@@ -1,5 +1,5 @@
 docs/
-.zig-cache
+.zig-cache/
 .rtk
-zig-out
+zig-out/
 .claude
