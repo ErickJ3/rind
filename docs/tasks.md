@@ -78,7 +78,7 @@ Match `docker pull` default expansion so users coming from Docker aren't surpris
 
 ## T02 — Digest utilities (sha256)
 
-**Status:** pending
+**Status:** done
 **Depends on:** none
 
 ### Deliverable

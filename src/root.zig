@@ -5,6 +5,7 @@ const Io = std.Io;
 /// Image-layer modules: reference parsing, digest helpers, layer extraction.
 pub const image = struct {
     pub const ref = @import("image/ref.zig");
+    pub const digest = @import("image/digest.zig");
 };
 
 /// This is a documentation comment to explain the `printAnotherMessage` function below.
@@ -24,4 +25,5 @@ test "basic add functionality" {
 
 test {
     _ = image.ref;
+    _ = image.digest;
 }
