@@ -18,6 +18,7 @@ pub const store = struct {
 pub const registry = struct {
     pub const auth = @import("registry/auth.zig");
     pub const client = @import("registry/client.zig");
+    pub const manifest = @import("registry/manifest.zig");
 };
 
 /// This is a documentation comment to explain the `printAnotherMessage` function below.
@@ -41,4 +42,5 @@ test {
     _ = store.layout;
     _ = registry.auth;
     _ = registry.client;
+    _ = registry.manifest;
 }

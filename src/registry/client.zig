@@ -23,12 +23,21 @@ const Io = std.Io;
 const http = std.http;
 
 const auth = @import("auth.zig");
+const manifest_mod = @import("manifest.zig");
+const image_ref = @import("../image/ref.zig");
+const digest_mod = @import("../image/digest.zig");
 
 /// Re-export of the credentials provider type so callers do not need
 /// to also import `auth.zig`.
 pub const Provider = auth.Provider;
 /// Re-export of the credentials struct.
 pub const Credentials = auth.Credentials;
+/// Re-export of the manifest result type returned by `Client.getManifest`.
+pub const ManifestResult = manifest_mod.ManifestResult;
+/// Re-export of the manifest error set.
+pub const ManifestError = manifest_mod.ManifestError;
+/// Re-export of `Digest` so callers don't also need `image/digest.zig`.
+pub const Digest = digest_mod.Digest;
 
 /// Semantic errors specific to the registry transport. Per-method
 /// public error sets union this with the relevant std error sets.
@@ -166,17 +175,18 @@ pub const Client = struct {
         const host_dup = try self.gpa.dupe(u8, host.bytes);
         defer self.gpa.free(host_dup);
 
-        // Phase 1: probe with no Authorization. We intentionally
-        // discard the body of this attempt: if it's 200, we re-issue
-        // to populate `body_writer`; if it's 401, the body is
-        // throwaway diagnostic JSON.
+        // Phase 1: probe with no Authorization. Pass the user's
+        // `body_writer` so a direct 200 (no auth needed) costs only
+        // one round-trip. `sendOnce` discards the body on 401 so the
+        // diagnostic JSON does not contaminate `body_writer` before
+        // the auth dance retries with credentials.
         var attempt = try self.sendOnce(.{
             .method = req.method,
             .uri = uri,
             .accept = req.accept,
             .extra_headers = req.extra_headers,
             .auth_header = null,
-        }, null);
+        }, body_writer);
 
         if (attempt.status != .unauthorized) {
             return self.finalize(req, uri, attempt, body_writer, null);
@@ -285,20 +295,21 @@ pub const Client = struct {
         // If the caller asked for the body and Phase 1 already
         // consumed (and discarded) it, we need a fresh round-trip.
         if (body_writer != null and send_mut.body_was_discarded) {
-            const refetch = try self.sendOnce(.{
+            var refetch = try self.sendOnce(.{
                 .method = req.method,
                 .uri = uri,
                 .accept = req.accept,
                 .extra_headers = req.extra_headers,
                 .auth_header = retry_auth_header,
             }, body_writer);
-            return classify(refetch);
+            defer refetch.deinit(self.gpa);
+            return classify(&refetch);
         }
 
-        return classify(send_mut);
+        return classify(&send_mut);
     }
 
-    fn classify(send: SendResult) FetchError!Response {
+    fn classify(send: *SendResult) FetchError!Response {
         switch (send.status) {
             .unauthorized => return error.Unauthorized,
             .forbidden => return error.Forbidden,
@@ -307,15 +318,16 @@ pub const Client = struct {
         }
         if (@intFromEnum(send.status) >= 400) return error.UnexpectedStatus;
 
-        // Move ownership of content_type across into Response.
-        var owned_send = send;
-        const ct = owned_send.content_type;
-        owned_send.content_type = null;
+        // Move ownership of content_type out of the SendResult so the
+        // deferred `deinit` does not double-free what now belongs to
+        // the returned `Response`.
+        const ct = send.content_type;
+        send.content_type = null;
 
         return .{
-            .status = owned_send.status,
+            .status = send.status,
             .content_type = ct,
-            .content_length = owned_send.content_length,
+            .content_length = send.content_length,
         };
     }
 
@@ -444,10 +456,14 @@ pub const Client = struct {
         req.sendBodiless() catch return error.WriteFailed;
         var response = try req.receiveHead(&redirect_buf);
 
+        // 401 bodies are diagnostic JSON the auth dance discards;
+        // never let them contaminate the caller's writer.
+        const will_stream = body_writer != null and response.head.status != .unauthorized;
+
         var result: SendResult = .{
             .status = response.head.status,
             .content_length = response.head.content_length,
-            .body_was_discarded = body_writer == null,
+            .body_was_discarded = !will_stream,
         };
         errdefer result.deinit(self.gpa);
 
@@ -466,8 +482,8 @@ pub const Client = struct {
 
         var transfer_buf: [16 * 1024]u8 = undefined;
         const body_reader = response.reader(&transfer_buf);
-        if (body_writer) |w| {
-            _ = body_reader.streamRemaining(w) catch |err| switch (err) {
+        if (will_stream) {
+            _ = body_reader.streamRemaining(body_writer.?) catch |err| switch (err) {
                 error.ReadFailed => return error.ReadFailed,
                 error.WriteFailed => return error.WriteFailed,
             };
@@ -476,6 +492,113 @@ pub const Client = struct {
         }
 
         return result;
+    }
+
+    /// Options for `getManifest` / `getManifestByUrl`.
+    pub const GetManifestOptions = struct {
+        /// Override target platform when dispatching an image-index.
+        /// Defaults to `manifest_mod.default_platform`
+        /// (`linux/<host_arch>` baked at comptime).
+        platform: ?manifest_mod.Platform = null,
+    };
+
+    /// Errors returned by `getManifest`. Unions transport, parse,
+    /// and digest errors so callers handle one set.
+    pub const GetManifestError =
+        FetchError ||
+        ManifestError ||
+        digest_mod.DigestError;
+
+    /// `GET /v2/<repo>/manifests/<reference>` for the given image
+    /// reference. Follows image-index / manifest-list responses
+    /// transparently by selecting the picked platform's descriptor
+    /// and re-fetching it by digest. Returns the picked
+    /// single-platform manifest, its sha256, the resolved media
+    /// type, and the verbatim response bytes (suitable for
+    /// `Store.putBlob` without re-hashing).
+    ///
+    /// `<reference>` is `ref.digest` if non-null, else `ref.tag`,
+    /// else `"latest"`. When `ref.digest` is present, the response
+    /// body is verified against it.
+    pub fn getManifest(
+        self: *Client,
+        ref: image_ref.ImageRef,
+        opts: GetManifestOptions,
+    ) GetManifestError!ManifestResult {
+        const ep_base = try manifest_mod.buildManifestBaseUrl(self.gpa, ref.registry, ref.repository);
+        defer self.gpa.free(ep_base);
+        const reference = ref.digest orelse ref.tag orelse "latest";
+        const scope = try std.fmt.allocPrint(self.gpa, "repository:{s}:pull", .{ref.repository});
+        defer self.gpa.free(scope);
+        const expected: ?Digest = if (ref.digest) |d| try Digest.parse(d) else null;
+        return self.getManifestByUrl(ep_base, reference, scope, expected, opts);
+    }
+
+    /// Lower-level entry point used internally for index-recursion
+    /// and by tests. `base_url` is the `manifests` endpoint without
+    /// the trailing `/<reference>`. `expected_digest`, if non-null,
+    /// is compared against the sha256 of the response body and
+    /// `DigestMismatch` is returned on disagreement.
+    pub fn getManifestByUrl(
+        self: *Client,
+        base_url: []const u8,
+        reference: []const u8,
+        scope: []const u8,
+        expected_digest: ?Digest,
+        opts: GetManifestOptions,
+    ) GetManifestError!ManifestResult {
+        var arena: std.heap.ArenaAllocator = .init(self.gpa);
+        var arena_owned: bool = true;
+        errdefer if (arena_owned) arena.deinit();
+        const arena_alloc = arena.allocator();
+
+        const url = try std.fmt.allocPrint(self.gpa, "{s}/{s}", .{ base_url, reference });
+        defer self.gpa.free(url);
+
+        var body_buf: Io.Writer.Allocating = .init(arena_alloc);
+        var resp = try self.fetch(.{
+            .url = url,
+            .accept = manifest_mod.accept_header_value,
+            .scope = scope,
+        }, &body_buf.writer);
+        defer resp.deinit(self.gpa);
+
+        const ct = resp.content_type orelse return error.UnsupportedMediaType;
+        const mt = manifest_mod.MediaType.fromString(ct) orelse return error.UnsupportedMediaType;
+
+        const raw_bytes = try body_buf.toOwnedSlice();
+
+        const computed = digest_mod.Hasher.hash(raw_bytes);
+        if (expected_digest) |exp| {
+            if (!computed.eql(exp)) return error.DigestMismatch;
+        }
+
+        if (mt.isSingle()) {
+            const m = try manifest_mod.parseManifest(arena_alloc, raw_bytes, mt);
+            arena_owned = false;
+            return .{
+                .manifest = m,
+                .digest = computed,
+                .media_type = mt,
+                .raw_bytes = raw_bytes,
+                .arena = arena,
+            };
+        }
+
+        // Index path: parse, select platform, recurse on the picked
+        // descriptor's digest. The picked digest string lives in
+        // `arena`, so dup it onto `self.gpa` before tearing down.
+        const idx = try manifest_mod.parseIndex(arena_alloc, raw_bytes, mt);
+        const target = opts.platform orelse manifest_mod.default_platform;
+        const picked = try manifest_mod.selectPlatform(idx, target);
+        const picked_dig = try Digest.parse(picked.digest);
+
+        const picked_ref_dup = try self.gpa.dupe(u8, picked.digest);
+        defer self.gpa.free(picked_ref_dup);
+
+        arena.deinit();
+        arena_owned = false;
+        return self.getManifestByUrl(base_url, picked_ref_dup, scope, picked_dig, opts);
     }
 };
 
@@ -1261,6 +1384,334 @@ test "fetch — token endpoint failure surfaces TokenEndpointFailed" {
         .url = url,
         .scope = "repository:test:pull",
     }, null));
+
+    thread.join();
+    if (ms.err) |e| return e;
+}
+
+const test_oci_manifest_body =
+    \\{
+    \\  "schemaVersion": 2,
+    \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+    \\  "config": {
+    \\    "mediaType": "application/vnd.oci.image.config.v1+json",
+    \\    "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    \\    "size": 7023
+    \\  },
+    \\  "layers": [
+    \\    {
+    \\      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+    \\      "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    \\      "size": 32654
+    \\    },
+    \\    {
+    \\      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+    \\      "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+    \\      "size": 16724
+    \\    }
+    \\  ]
+    \\}
+;
+
+const test_amd64_only_index_no_inner_dig =
+    \\{
+    \\  "schemaVersion": 2,
+    \\  "mediaType": "application/vnd.oci.image.index.v1+json",
+    \\  "manifests": [
+    \\    { "mediaType": "application/vnd.oci.image.manifest.v1+json",
+    \\      "digest": "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+    \\      "size": 7000,
+    \\      "platform": { "architecture": "s390x", "os": "linux" } }
+    \\  ]
+    \\}
+;
+
+test "getManifest — single OCI manifest direct" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var ms = try startMockServer(io, &.{});
+    defer stopMockServer(ms);
+
+    const port = ms.server.socket.address.getPort();
+
+    const ct_headers = [_]http.Header{
+        .{ .name = "content-type", .value = "application/vnd.oci.image.manifest.v1+json" },
+    };
+
+    ms.steps = &.{
+        .{
+            .path_contains = "/v2/test/manifests/latest",
+            .status = .ok,
+            .extra_headers = &ct_headers,
+            .body = test_oci_manifest_body,
+        },
+    };
+
+    const thread = try std.Thread.spawn(.{}, MockServer.run, .{ms});
+
+    const base_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/v2/test/manifests", .{port});
+    defer gpa.free(base_url);
+
+    var http_client: http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+
+    var client = Client.init(gpa, io, &http_client, Provider.anonymous);
+    defer client.deinit();
+
+    var result = try client.getManifestByUrl(
+        base_url,
+        "latest",
+        "repository:test:pull",
+        null,
+        .{},
+    );
+    defer result.deinit();
+
+    thread.join();
+    if (ms.err) |e| return e;
+
+    try testing.expectEqual(manifest_mod.MediaType.oci_manifest, result.media_type);
+    try testing.expectEqual(@as(usize, 2), result.manifest.layers.len);
+    try testing.expectEqualStrings(test_oci_manifest_body, result.raw_bytes);
+    try testing.expect(result.digest.eql(digest_mod.Hasher.hash(test_oci_manifest_body)));
+    try testing.expectEqual(@as(usize, 1), ms.requests_seen);
+}
+
+test "getManifest — index dispatches to picked platform manifest" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var ms = try startMockServer(io, &.{});
+    defer stopMockServer(ms);
+
+    const port = ms.server.socket.address.getPort();
+
+    // Compute digest of the inner manifest body so the index can
+    // reference it with the real sha256 — letting `getManifestByUrl`
+    // verify the body on recursion.
+    const inner_dig = digest_mod.Hasher.hash(test_oci_manifest_body);
+    var dig_buf: [digest_mod.string_length]u8 = undefined;
+    const inner_dig_str = inner_dig.toString(&dig_buf);
+
+    const index_body = try std.fmt.allocPrint(gpa,
+        \\{{
+        \\  "schemaVersion": 2,
+        \\  "mediaType": "application/vnd.oci.image.index.v1+json",
+        \\  "manifests": [
+        \\    {{ "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        \\       "digest": "{s}",
+        \\       "size": {d},
+        \\       "platform": {{ "architecture": "amd64", "os": "linux" }} }}
+        \\  ]
+        \\}}
+    , .{ inner_dig_str, test_oci_manifest_body.len });
+    defer gpa.free(index_body);
+
+    const inner_path = try std.fmt.allocPrint(gpa, "/v2/test/manifests/{s}", .{inner_dig_str});
+    defer gpa.free(inner_path);
+
+    const ct_index = [_]http.Header{
+        .{ .name = "content-type", .value = "application/vnd.oci.image.index.v1+json" },
+    };
+    const ct_manifest = [_]http.Header{
+        .{ .name = "content-type", .value = "application/vnd.oci.image.manifest.v1+json" },
+    };
+
+    ms.steps = &.{
+        .{
+            .path_contains = "/v2/test/manifests/latest",
+            .status = .ok,
+            .extra_headers = &ct_index,
+            .body = index_body,
+        },
+        .{
+            .path_contains = inner_path,
+            .status = .ok,
+            .extra_headers = &ct_manifest,
+            .body = test_oci_manifest_body,
+        },
+    };
+
+    const thread = try std.Thread.spawn(.{}, MockServer.run, .{ms});
+
+    const base_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/v2/test/manifests", .{port});
+    defer gpa.free(base_url);
+
+    var http_client: http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+
+    var client = Client.init(gpa, io, &http_client, Provider.anonymous);
+    defer client.deinit();
+
+    var result = try client.getManifestByUrl(
+        base_url,
+        "latest",
+        "repository:test:pull",
+        null,
+        .{ .platform = .{ .architecture = "amd64", .os = "linux" } },
+    );
+    defer result.deinit();
+
+    thread.join();
+    if (ms.err) |e| return e;
+
+    try testing.expectEqual(manifest_mod.MediaType.oci_manifest, result.media_type);
+    try testing.expectEqualStrings(test_oci_manifest_body, result.raw_bytes);
+    try testing.expect(result.digest.eql(inner_dig));
+    try testing.expectEqual(@as(usize, 2), ms.requests_seen);
+}
+
+test "getManifest — DigestMismatch when body hash diverges from expected" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var ms = try startMockServer(io, &.{});
+    defer stopMockServer(ms);
+
+    const port = ms.server.socket.address.getPort();
+
+    const ct_headers = [_]http.Header{
+        .{ .name = "content-type", .value = "application/vnd.oci.image.manifest.v1+json" },
+    };
+
+    ms.steps = &.{
+        .{
+            .path_contains = "/v2/test/manifests/sha256:",
+            .status = .ok,
+            .extra_headers = &ct_headers,
+            .body = test_oci_manifest_body,
+        },
+    };
+
+    const thread = try std.Thread.spawn(.{}, MockServer.run, .{ms});
+
+    const base_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/v2/test/manifests", .{port});
+    defer gpa.free(base_url);
+
+    var http_client: http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+
+    var client = Client.init(gpa, io, &http_client, Provider.anonymous);
+    defer client.deinit();
+
+    // Wrong expected digest — server returns the OCI manifest body
+    // but caller pinned to an unrelated sha256.
+    const wrong = try Digest.parse("sha256:0000000000000000000000000000000000000000000000000000000000000000");
+
+    try testing.expectError(error.DigestMismatch, client.getManifestByUrl(
+        base_url,
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "repository:test:pull",
+        wrong,
+        .{},
+    ));
+
+    thread.join();
+    if (ms.err) |e| return e;
+}
+
+test "getManifest — PlatformNotFound when index has no matching platform" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var ms = try startMockServer(io, &.{});
+    defer stopMockServer(ms);
+
+    const port = ms.server.socket.address.getPort();
+
+    const ct_index = [_]http.Header{
+        .{ .name = "content-type", .value = "application/vnd.oci.image.index.v1+json" },
+    };
+
+    ms.steps = &.{
+        .{
+            .path_contains = "/v2/test/manifests/latest",
+            .status = .ok,
+            .extra_headers = &ct_index,
+            .body = test_amd64_only_index_no_inner_dig,
+        },
+    };
+
+    const thread = try std.Thread.spawn(.{}, MockServer.run, .{ms});
+
+    const base_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/v2/test/manifests", .{port});
+    defer gpa.free(base_url);
+
+    var http_client: http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+
+    var client = Client.init(gpa, io, &http_client, Provider.anonymous);
+    defer client.deinit();
+
+    try testing.expectError(error.PlatformNotFound, client.getManifestByUrl(
+        base_url,
+        "latest",
+        "repository:test:pull",
+        null,
+        // Index only has linux/s390x; ask for windows/ppc64 to
+        // guarantee no host-arch match regardless of the build host.
+        .{ .platform = .{ .architecture = "ppc64", .os = "windows" } },
+    ));
+
+    thread.join();
+    if (ms.err) |e| return e;
+}
+
+test "getManifest — MediaTypeMismatch when body mediaType disagrees with header" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var ms = try startMockServer(io, &.{});
+    defer stopMockServer(ms);
+
+    const port = ms.server.socket.address.getPort();
+
+    // Header says OCI manifest; body's mediaType field says Docker.
+    const mismatch_body =
+        \\{
+        \\  "schemaVersion": 2,
+        \\  "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+        \\  "config": {
+        \\    "mediaType": "application/vnd.oci.image.config.v1+json",
+        \\    "digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+        \\    "size": 100
+        \\  },
+        \\  "layers": []
+        \\}
+    ;
+
+    const ct_oci = [_]http.Header{
+        .{ .name = "content-type", .value = "application/vnd.oci.image.manifest.v1+json" },
+    };
+
+    ms.steps = &.{
+        .{
+            .path_contains = "/v2/test/manifests/latest",
+            .status = .ok,
+            .extra_headers = &ct_oci,
+            .body = mismatch_body,
+        },
+    };
+
+    const thread = try std.Thread.spawn(.{}, MockServer.run, .{ms});
+
+    const base_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/v2/test/manifests", .{port});
+    defer gpa.free(base_url);
+
+    var http_client: http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+
+    var client = Client.init(gpa, io, &http_client, Provider.anonymous);
+    defer client.deinit();
+
+    try testing.expectError(error.MediaTypeMismatch, client.getManifestByUrl(
+        base_url,
+        "latest",
+        "repository:test:pull",
+        null,
+        .{},
+    ));
 
     thread.join();
     if (ms.err) |e| return e;
