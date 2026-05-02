@@ -55,8 +55,11 @@ pub const RegistryError = error{
     /// Token endpoint returned a 200 whose JSON body had neither
     /// `token` nor `access_token`.
     BadTokenResponse,
-    /// Any 4xx/5xx not specifically classified above.
+    /// Any 4xx not specifically classified above.
     UnexpectedStatus,
+    /// 5xx response from the registry. T06 retries on this with
+    /// bounded backoff; other callers may treat it as terminal.
+    ServerError,
     /// Bearer challenge from the registry but the configured
     /// `Provider` returned no credentials. Distinct from
     /// `Unauthorized` because the request never reached the token
@@ -316,6 +319,7 @@ pub const Client = struct {
             .not_found => return error.NotFound,
             else => {},
         }
+        if (@intFromEnum(send.status) >= 500) return error.ServerError;
         if (@intFromEnum(send.status) >= 400) return error.UnexpectedStatus;
 
         // Move ownership of content_type out of the SendResult so the
@@ -600,7 +604,203 @@ pub const Client = struct {
         arena_owned = false;
         return self.getManifestByUrl(base_url, picked_ref_dup, scope, picked_dig, opts);
     }
+
+    /// Tunables for `getBlob` / `getBlobByUrl`. The defaults match the
+    /// MVP spec: three retries, 100 ms initial backoff, 10 s ceiling.
+    pub const GetBlobOptions = struct {
+        /// Maximum number of *additional* attempts on top of the first.
+        /// Total attempts = `max_retries + 1`.
+        max_retries: u32 = 3,
+        /// Backoff before the first retry, in milliseconds. Doubled on
+        /// each subsequent retry up to `max_backoff_ms`.
+        initial_backoff_ms: u32 = 100,
+        /// Upper bound for backoff between retries, in milliseconds.
+        max_backoff_ms: u32 = 10_000,
+    };
+
+    /// Errors returned by `getBlob` / `getBlobByUrl`. Unions transport,
+    /// digest-parse, and the blob-specific cases (`DigestMismatch`,
+    /// `ResumeRangeRejected`, `TooManyRetries`).
+    pub const GetBlobError =
+        FetchError ||
+        digest_mod.DigestError ||
+        error{
+            /// Streamed body did not hash to the expected digest.
+            DigestMismatch,
+            /// We sent a `Range:` header to resume a partial download
+            /// but the server replied 200 (full body) instead of 206.
+            /// The caller's writer now contains a prefix from a prior
+            /// attempt followed by a fresh full body — corrupt. The
+            /// caller (T09) is expected to truncate its sink and retry
+            /// from offset 0.
+            ResumeRangeRejected,
+            /// All retries exhausted on transient errors.
+            TooManyRetries,
+        };
+
+    /// `GET /v2/<repo>/blobs/<digest>` with bounded retries and
+    /// `Range:`-based resume on partial-failure. Streams the body
+    /// through `dest_writer`, hashing live. Verifies the final hash
+    /// against `expected` and returns `error.DigestMismatch` on any
+    /// disagreement.
+    ///
+    /// The token cache is reused across attempts and across concurrent
+    /// callers (the cache's mutex serialises access). On transient
+    /// failure (network read drop, 5xx) the function sleeps for
+    /// `min(initial_backoff_ms << attempt, max_backoff_ms)` and reissues
+    /// the request with `Range: bytes=<n>-`, where `n` is the number of
+    /// bytes already streamed to `dest_writer`.
+    pub fn getBlob(
+        self: *Client,
+        ref: image_ref.ImageRef,
+        expected: Digest,
+        dest_writer: *Io.Writer,
+        opts: GetBlobOptions,
+    ) GetBlobError!void {
+        var dig_buf: [digest_mod.string_length]u8 = undefined;
+        const dig_str = expected.toString(&dig_buf);
+        const url = try buildBlobUrl(self.gpa, ref.registry, ref.repository, dig_str);
+        defer self.gpa.free(url);
+        const scope = try std.fmt.allocPrint(self.gpa, "repository:{s}:pull", .{ref.repository});
+        defer self.gpa.free(scope);
+        return self.getBlobByUrl(url, scope, expected, dest_writer, opts);
+    }
+
+    /// Lower-level entrypoint used by `getBlob` and by tests. `url` is
+    /// the absolute blob URL; `scope` is the OCI auth scope passed to
+    /// the token cache.
+    pub fn getBlobByUrl(
+        self: *Client,
+        url: []const u8,
+        scope: []const u8,
+        expected: Digest,
+        dest_writer: *Io.Writer,
+        opts: GetBlobOptions,
+    ) GetBlobError!void {
+        var hasher = digest_mod.Hasher.init();
+        var bytes_written: u64 = 0;
+
+        var attempt: u32 = 0;
+        retry: while (true) : (attempt += 1) {
+            // Build the optional Range header for the second attempt
+            // onwards. Stack-only: the buffer outlives the fetch call.
+            var range_value_buf: [64]u8 = undefined;
+            var headers_buf: [1]http.Header = undefined;
+            var headers: []const http.Header = &.{};
+            const sent_range = bytes_written > 0;
+            if (sent_range) {
+                const range_value = std.fmt.bufPrint(
+                    &range_value_buf,
+                    "bytes={d}-",
+                    .{bytes_written},
+                ) catch unreachable;
+                headers_buf[0] = .{ .name = "range", .value = range_value };
+                headers = headers_buf[0..1];
+            }
+
+            // Hashing/counting forwarder. Buffered (16 KiB) because
+            // the body reader expects a non-empty writable slice; we
+            // explicitly `flush` after the fetch so `hasher` and
+            // `bytes_written` reflect every byte streamed before we
+            // act on either branch.
+            const hc: HashCount = .{ .hasher = &hasher, .bytes = &bytes_written };
+            var sink_buf: [16 * 1024]u8 = undefined;
+            var sink = std.Io.Writer.Hashed(HashCount).initHasher(
+                dest_writer,
+                hc,
+                &sink_buf,
+            );
+
+            const prior_written = bytes_written;
+            const fetch_result = self.fetch(.{
+                .url = url,
+                .scope = scope,
+                .extra_headers = headers,
+            }, &sink.writer);
+            sink.writer.flush() catch {};
+            const this_round_bytes = bytes_written - prior_written;
+
+            if (fetch_result) |resp_const| {
+                var resp = resp_const;
+                defer resp.deinit(self.gpa);
+
+                if (sent_range and resp.status == .ok) {
+                    // Server ignored Range and re-sent the whole body
+                    // on top of our already-written prefix. The sink
+                    // is now corrupt; the caller has to truncate.
+                    return error.ResumeRangeRejected;
+                }
+                if (!sent_range and resp.status == .partial_content) {
+                    // We didn't ask for a partial; the server is
+                    // misbehaving — surface as unexpected.
+                    return error.UnexpectedStatus;
+                }
+
+                // `streamRemaining` swallows `EndOfStream` from the
+                // underlying socket, so a server that announced
+                // Content-Length but cut mid-stream returns "OK"
+                // here with fewer bytes than promised. Treat that
+                // as a transient ReadFailed so the retry loop kicks
+                // in with a Range request from where we left off.
+                if (resp.content_length) |cl| {
+                    if (this_round_bytes < cl) {
+                        if (attempt >= opts.max_retries) return error.TooManyRetries;
+                        try self.sleepBackoff(attempt, opts);
+                        continue :retry;
+                    }
+                }
+
+                const got = hasher.final();
+                if (!got.eql(expected)) return error.DigestMismatch;
+                return;
+            } else |err| switch (err) {
+                error.ServerError, error.ReadFailed, error.WriteFailed => {
+                    if (attempt >= opts.max_retries) return error.TooManyRetries;
+                    try self.sleepBackoff(attempt, opts);
+                    continue :retry;
+                },
+                else => return err,
+            }
+        }
+    }
+
+    fn sleepBackoff(self: *Client, attempt: u32, opts: GetBlobOptions) GetBlobError!void {
+        const shift: u5 = @intCast(@min(attempt, 16));
+        const raw_ms: u64 = @as(u64, opts.initial_backoff_ms) << shift;
+        const ms: u64 = @min(raw_ms, opts.max_backoff_ms);
+        Io.sleep(self.io, Io.Duration.fromMilliseconds(@intCast(ms)), .real) catch
+            return error.TooManyRetries;
+    }
 };
+
+/// Hasher adapter wired into `std.Io.Writer.Hashed` so the same drain
+/// pass that updates the sha256 also bumps a byte counter the retry
+/// loop reads to build the next `Range:` header.
+const HashCount = struct {
+    hasher: *digest_mod.Hasher,
+    bytes: *u64,
+
+    /// Forwarder. `pub` because `std.Io.Writer.Hashed(HashCount)`
+    /// reaches in via comptime to call this on every drained chunk.
+    pub fn update(self: *HashCount, data: []const u8) void {
+        self.hasher.update(data);
+        self.bytes.* += data.len;
+    }
+};
+
+fn buildBlobUrl(
+    gpa: Allocator,
+    registry_name: []const u8,
+    repository: []const u8,
+    digest_str: []const u8,
+) Allocator.Error![]u8 {
+    const ep = manifest_mod.registryEndpoint(registry_name);
+    return std.fmt.allocPrint(
+        gpa,
+        "https://{s}/v2/{s}/blobs/{s}",
+        .{ ep, repository, digest_str },
+    );
+}
 
 fn buildTokenUrl(
     gpa: Allocator,
@@ -876,10 +1076,27 @@ const ScriptStep = struct {
     /// Optional substring required to *not* appear (e.g. asserting
     /// no `authorization` was sent).
     head_not_contains: ?[]const u8 = null,
+    /// Optional Range-header assertion: the request head must contain
+    /// `bytes=<N>-`. Used by T06 resume tests.
+    head_must_contain_range_start: ?u64 = null,
     status: http.Status = .ok,
     /// Extra headers to send back. Lifetimes managed by the test.
     extra_headers: []const http.Header = &.{},
     body: []const u8 = "",
+    /// If set, the response is hand-written: status line + headers +
+    /// `body[0..truncate_at_bytes]`, then the connection is closed
+    /// without sending the rest. Combined with
+    /// `content_length_override` this simulates a server that drops
+    /// mid-stream while claiming a longer body.
+    truncate_at_bytes: ?usize = null,
+    /// Optional override for the `content-length` header. When unset,
+    /// the actual `body.len` is sent. Only meaningful in conjunction
+    /// with `truncate_at_bytes` or the digest-mismatch tests.
+    content_length_override: ?u64 = null,
+    /// Sleep this many milliseconds after parsing the request and
+    /// before responding. Used by T06's pool-concurrency test to
+    /// keep multiple requests "in flight" simultaneously.
+    before_respond_sleep_ms: u32 = 0,
 };
 
 const MockServer = struct {
@@ -925,6 +1142,56 @@ const MockServer = struct {
             if (std.mem.indexOf(u8, request.head_buffer, needle) != null) {
                 return error.UnexpectedHeader;
             }
+        }
+        if (step.head_must_contain_range_start) |start| {
+            var range_buf: [64]u8 = undefined;
+            const needle = std.fmt.bufPrint(&range_buf, "bytes={d}-", .{start}) catch
+                return error.MissingRangeHeader;
+            if (std.mem.indexOf(u8, request.head_buffer, needle) == null) {
+                return error.MissingRangeHeader;
+            }
+        }
+
+        if (step.before_respond_sleep_ms > 0) {
+            Io.sleep(
+                self.io,
+                Io.Duration.fromMilliseconds(@intCast(step.before_respond_sleep_ms)),
+                .real,
+            ) catch return error.SleepInterrupted;
+        }
+
+        if (step.truncate_at_bytes) |trunc| {
+            const cl = step.content_length_override orelse step.body.len;
+            const w = &stream_writer.interface;
+            const phrase = step.status.phrase() orelse "";
+            try w.print("HTTP/1.1 {d} {s}\r\n", .{ @intFromEnum(step.status), phrase });
+            try w.writeAll("connection: close\r\n");
+            try w.print("content-length: {d}\r\n", .{cl});
+            for (step.extra_headers) |h| {
+                try w.print("{s}: {s}\r\n", .{ h.name, h.value });
+            }
+            try w.writeAll("\r\n");
+            try w.writeAll(step.body[0..trunc]);
+            w.flush() catch {};
+            return;
+        }
+
+        if (step.content_length_override) |cl| {
+            // Same hand-written path as truncate, but body is sent in
+            // full. Used by the digest-mismatch tests that need a
+            // misleading content-length without simulating a cut.
+            const w = &stream_writer.interface;
+            const phrase = step.status.phrase() orelse "";
+            try w.print("HTTP/1.1 {d} {s}\r\n", .{ @intFromEnum(step.status), phrase });
+            try w.writeAll("connection: close\r\n");
+            try w.print("content-length: {d}\r\n", .{cl});
+            for (step.extra_headers) |h| {
+                try w.print("{s}: {s}\r\n", .{ h.name, h.value });
+            }
+            try w.writeAll("\r\n");
+            try w.writeAll(step.body);
+            w.flush() catch {};
+            return;
         }
 
         try request.respond(step.body, .{
@@ -1707,4 +1974,334 @@ test "getManifest — MediaTypeMismatch when body mediaType disagrees with heade
 
     thread.join();
     if (ms.err) |e| return e;
+}
+
+// --- T06: blob GET tests --------------------------------------------------
+
+/// Generate a deterministic, non-trivial test blob: 4096 bytes whose
+/// content depends on the offset, so any truncation or substitution is
+/// visible in the sha256.
+fn buildTestBlob(buf: []u8) void {
+    for (buf, 0..) |*b, i| b.* = @intCast(((i *% 2654435761) ^ (i >> 3)) & 0xff);
+}
+
+test "getBlob — happy path streams body and verifies digest" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var blob_bytes: [4096]u8 = undefined;
+    buildTestBlob(&blob_bytes);
+    const expected = digest_mod.Hasher.hash(&blob_bytes);
+    var dig_buf: [digest_mod.string_length]u8 = undefined;
+    const dig_str = expected.toString(&dig_buf);
+
+    var ms = try startMockServer(io, &.{});
+    defer stopMockServer(ms);
+    const port = ms.server.socket.address.getPort();
+
+    const path = try std.fmt.allocPrint(gpa, "/v2/test/blobs/{s}", .{dig_str});
+    defer gpa.free(path);
+
+    ms.steps = &.{
+        .{ .path_contains = path, .status = .ok, .body = &blob_bytes },
+    };
+
+    const thread = try std.Thread.spawn(.{}, MockServer.run, .{ms});
+
+    const url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}{s}", .{ port, path });
+    defer gpa.free(url);
+
+    var http_client: http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+    var client = Client.init(gpa, io, &http_client, Provider.anonymous);
+    defer client.deinit();
+
+    var sink: std.Io.Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+
+    try client.getBlobByUrl(url, "repository:test:pull", expected, &sink.writer, .{});
+
+    thread.join();
+    if (ms.err) |e| return e;
+
+    try testing.expectEqualSlices(u8, &blob_bytes, sink.written());
+}
+
+test "getBlob — DigestMismatch on truncated body (honest content-length)" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var blob_bytes: [4096]u8 = undefined;
+    buildTestBlob(&blob_bytes);
+    const expected = digest_mod.Hasher.hash(&blob_bytes); // hash of FULL blob
+
+    var ms = try startMockServer(io, &.{});
+    defer stopMockServer(ms);
+    const port = ms.server.socket.address.getPort();
+
+    var dig_buf: [digest_mod.string_length]u8 = undefined;
+    const dig_str = expected.toString(&dig_buf);
+    const path = try std.fmt.allocPrint(gpa, "/v2/test/blobs/{s}", .{dig_str});
+    defer gpa.free(path);
+
+    // Server sends only first 2000 bytes, with content-length=2000
+    // (no transport error), but the caller pinned to the full hash.
+    ms.steps = &.{
+        .{
+            .path_contains = path,
+            .status = .ok,
+            .body = blob_bytes[0..2000],
+        },
+    };
+
+    const thread = try std.Thread.spawn(.{}, MockServer.run, .{ms});
+
+    const url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}{s}", .{ port, path });
+    defer gpa.free(url);
+
+    var http_client: http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+    var client = Client.init(gpa, io, &http_client, Provider.anonymous);
+    defer client.deinit();
+
+    var sink: std.Io.Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+
+    try testing.expectError(
+        error.DigestMismatch,
+        client.getBlobByUrl(url, "repository:test:pull", expected, &sink.writer, .{
+            .max_retries = 0,
+        }),
+    );
+
+    thread.join();
+    if (ms.err) |e| return e;
+}
+
+test "getBlob — DigestMismatch on tampered body (same length)" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var blob_bytes: [4096]u8 = undefined;
+    buildTestBlob(&blob_bytes);
+    const expected = digest_mod.Hasher.hash(&blob_bytes);
+
+    // Mutate one byte to produce a different but same-length body.
+    var tampered = blob_bytes;
+    tampered[123] ^= 0xff;
+
+    var ms = try startMockServer(io, &.{});
+    defer stopMockServer(ms);
+    const port = ms.server.socket.address.getPort();
+
+    var dig_buf: [digest_mod.string_length]u8 = undefined;
+    const dig_str = expected.toString(&dig_buf);
+    const path = try std.fmt.allocPrint(gpa, "/v2/test/blobs/{s}", .{dig_str});
+    defer gpa.free(path);
+
+    ms.steps = &.{
+        .{ .path_contains = path, .status = .ok, .body = &tampered },
+    };
+
+    const thread = try std.Thread.spawn(.{}, MockServer.run, .{ms});
+
+    const url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}{s}", .{ port, path });
+    defer gpa.free(url);
+
+    var http_client: http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+    var client = Client.init(gpa, io, &http_client, Provider.anonymous);
+    defer client.deinit();
+
+    var sink: std.Io.Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+
+    try testing.expectError(
+        error.DigestMismatch,
+        client.getBlobByUrl(url, "repository:test:pull", expected, &sink.writer, .{
+            .max_retries = 0,
+        }),
+    );
+
+    thread.join();
+    if (ms.err) |e| return e;
+}
+
+test "getBlob — Range resume after mid-stream cut yields byte-identical blob" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var blob_bytes: [4096]u8 = undefined;
+    buildTestBlob(&blob_bytes);
+    const expected = digest_mod.Hasher.hash(&blob_bytes);
+    var dig_buf: [digest_mod.string_length]u8 = undefined;
+    const dig_str = expected.toString(&dig_buf);
+
+    var ms = try startMockServer(io, &.{});
+    defer stopMockServer(ms);
+    const port = ms.server.socket.address.getPort();
+
+    const path = try std.fmt.allocPrint(gpa, "/v2/test/blobs/{s}", .{dig_str});
+    defer gpa.free(path);
+
+    const cut_at: usize = 1500;
+
+    // Step 2 needs Content-Range: bytes=cut_at-(total-1)/total
+    var range_hdr_buf: [64]u8 = undefined;
+    const range_value = try std.fmt.bufPrint(
+        &range_hdr_buf,
+        "bytes={d}-{d}/{d}",
+        .{ cut_at, blob_bytes.len - 1, blob_bytes.len },
+    );
+    const partial_headers = [_]http.Header{
+        .{ .name = "content-range", .value = range_value },
+    };
+
+    ms.steps = &.{
+        // Initial GET: lie about content-length, write only `cut_at`
+        // bytes, then close. Client should surface ReadFailed and
+        // retry with Range.
+        .{
+            .path_contains = path,
+            .status = .ok,
+            .body = &blob_bytes,
+            .truncate_at_bytes = cut_at,
+            .content_length_override = blob_bytes.len,
+        },
+        // Retry: must carry Range header. Reply 206 + tail bytes.
+        .{
+            .path_contains = path,
+            .head_must_contain_range_start = cut_at,
+            .status = .partial_content,
+            .extra_headers = &partial_headers,
+            .body = blob_bytes[cut_at..],
+        },
+    };
+
+    const thread = try std.Thread.spawn(.{}, MockServer.run, .{ms});
+
+    const url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}{s}", .{ port, path });
+    defer gpa.free(url);
+
+    var http_client: http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+    var client = Client.init(gpa, io, &http_client, Provider.anonymous);
+    defer client.deinit();
+
+    var sink: std.Io.Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+
+    try client.getBlobByUrl(url, "repository:test:pull", expected, &sink.writer, .{
+        .max_retries = 1,
+        .initial_backoff_ms = 1,
+    });
+
+    thread.join();
+    if (ms.err) |e| return e;
+
+    try testing.expectEqualSlices(u8, &blob_bytes, sink.written());
+    try testing.expectEqual(@as(usize, 2), ms.requests_seen);
+}
+
+test "getBlob — backoff schedule honored on transient ServerError" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var blob_bytes: [256]u8 = undefined;
+    buildTestBlob(&blob_bytes);
+    const expected = digest_mod.Hasher.hash(&blob_bytes);
+    var dig_buf: [digest_mod.string_length]u8 = undefined;
+    const dig_str = expected.toString(&dig_buf);
+
+    var ms = try startMockServer(io, &.{});
+    defer stopMockServer(ms);
+    const port = ms.server.socket.address.getPort();
+
+    const path = try std.fmt.allocPrint(gpa, "/v2/test/blobs/{s}", .{dig_str});
+    defer gpa.free(path);
+
+    ms.steps = &.{
+        .{ .path_contains = path, .status = .service_unavailable },
+        .{ .path_contains = path, .status = .service_unavailable },
+        .{ .path_contains = path, .status = .ok, .body = &blob_bytes },
+    };
+
+    const thread = try std.Thread.spawn(.{}, MockServer.run, .{ms});
+
+    const url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}{s}", .{ port, path });
+    defer gpa.free(url);
+
+    var http_client: http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+    var client = Client.init(gpa, io, &http_client, Provider.anonymous);
+    defer client.deinit();
+
+    var sink: std.Io.Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+
+    const t0 = Io.Clock.awake.now(io);
+    try client.getBlobByUrl(url, "repository:test:pull", expected, &sink.writer, .{
+        .max_retries = 3,
+        .initial_backoff_ms = 30,
+        .max_backoff_ms = 1_000,
+    });
+    const elapsed_ms = t0.untilNow(io, .awake).toMilliseconds();
+
+    thread.join();
+    if (ms.err) |e| return e;
+
+    // Two backoffs: 30ms + 60ms = 90ms. Allow generous slop.
+    try testing.expect(elapsed_ms >= 80);
+    try testing.expectEqualSlices(u8, &blob_bytes, sink.written());
+    try testing.expectEqual(@as(usize, 3), ms.requests_seen);
+}
+
+test "getBlob — TooManyRetries when transient errors exhaust budget" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var blob_bytes: [64]u8 = undefined;
+    buildTestBlob(&blob_bytes);
+    const expected = digest_mod.Hasher.hash(&blob_bytes);
+    var dig_buf: [digest_mod.string_length]u8 = undefined;
+    const dig_str = expected.toString(&dig_buf);
+
+    var ms = try startMockServer(io, &.{});
+    defer stopMockServer(ms);
+    const port = ms.server.socket.address.getPort();
+
+    const path = try std.fmt.allocPrint(gpa, "/v2/test/blobs/{s}", .{dig_str});
+    defer gpa.free(path);
+
+    ms.steps = &.{
+        .{ .path_contains = path, .status = .service_unavailable },
+        .{ .path_contains = path, .status = .service_unavailable },
+        .{ .path_contains = path, .status = .service_unavailable },
+    };
+
+    const thread = try std.Thread.spawn(.{}, MockServer.run, .{ms});
+
+    const url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}{s}", .{ port, path });
+    defer gpa.free(url);
+
+    var http_client: http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+    var client = Client.init(gpa, io, &http_client, Provider.anonymous);
+    defer client.deinit();
+
+    var sink: std.Io.Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+
+    try testing.expectError(
+        error.TooManyRetries,
+        client.getBlobByUrl(url, "repository:test:pull", expected, &sink.writer, .{
+            .max_retries = 2,
+            .initial_backoff_ms = 1,
+        }),
+    );
+
+    thread.join();
+    if (ms.err) |e| return e;
+
+    try testing.expectEqual(@as(usize, 3), ms.requests_seen);
 }

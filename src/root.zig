@@ -19,6 +19,7 @@ pub const registry = struct {
     pub const auth = @import("registry/auth.zig");
     pub const client = @import("registry/client.zig");
     pub const manifest = @import("registry/manifest.zig");
+    pub const blob_pool = @import("registry/blob_pool.zig");
 };
 
 /// This is a documentation comment to explain the `printAnotherMessage` function below.
@@ -43,4 +44,5 @@ test {
     _ = registry.auth;
     _ = registry.client;
     _ = registry.manifest;
+    _ = registry.blob_pool;
 }
