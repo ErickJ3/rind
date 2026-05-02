@@ -10,6 +10,20 @@ pub fn build(b: *std.Build) void {
         "Enable e2e tests that pull from real registries (requires RIND_E2E=1 at runtime).",
     ) orelse false;
 
+    // Dev-only escape hatch: link the host's libc dynamically so DNS
+    // resolution goes through the system's nsswitch (works with
+    // systemd-resolved on typical Linux dev boxes). The default
+    // build stays statically linked with Zig's musl — that's what
+    // ships, but it currently can't talk to the systemd-resolved
+    // stub at 127.0.0.53. A native Zig DNS resolver is on the M4
+    // polish list; until then use `-Ddev-libc=true` to smoke-test
+    // pulls locally.
+    const dev_libc = b.option(
+        bool,
+        "dev-libc",
+        "Link host libc dynamically (workaround for musl + systemd-resolved DNS issues).",
+    ) orelse false;
+
     const build_options = b.addOptions();
     build_options.addOption(bool, "e2e_enabled", enable_e2e);
 
@@ -23,18 +37,21 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
+    const exe_module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = dev_libc,
+        .imports = &.{
+            .{ .name = "rind", .module = mod },
+            .{ .name = "clap", .module = clap_dep.module("clap") },
+            .{ .name = "build_options", .module = build_options.createModule() },
+        },
+    });
+
     const exe = b.addExecutable(.{
         .name = "rind",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "rind", .module = mod },
-                .{ .name = "clap", .module = clap_dep.module("clap") },
-                .{ .name = "build_options", .module = build_options.createModule() },
-            },
-        }),
+        .root_module = exe_module,
     });
 
     b.installArtifact(exe);
