@@ -768,10 +768,6 @@ const TokenCache = struct {
     }
 };
 
-// ---------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------
-
 const testing = std.testing;
 
 test "buildTokenUrl appends service and scope" {
@@ -869,10 +865,6 @@ test "TokenCache invalidate removes entry" {
     cache.invalidate(io, gpa, "realm", "svc", "scope");
     try testing.expectEqual(@as(?[]u8, null), try cache.get(io, gpa, "realm", "svc", "scope", 0));
 }
-
-// ---------------------------------------------------------------------
-// Mock-server integration tests
-// ---------------------------------------------------------------------
 
 const ScriptStep = struct {
     /// Substring the request target must contain (used to identify
