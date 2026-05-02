@@ -296,6 +296,7 @@ fn stubPullSuccess(
     @memset(&d.bytes, 0xaa);
 
     if (opts.progress_fn) |f| {
+        f(opts.progress_ctx, .{ .pull_started = .{ .ref = "alpine:3.19" } });
         f(opts.progress_ctx, .{ .manifest = .{ .digest = d, .media_type = .oci_manifest, .size = 100 } });
         f(opts.progress_ctx, .{ .blob_started = .{ .digest = d, .kind = .config, .size = 50 } });
         f(opts.progress_ctx, .{ .blob_done = .{ .digest = d, .kind = .config, .hit_cache = false } });

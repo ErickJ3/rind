@@ -48,18 +48,32 @@ pub const MediaType = manifest_mod.MediaType;
 /// often render them differently.
 pub const BlobKind = enum { config, layer };
 
-/// Tagged union of orchestrator progress events. Emitted in this
-/// order: `manifest`, then `blob_started` for every slot in slot order
-/// (config first, then layers), then `blob_done` in slot order, then
+/// Tagged union of orchestrator progress events. Emission order:
+/// `pull_started` (once, immediately on entry, before any I/O so the
+/// caller has something visible during the auth+manifest dance),
+/// `manifest`, `blob_started` for every slot in slot order (config
+/// first, then layers), `blob_done` for every cached slot in slot
+/// order (these are decided up-front), then `blob_done` for each
+/// non-cached slot as its blob lands on disk (post-pool finalize
+/// order, same as slot order among the non-cached subset),
 /// `extracted` for every layer in layer order, then `done`.
 pub const PullEvent = union(enum) {
+    /// Pull invocation accepted; no I/O has happened yet. Lets
+    /// renderers print "Pulling <ref>…" before the (potentially slow)
+    /// auth + manifest fetch begins. `ref` borrows from the
+    /// orchestrator's `ref_text` argument and is valid for the
+    /// duration of the callback.
+    pull_started: struct { ref: []const u8 },
     /// Manifest fetched and identified. `size` is the byte length of
     /// the verbatim manifest body.
     manifest: struct { digest: Digest, media_type: MediaType, size: u64 },
     /// A blob slot is about to be processed (or recognised as cached).
     blob_started: struct { digest: Digest, kind: BlobKind, size: u64 },
     /// A blob slot finished. `hit_cache` is true if the blob was
-    /// already present and no network round-trip happened.
+    /// already present and no network round-trip happened. For
+    /// non-cached slots this fires *after* the atomic temp file has
+    /// been linked into the store, not when the worker thread
+    /// returned.
     blob_done: struct { digest: Digest, kind: BlobKind, hit_cache: bool },
     /// A layer's tar contents were materialized under
     /// `<store>/extracted/<hex>/`.
@@ -212,6 +226,10 @@ const Pending = struct {
     url: []u8,
     scope: []u8,
     linked: bool,
+    /// Index back into the orchestrator's `slots` table so the
+    /// post-pool finalize loop can emit `blob_done` with the right
+    /// digest+kind without parallel arrays.
+    slot_idx: usize,
 
     fn cleanup(self: *Pending, io: Io, gpa: Allocator) void {
         if (!self.linked) self.atomic.deinit(io);
@@ -232,6 +250,7 @@ fn initPending(
     scheme: []const u8,
     ref: *const image_ref.ImageRef,
     slot: Slot,
+    slot_idx: usize,
 ) PendingInitError!void {
     // Materialize hex into self.hex_buf first; createFileAtomic stores
     // the path by reference, so the buffer must outlive the call.
@@ -255,6 +274,7 @@ fn initPending(
     errdefer gpa.free(self.scope);
 
     self.linked = false;
+    self.slot_idx = slot_idx;
     self.fw = self.atomic.file.writer(io, self.write_buf);
 }
 
@@ -327,6 +347,8 @@ pub fn pullImage(
     ref_text: []const u8,
     options: PullOptions,
 ) PullError!PullResult {
+    emit(options, .{ .pull_started = .{ .ref = ref_text } });
+
     var ref = try image_ref.parse(gpa, ref_text);
     defer ref.deinit(gpa);
 
@@ -419,9 +441,9 @@ pub fn pullImage(
 
     {
         var j: usize = 0;
-        for (slots) |s| {
+        for (slots, 0..) |s, slot_idx| {
             if (s.cached) continue;
-            try initPending(&pendings[j], io, gpa, store, options.scheme, &ref, s);
+            try initPending(&pendings[j], io, gpa, store, options.scheme, &ref, s, slot_idx);
             init_count = j + 1;
             jobs[j] = .{
                 .url = pendings[j].url,
@@ -443,6 +465,17 @@ pub fn pullImage(
         } });
     }
 
+    // Cached slots are decided up-front; emit their `blob_done`
+    // before the pool runs so warm-cache pulls do not appear to
+    // stall while the pool spins up workers for the rest.
+    for (slots) |s| if (s.cached) {
+        emit(options, .{ .blob_done = .{
+            .digest = s.digest,
+            .kind = s.kind,
+            .hit_cache = true,
+        } });
+    };
+
     // Step 5: drive the pool.
     const eff_concurrency = if (options.concurrency == 0)
         blob_pool.Pool.defaultConcurrency()
@@ -453,10 +486,20 @@ pub fn pullImage(
     defer pool.deinit();
     try pool.runAll(jobs);
 
-    // Step 6: surface per-job errors, then link the temps into place.
+    // Step 6: surface per-job errors, link the temps into place, and
+    // emit `blob_done` for each non-cached slot as it lands. The
+    // workers have already finished — we are on the orchestrator
+    // thread — so the callback is single-threaded and the user sees
+    // one line per blob as the finalize loop walks the jobs.
     for (jobs, 0..) |job, jx| {
         try job.result;
         try finalizePending(&pendings[jx], io);
+        const s = slots[pendings[jx].slot_idx];
+        emit(options, .{ .blob_done = .{
+            .digest = s.digest,
+            .kind = s.kind,
+            .hit_cache = false,
+        } });
     }
 
     // After link, pendings hold no atomic resources — but we still
@@ -466,15 +509,6 @@ pub fn pullImage(
         var k: usize = 0;
         while (k < init_count) : (k += 1) pendings[k].cleanup(io, gpa);
         init_count = 0;
-    }
-
-    // Emit blob_done in slot order.
-    for (slots) |s| {
-        emit(options, .{ .blob_done = .{
-            .digest = s.digest,
-            .kind = s.kind,
-            .hit_cache = s.cached,
-        } });
     }
 
     // Step 7: extract layers (serial; T09 brief does not require
@@ -1037,8 +1071,10 @@ test "pullImage emits progress events in deterministic order" {
     thread.join();
     if (ms.err) |e| return e;
 
-    // Expected order: manifest, blob_started×3, blob_done×3,
-    // extracted×2, done. Verify by walking tags in sequence.
+    // Expected order with no cached slots:
+    // pull_started, manifest, blob_started×3, (no cached blob_done),
+    // blob_done×3 (post-pool, in non-cached/slot order),
+    // extracted×2, done.
     const tags = blk: {
         var arr: std.ArrayList(std.meta.Tag(PullEvent)) = .empty;
         defer arr.deinit(gpa);
@@ -1048,6 +1084,7 @@ test "pullImage emits progress events in deterministic order" {
     defer gpa.free(tags);
 
     const expected = [_]std.meta.Tag(PullEvent){
+        .pull_started,
         .manifest,
         .blob_started,
         .blob_started,

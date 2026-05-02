@@ -20,7 +20,13 @@ const digest_mod = @import("../image/digest.zig");
 
 /// Stable JSON event-stream version. Bumping this is a contract
 /// break; any consumer (miru) keys behavior off it.
-pub const schema_version: u32 = 1;
+///
+/// v2 (T14): introduced the `pull_started` event and rearranged
+/// `blob_done` emission so non-cached slots fire as each blob lands
+/// rather than after the whole pool joins. Cached slots fire
+/// `blob_done` before the pool runs. Field shapes for existing
+/// events are unchanged.
+pub const schema_version: u32 = 2;
 
 /// Fields needed to render the final summary line. The renderer never
 /// allocates — all strings borrow from caller-owned storage.
@@ -80,6 +86,10 @@ pub const Human = struct {
     fn onEvent(ctx: ?*anyopaque, ev: pull_mod.PullEvent) Io.Writer.Error!void {
         const self: *Human = @ptrCast(@alignCast(ctx.?));
         switch (ev) {
+            .pull_started => |p| {
+                if (self.quiet) return;
+                try self.writer.print("Pulling {s}\n", .{p.ref});
+            },
             .manifest => |m| {
                 if (self.quiet) return;
                 var buf: [digest_mod.string_length]u8 = undefined;
@@ -206,6 +216,14 @@ pub const Json = struct {
 pub fn writeEvent(w: *Io.Writer, ev: pull_mod.PullEvent) Io.Writer.Error!void {
     var dig_buf: [digest_mod.string_length]u8 = undefined;
     switch (ev) {
+        .pull_started => |p| {
+            try w.print(
+                "{{\"schema_version\":{d},\"event\":\"pull_started\",\"ref\":",
+                .{schema_version},
+            );
+            try writeJsonString(w, p.ref);
+            try w.writeAll("}\n");
+        },
         .manifest => |m| {
             try w.print(
                 "{{\"schema_version\":{d},\"event\":\"manifest\",\"digest\":\"{s}\",\"media_type\":\"{s}\",\"size\":{d}}}\n",
@@ -290,6 +308,7 @@ test "writeEvent JSON snapshot — full sequence" {
     const l2_dig = fixedDigest(0x44);
 
     const events = [_]pull_mod.PullEvent{
+        .{ .pull_started = .{ .ref = "alpine:3.19" } },
         .{ .manifest = .{
             .digest = m_dig,
             .media_type = .oci_manifest,
@@ -298,8 +317,8 @@ test "writeEvent JSON snapshot — full sequence" {
         .{ .blob_started = .{ .digest = c_dig, .kind = .config, .size = 64 } },
         .{ .blob_started = .{ .digest = l1_dig, .kind = .layer, .size = 1024 } },
         .{ .blob_started = .{ .digest = l2_dig, .kind = .layer, .size = 2048 } },
-        .{ .blob_done = .{ .digest = c_dig, .kind = .config, .hit_cache = false } },
         .{ .blob_done = .{ .digest = l1_dig, .kind = .layer, .hit_cache = true } },
+        .{ .blob_done = .{ .digest = c_dig, .kind = .config, .hit_cache = false } },
         .{ .blob_done = .{ .digest = l2_dig, .kind = .layer, .hit_cache = false } },
         .{ .extracted = .{
             .digest = l1_dig,
