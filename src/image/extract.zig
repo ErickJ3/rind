@@ -32,6 +32,7 @@ const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const flate = std.compress.flate;
+const zstd = std.compress.zstd;
 
 /// Semantic errors returned by the extractor. Per-method error sets
 /// union these with the relevant `flate.Decompress.Error`,
@@ -55,11 +56,11 @@ pub const ExtractError = error{
     CorruptStream,
 };
 
-/// Errors returned by `extractGzip`. Combines the semantic
-/// `ExtractError` set with every transport / filesystem / allocation
-/// error a streaming extraction might surface.
-pub const ExtractGzipError = ExtractError ||
-    flate.Decompress.Error ||
+/// Errors returned by the raw-tar core (`extractTar`). Pure
+/// filesystem / allocation / reader surface — no compression-layer
+/// errors. Compressed wrappers union this with their decoder's typed
+/// error set (`ExtractTarError`, `ExtractZstdError`).
+pub const ExtractTarError = ExtractError ||
     Io.Reader.Error ||
     Io.Dir.OpenError ||
     Io.Dir.CreateDirPathError ||
@@ -70,6 +71,16 @@ pub const ExtractGzipError = ExtractError ||
     Io.File.OpenError ||
     Io.File.Writer.Error ||
     Allocator.Error;
+
+/// Errors returned by `extractGzip`. Combines `ExtractTarError` with
+/// every gzip-decode error the underlying `flate.Decompress` may
+/// stash on `error.ReadFailed`.
+pub const ExtractGzipError = ExtractTarError || flate.Decompress.Error;
+
+/// Errors returned by `extractZstd`. Combines `ExtractTarError` with
+/// every zstd-decode error the underlying `zstd.Decompress` may
+/// stash on `error.ReadFailed`.
+pub const ExtractZstdError = ExtractTarError || zstd.Decompress.Error;
 
 /// Extract a `tar+gzip` layer blob into `dest_dir`.
 ///
@@ -104,6 +115,41 @@ pub fn extractGzip(
     };
 }
 
+/// Extract a `tar+zstd` layer blob into `dest_dir`.
+///
+/// Streams `blob_reader` through zstd decompression, then a tar walker.
+/// Same hardening rules as `extractGzip` (path traversal rejection,
+/// whiteouts, symlink-target validation). `dest_dir` must already
+/// exist and be opened with iteration capability.
+///
+/// `dest_dir` is borrowed; the caller retains ownership and is
+/// responsible for closing it. The zstd decoder needs a sliding
+/// window of `zstd.default_window_len` (8 MiB) plus one block worth
+/// of staging (`zstd.block_size_max`, 128 KiB). This is the spec's
+/// recommended maximum and matches what real registries produce.
+pub fn extractZstd(
+    io: Io,
+    gpa: Allocator,
+    blob_reader: *Io.Reader,
+    dest_dir: Io.Dir,
+) ExtractZstdError!void {
+    // Indirect mode: extractTar reads from dec.reader, so the buffer
+    // must hold the full sliding window plus one block of headroom.
+    const buf_len = @as(usize, zstd.default_window_len) + zstd.block_size_max;
+    const buffer = try gpa.alloc(u8, buf_len);
+    defer gpa.free(buffer);
+
+    var dec: zstd.Decompress = .init(blob_reader, buffer, .{});
+
+    extractTar(io, gpa, &dec.reader, dest_dir) catch |err| switch (err) {
+        // Same diagnostic-stash dance as extractGzip: zstd.Decompress
+        // surfaces `error.ReadFailed` and parks the real cause in
+        // `dec.err` (e.g. `error.BadMagic`, `error.MalformedFrame`).
+        error.ReadFailed => return dec.err orelse error.ReadFailed,
+        else => |e| return e,
+    };
+}
+
 /// Extract a raw (uncompressed) tar stream. Exposed mostly for tests
 /// and for layers whose container has already been peeled off; the
 /// gzip variant is the production entry point.
@@ -112,7 +158,7 @@ pub fn extractTar(
     gpa: Allocator,
     tar_reader: *Io.Reader,
     dest_dir: Io.Dir,
-) ExtractGzipError!void {
+) ExtractTarError!void {
     const file_name_buf = try gpa.alloc(u8, max_path_bytes);
     defer gpa.free(file_name_buf);
     const link_name_buf = try gpa.alloc(u8, max_path_bytes);
@@ -139,7 +185,7 @@ fn handleEntry(
     walker: *Walker,
     entry: TarEntry,
     write_buf: []u8,
-) ExtractGzipError!void {
+) ExtractTarError!void {
     const basename = std.fs.path.basenamePosix(entry.name);
 
     if (std.mem.eql(u8, basename, opaque_whiteout_marker)) {
@@ -425,7 +471,7 @@ const Walker = struct {
 
     /// Discard any data + padding the caller did not consume from the
     /// previous entry. Safe to call multiple times.
-    fn discardRemaining(self: *Walker) ExtractGzipError!void {
+    fn discardRemaining(self: *Walker) ExtractTarError!void {
         if (self.unread > 0) {
             try self.reader.discardAll64(self.unread);
             self.unread = 0;
@@ -447,7 +493,7 @@ const Walker = struct {
     /// Yield the next entry, or `null` at EOF. Transparently consumes
     /// GNU long-name / long-link / PAX prefix headers so the caller
     /// only sees real entries.
-    fn next(self: *Walker) ExtractGzipError!?TarEntry {
+    fn next(self: *Walker) ExtractTarError!?TarEntry {
         try self.discardRemaining();
 
         var name_len: ?usize = self.pending_name_len;
@@ -547,7 +593,7 @@ const Walker = struct {
         }
     }
 
-    fn readPrefix(self: *Walker, size: u64, buf: []u8) ExtractGzipError!usize {
+    fn readPrefix(self: *Walker, size: u64, buf: []u8) ExtractTarError!usize {
         if (size > buf.len) return ExtractError.CorruptStream;
         const n: usize = @intCast(size);
         // GNU long-name records are null-terminated; readSliceAll only
@@ -606,7 +652,7 @@ const Header = struct {
         return std.mem.eql(u8, magic[0..5], "ustar");
     }
 
-    fn fullName(self: Header, buf: []u8) ExtractGzipError![]const u8 {
+    fn fullName(self: Header, buf: []u8) ExtractTarError![]const u8 {
         const n = self.name();
         const p = self.prefix();
         const total = if (p.len == 0) n.len else p.len + 1 + n.len;
@@ -621,19 +667,19 @@ const Header = struct {
         return buf[0..total];
     }
 
-    fn linkName(self: Header, buf: []u8) ExtractGzipError![]const u8 {
+    fn linkName(self: Header, buf: []u8) ExtractTarError![]const u8 {
         const link = nullStr(self.bytes[157..257]);
         if (buf.len < link.len) return ExtractError.CorruptStream;
         @memcpy(buf[0..link.len], link);
         return buf[0..link.len];
     }
 
-    fn mode(self: Header) ExtractGzipError!u32 {
+    fn mode(self: Header) ExtractTarError!u32 {
         const v = octal(self.bytes[100..108]) catch return ExtractError.CorruptStream;
         return @intCast(v);
     }
 
-    fn size(self: Header) ExtractGzipError!u64 {
+    fn size(self: Header) ExtractTarError!u64 {
         const raw = self.bytes[124..136];
         // GNU base-256 binary encoding for sizes that don't fit in 11 octal digits.
         if (raw[0] == 0x80) {
@@ -645,7 +691,7 @@ const Header = struct {
         return octal(raw) catch return ExtractError.CorruptStream;
     }
 
-    fn checksum(self: Header) ExtractGzipError!u64 {
+    fn checksum(self: Header) ExtractTarError!u64 {
         return octal(self.bytes[148..156]) catch ExtractError.CorruptStream;
     }
 
@@ -660,7 +706,7 @@ const Header = struct {
         return .{ .unsigned = u, .signed = s };
     }
 
-    fn verifyChecksum(self: Header) ExtractGzipError!void {
+    fn verifyChecksum(self: Header) ExtractTarError!void {
         const field = try self.checksum();
         const c = self.computedChecksum();
         if (field != c.unsigned and field != @as(u64, @bitCast(c.signed))) {
@@ -668,7 +714,7 @@ const Header = struct {
         }
     }
 
-    fn isZeroBlock(self: Header) ExtractGzipError!bool {
+    fn isZeroBlock(self: Header) ExtractTarError!bool {
         const field = try self.checksum();
         if (field != 0) return false;
         const c = self.computedChecksum();
@@ -703,7 +749,7 @@ const PaxParser = struct {
     reader: *Io.Reader,
     remaining: usize,
 
-    fn next(self: *PaxParser) ExtractGzipError!?PaxAttr {
+    fn next(self: *PaxParser) ExtractTarError!?PaxAttr {
         while (self.remaining > 0) {
             const len_str = self.reader.takeSentinel(' ') catch return ExtractError.CorruptStream;
             const len = std.fmt.parseInt(usize, len_str, 10) catch return ExtractError.CorruptStream;
@@ -729,7 +775,7 @@ const PaxParser = struct {
         return null;
     }
 
-    fn copyValue(self: *PaxParser, attr: PaxAttr, buf: []u8) ExtractGzipError!usize {
+    fn copyValue(self: *PaxParser, attr: PaxAttr, buf: []u8) ExtractTarError!usize {
         if (attr.value_len > buf.len) return ExtractError.CorruptStream;
         self.reader.readSliceAll(buf[0..attr.value_len]) catch return ExtractError.CorruptStream;
         if ((self.reader.takeByte() catch return ExtractError.CorruptStream) != '\n') {
@@ -738,7 +784,7 @@ const PaxParser = struct {
         return attr.value_len;
     }
 
-    fn skipValue(self: *PaxParser, attr: PaxAttr) ExtractGzipError!void {
+    fn skipValue(self: *PaxParser, attr: PaxAttr) ExtractTarError!void {
         self.reader.discardAll(attr.value_len) catch return ExtractError.CorruptStream;
         if ((self.reader.takeByte() catch return ExtractError.CorruptStream) != '\n') {
             return ExtractError.CorruptStream;
@@ -774,6 +820,60 @@ fn buildTarGz(allocator: Allocator, entries: []const TestEntry) ![]u8 {
     try gz.writer.flush();
 
     return gz.toOwnedSlice();
+}
+
+/// Build a tar+zstd blob in-memory from a list of synthetic entries.
+/// Returns a heap-allocated buffer the caller owns. Unlike gzip, the
+/// stdlib has no zstd encoder, so we wrap the raw tar in zstd raw
+/// blocks (block_type=0, no compression) — a self-contained format
+/// the stdlib decoder must accept per RFC 8878.
+fn buildTarZst(allocator: Allocator, entries: []const TestEntry) ![]u8 {
+    var raw: Io.Writer.Allocating = try .initCapacity(allocator, 4096);
+    defer raw.deinit();
+
+    var tar_writer: std.tar.Writer = .{ .underlying_writer = &raw.writer };
+    for (entries) |e| try writeTestEntry(&tar_writer, &raw.writer, e);
+    try raw.writer.flush();
+
+    return zstdRawWrap(allocator, raw.written());
+}
+
+/// Wrap arbitrary `payload` bytes into a single zstd frame composed
+/// of one or more raw (uncompressed) blocks. Frame header uses
+/// FCS_flag=2 (4-byte content size) + Single_Segment=1, matching the
+/// shape the stdlib decoder validates in its own raw-block tests.
+fn zstdRawWrap(allocator: Allocator, payload: []const u8) ![]u8 {
+    const block_max: usize = zstd.block_size_max;
+    // At least one block, even when payload is empty (decoder needs a
+    // last_block marker).
+    const num_blocks: usize = if (payload.len == 0) 1 else (payload.len + block_max - 1) / block_max;
+    const total: usize = 4 + 1 + 4 + num_blocks * 3 + payload.len;
+    const out = try allocator.alloc(u8, total);
+    errdefer allocator.free(out);
+
+    @memcpy(out[0..4], "\x28\xb5\x2f\xfd");
+    out[4] = 0xa0; // FHD: FCS_flag=2 (bits 7-6 = 0b10), Single_Segment=1 (bit 5)
+    std.mem.writeInt(u32, out[5..9], @intCast(payload.len), .little);
+
+    var w: usize = 9;
+    var p: usize = 0;
+    if (payload.len == 0) {
+        // Single empty raw block, last_block=1.
+        std.mem.writeInt(u24, out[w..][0..3], 1, .little);
+        return out;
+    }
+    while (p < payload.len) {
+        const take = @min(block_max, payload.len - p);
+        const last: u24 = if (p + take == payload.len) 1 else 0;
+        // Block header: bits 0=last_block, 1-2=block_type (0=raw), 3-23=size.
+        const header: u24 = (@as(u24, @intCast(take)) << 3) | last;
+        std.mem.writeInt(u24, out[w..][0..3], header, .little);
+        w += 3;
+        @memcpy(out[w..][0..take], payload[p..][0..take]);
+        w += take;
+        p += take;
+    }
+    return out;
 }
 
 const TestEntry = union(enum) {
@@ -1068,6 +1168,218 @@ test "extractGzip overwrites a previous-layer file with a new symlink" {
 
     var reader: Io.Reader = .fixed(blob);
     try extractGzip(testing.io, testing.allocator, &reader, tmp.dir);
+
+    var link_buf: [32]u8 = undefined;
+    const n = try tmp.dir.readLink(testing.io, "old", &link_buf);
+    try testing.expectEqualStrings("elsewhere", link_buf[0..n]);
+}
+
+// ---------------------------------------------------------------------------
+// extractZstd: mirrored coverage of the gzip suite. Same TestEntry inputs,
+// same on-disk expectations — only the compression wrapper differs. Proves
+// the AC's "extracts identically to its .tar.gz twin" requirement.
+// ---------------------------------------------------------------------------
+
+test "extractZstd basic round-trip: dir + file + symlink" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const blob = try buildTarZst(testing.allocator, &.{
+        .{ .dir = .{ .path = "bin" } },
+        .{ .file = .{ .path = "bin/sh", .content = "#!/bin/sh\n", .mode = 0o755 } },
+        .{ .symlink = .{ .path = "bin/ash", .target = "sh" } },
+    });
+    defer testing.allocator.free(blob);
+
+    var reader: Io.Reader = .fixed(blob);
+    try extractZstd(testing.io, testing.allocator, &reader, tmp.dir);
+
+    var content_buf: [32]u8 = undefined;
+    const content = try tmp.dir.readFile(testing.io, "bin/sh", &content_buf);
+    try testing.expectEqualStrings("#!/bin/sh\n", content);
+
+    if (Io.File.Permissions.has_executable_bit) {
+        const stat = try tmp.dir.statFile(testing.io, "bin/sh", .{});
+        const mode = stat.permissions.toMode();
+        try testing.expect(mode & 0o100 != 0);
+    }
+
+    var link_buf: [32]u8 = undefined;
+    const link_n = try tmp.dir.readLink(testing.io, "bin/ash", &link_buf);
+    try testing.expectEqualStrings("sh", link_buf[0..link_n]);
+}
+
+test "extractZstd whiteout removes a prior-layer file" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(testing.io, "etc");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "etc/hostname", .data = "old" });
+
+    const blob = try buildTarZst(testing.allocator, &.{
+        .{ .file = .{ .path = "etc/.wh.hostname", .content = "" } },
+    });
+    defer testing.allocator.free(blob);
+
+    var reader: Io.Reader = .fixed(blob);
+    try extractZstd(testing.io, testing.allocator, &reader, tmp.dir);
+
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(testing.io, "etc/hostname", .{}));
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(testing.io, "etc/.wh.hostname", .{}));
+    const etc_stat = try tmp.dir.statFile(testing.io, "etc", .{});
+    try testing.expectEqual(Io.File.Kind.directory, etc_stat.kind);
+}
+
+test "extractZstd opaque whiteout clears a directory's contents" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(testing.io, "etc");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "etc/a", .data = "1" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "etc/b", .data = "2" });
+    try tmp.dir.createDirPath(testing.io, "etc/sub");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "etc/sub/c", .data = "3" });
+
+    const blob = try buildTarZst(testing.allocator, &.{
+        .{ .file = .{ .path = "etc/.wh..wh..opq", .content = "" } },
+    });
+    defer testing.allocator.free(blob);
+
+    var reader: Io.Reader = .fixed(blob);
+    try extractZstd(testing.io, testing.allocator, &reader, tmp.dir);
+
+    const etc_stat = try tmp.dir.statFile(testing.io, "etc", .{});
+    try testing.expectEqual(Io.File.Kind.directory, etc_stat.kind);
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(testing.io, "etc/a", .{}));
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(testing.io, "etc/b", .{}));
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(testing.io, "etc/sub", .{}));
+}
+
+test "extractZstd rejects path-traversal entry" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const blob = try buildTarZst(testing.allocator, &.{
+        .{ .raw_path_file = .{ .path = "../../etc/passwd", .content = "pwned" } },
+    });
+    defer testing.allocator.free(blob);
+
+    var reader: Io.Reader = .fixed(blob);
+    try testing.expectError(ExtractError.UnsafePath, extractZstd(testing.io, testing.allocator, &reader, tmp.dir));
+}
+
+test "extractZstd rejects absolute path entry" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const blob = try buildTarZst(testing.allocator, &.{
+        .{ .raw_path_file = .{ .path = "/etc/passwd", .content = "pwned" } },
+    });
+    defer testing.allocator.free(blob);
+
+    var reader: Io.Reader = .fixed(blob);
+    try testing.expectError(ExtractError.UnsafePath, extractZstd(testing.io, testing.allocator, &reader, tmp.dir));
+}
+
+test "extractZstd rejects symlink target that escapes rootfs" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const blob = try buildTarZst(testing.allocator, &.{
+        .{ .symlink = .{ .path = "link", .target = "../../etc" } },
+    });
+    defer testing.allocator.free(blob);
+
+    var reader: Io.Reader = .fixed(blob);
+    try testing.expectError(ExtractError.UnsafePath, extractZstd(testing.io, testing.allocator, &reader, tmp.dir));
+}
+
+test "extractZstd rejects absolute symlink target" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const blob = try buildTarZst(testing.allocator, &.{
+        .{ .symlink = .{ .path = "link", .target = "/etc" } },
+    });
+    defer testing.allocator.free(blob);
+
+    var reader: Io.Reader = .fixed(blob);
+    try testing.expectError(ExtractError.UnsafePath, extractZstd(testing.io, testing.allocator, &reader, tmp.dir));
+}
+
+test "extractZstd materializes a hard link" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const blob = try buildTarZst(testing.allocator, &.{
+        .{ .file = .{ .path = "a", .content = "shared" } },
+        .{ .hardlink = .{ .path = "b", .target = "a" } },
+    });
+    defer testing.allocator.free(blob);
+
+    var reader: Io.Reader = .fixed(blob);
+    try extractZstd(testing.io, testing.allocator, &reader, tmp.dir);
+
+    const stat_a = try tmp.dir.statFile(testing.io, "a", .{});
+    const stat_b = try tmp.dir.statFile(testing.io, "b", .{});
+    try testing.expectEqual(stat_a.inode, stat_b.inode);
+
+    var content_buf: [16]u8 = undefined;
+    const c = try tmp.dir.readFile(testing.io, "b", &content_buf);
+    try testing.expectEqualStrings("shared", c);
+}
+
+test "extractZstd rejects fifo / unsupported entry kind" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const blob = try buildTarZst(testing.allocator, &.{
+        .{ .fifo = .{ .path = "myfifo" } },
+    });
+    defer testing.allocator.free(blob);
+
+    var reader: Io.Reader = .fixed(blob);
+    try testing.expectError(ExtractError.UnsupportedEntryKind, extractZstd(testing.io, testing.allocator, &reader, tmp.dir));
+}
+
+test "extractZstd surfaces typed error for non-zstd blob" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const garbage = "not a zstd stream, not even close" ** 8;
+    var reader: Io.Reader = .fixed(garbage);
+    try testing.expectError(error.BadMagic, extractZstd(testing.io, testing.allocator, &reader, tmp.dir));
+}
+
+test "extractZstd surfaces typed error for truncated frame" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const full = try buildTarZst(testing.allocator, &.{
+        .{ .file = .{ .path = "a", .content = "hello world" } },
+    });
+    defer testing.allocator.free(full);
+
+    // Lop off the trailing block (header + payload). Decoder must fail
+    // with a typed zstd error rather than silently succeeding.
+    const truncated = full[0 .. full.len - 8];
+    var reader: Io.Reader = .fixed(truncated);
+    try testing.expectError(error.EndOfStream, extractZstd(testing.io, testing.allocator, &reader, tmp.dir));
+}
+
+test "extractZstd overwrites a previous-layer file with a new symlink" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "old", .data = "stale" });
+
+    const blob = try buildTarZst(testing.allocator, &.{
+        .{ .symlink = .{ .path = "old", .target = "elsewhere" } },
+    });
+    defer testing.allocator.free(blob);
+
+    var reader: Io.Reader = .fixed(blob);
+    try extractZstd(testing.io, testing.allocator, &reader, tmp.dir);
 
     var link_buf: [32]u8 = undefined;
     const n = try tmp.dir.readLink(testing.io, "old", &link_buf);
