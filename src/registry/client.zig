@@ -428,74 +428,125 @@ pub const Client = struct {
         opts: SendOptions,
         body_writer: ?*Io.Writer,
     ) FetchError!SendResult {
-        // Build the extra-headers slice on the stack. Cap at 8 — we
-        // never compose more than user_agent + accept + auth +
-        // caller's extras (T05's Accept list is one header value).
-        var headers_buf: [8]http.Header = undefined;
-        var n: usize = 0;
-        headers_buf[n] = .{ .name = "user-agent", .value = self.user_agent };
-        n += 1;
-        if (opts.accept) |a| {
-            headers_buf[n] = .{ .name = "accept", .value = a };
+        // Manual redirect loop. We disable std.http's auto-follow
+        // because it preserves every header in `extra_headers` across
+        // cross-domain hops; forwarding the Bearer token to Docker
+        // Hub's CDN trips S3's "only one auth mechanism" rule
+        // (signed query + Authorization header → 400). On a host
+        // change we drop `current_auth` before reissuing so the token
+        // never reaches the CDN.
+        var current_uri = opts.uri;
+        var current_auth: ?[]const u8 = opts.auth_header;
+        var owned_url: ?[]u8 = null;
+        defer if (owned_url) |u| self.gpa.free(u);
+        var redirects_left: u8 = 3;
+
+        while (true) {
+            // Build the extra-headers slice on the stack. Cap at 8 —
+            // we never compose more than user_agent + accept + auth +
+            // caller's extras (T05's Accept list is one header value).
+            var headers_buf: [8]http.Header = undefined;
+            var n: usize = 0;
+            headers_buf[n] = .{ .name = "user-agent", .value = self.user_agent };
             n += 1;
-        }
-        if (opts.auth_header) |h| {
-            headers_buf[n] = .{ .name = "authorization", .value = h };
-            n += 1;
-        }
-        for (opts.extra_headers) |h| {
-            if (n >= headers_buf.len) break;
-            headers_buf[n] = h;
-            n += 1;
-        }
+            if (opts.accept) |a| {
+                headers_buf[n] = .{ .name = "accept", .value = a };
+                n += 1;
+            }
+            if (current_auth) |h| {
+                headers_buf[n] = .{ .name = "authorization", .value = h };
+                n += 1;
+            }
+            for (opts.extra_headers) |h| {
+                if (n >= headers_buf.len) break;
+                headers_buf[n] = h;
+                n += 1;
+            }
 
-        var redirect_buf: [8 * 1024]u8 = undefined;
+            var redirect_buf: [8 * 1024]u8 = undefined;
 
-        var req = try self.http.request(opts.method, opts.uri, .{
-            .extra_headers = headers_buf[0..n],
-            .keep_alive = false,
-        });
-        defer req.deinit();
+            var req = try self.http.request(opts.method, current_uri, .{
+                .extra_headers = headers_buf[0..n],
+                .keep_alive = false,
+                .redirect_behavior = .unhandled,
+            });
+            var req_alive = true;
+            defer if (req_alive) req.deinit();
 
-        req.sendBodiless() catch return error.WriteFailed;
-        var response = try req.receiveHead(&redirect_buf);
+            req.sendBodiless() catch return error.WriteFailed;
+            var response = try req.receiveHead(&redirect_buf);
 
-        // 401 bodies are diagnostic JSON the auth dance discards;
-        // never let them contaminate the caller's writer.
-        const will_stream = body_writer != null and response.head.status != .unauthorized;
+            // Redirect: parse Location, swap URIs, strip auth on host
+            // change, retry. Hop-cap is 3 to mirror std.http's default.
+            if (response.head.status.class() == .redirect and redirects_left > 0) {
+                const loc_borrow = response.head.location orelse return error.UnexpectedStatus;
+                const loc_dup = try self.gpa.dupe(u8, loc_borrow);
+                errdefer self.gpa.free(loc_dup);
 
-        var result: SendResult = .{
-            .status = response.head.status,
-            .content_length = response.head.content_length,
-            .body_was_discarded = !will_stream,
-        };
-        errdefer result.deinit(self.gpa);
+                // Drain the redirect body so the connection state is
+                // sane before we close it.
+                var drain_buf: [16 * 1024]u8 = undefined;
+                _ = response.reader(&drain_buf).discardRemaining() catch {};
+                req.deinit();
+                req_alive = false;
 
-        if (response.head.content_type) |ct| {
-            result.content_type = try self.gpa.dupe(u8, ct);
-        }
-        {
-            var it = response.head.iterateHeaders();
-            while (it.next()) |hdr| {
-                if (std.ascii.eqlIgnoreCase(hdr.name, "www-authenticate")) {
-                    result.www_authenticate = try self.gpa.dupe(u8, hdr.value);
-                    break;
+                const new_uri = std.Uri.parse(loc_dup) catch {
+                    self.gpa.free(loc_dup);
+                    return error.UnexpectedStatus;
+                };
+
+                var ob: [std.Io.net.HostName.max_len]u8 = undefined;
+                var nb: [std.Io.net.HostName.max_len]u8 = undefined;
+                const old_host = current_uri.getHost(&ob) catch return error.UriMissingHost;
+                const new_host = new_uri.getHost(&nb) catch return error.UriMissingHost;
+                if (!std.ascii.eqlIgnoreCase(old_host.bytes, new_host.bytes)) {
+                    current_auth = null;
+                }
+
+                if (owned_url) |u| self.gpa.free(u);
+                owned_url = loc_dup;
+                current_uri = new_uri;
+                redirects_left -= 1;
+                continue;
+            }
+
+            // 401 bodies are diagnostic JSON the auth dance discards;
+            // never let them contaminate the caller's writer.
+            const will_stream = body_writer != null and response.head.status != .unauthorized;
+
+            var result: SendResult = .{
+                .status = response.head.status,
+                .content_length = response.head.content_length,
+                .body_was_discarded = !will_stream,
+            };
+            errdefer result.deinit(self.gpa);
+
+            if (response.head.content_type) |ct| {
+                result.content_type = try self.gpa.dupe(u8, ct);
+            }
+            {
+                var it = response.head.iterateHeaders();
+                while (it.next()) |hdr| {
+                    if (std.ascii.eqlIgnoreCase(hdr.name, "www-authenticate")) {
+                        result.www_authenticate = try self.gpa.dupe(u8, hdr.value);
+                        break;
+                    }
                 }
             }
-        }
 
-        var transfer_buf: [16 * 1024]u8 = undefined;
-        const body_reader = response.reader(&transfer_buf);
-        if (will_stream) {
-            _ = body_reader.streamRemaining(body_writer.?) catch |err| switch (err) {
-                error.ReadFailed => return error.ReadFailed,
-                error.WriteFailed => return error.WriteFailed,
-            };
-        } else {
-            _ = body_reader.discardRemaining() catch return error.ReadFailed;
-        }
+            var transfer_buf: [16 * 1024]u8 = undefined;
+            const body_reader = response.reader(&transfer_buf);
+            if (will_stream) {
+                _ = body_reader.streamRemaining(body_writer.?) catch |err| switch (err) {
+                    error.ReadFailed => return error.ReadFailed,
+                    error.WriteFailed => return error.WriteFailed,
+                };
+            } else {
+                _ = body_reader.discardRemaining() catch return error.ReadFailed;
+            }
 
-        return result;
+            return result;
+        }
     }
 
     /// Options for `getManifest` / `getManifestByUrl`.
@@ -1203,11 +1254,19 @@ const MockServer = struct {
 };
 
 fn startMockServer(io: Io, steps: []const ScriptStep) !*MockServer {
+    return startMockServerAt(io, .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 }, steps);
+}
+
+fn startMockServerAt(
+    io: Io,
+    ip4: std.Io.net.Ip4Address,
+    steps: []const ScriptStep,
+) !*MockServer {
     const gpa = testing.allocator;
     const ms = try gpa.create(MockServer);
     errdefer gpa.destroy(ms);
 
-    var addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var addr: std.Io.net.IpAddress = .{ .ip4 = ip4 };
     const server = try std.Io.net.IpAddress.listen(&addr, io, .{ .reuse_address = true });
     ms.* = .{
         .server = server,
@@ -1595,6 +1654,101 @@ test "fetch — 401 after fresh token returns Unauthorized (no infinite loop)" {
 
     thread.join();
     if (ms.err) |e| return e;
+}
+
+test "fetch — cross-domain redirect strips Authorization (Docker Hub CDN gotcha)" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    // Server A on 127.0.0.1: serves the bearer challenge + redirect.
+    // Server B on 127.0.0.2: receives the followed redirect; must
+    // NOT see Authorization (else AWS S3 returns 400 — see sendOnce
+    // for the rationale).
+    var msa = try startMockServerAt(io, .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 }, &.{});
+    defer stopMockServer(msa);
+    var msb = try startMockServerAt(io, .{ .bytes = .{ 127, 0, 0, 2 }, .port = 0 }, &.{});
+    defer stopMockServer(msb);
+
+    const port_a = msa.server.socket.address.getPort();
+    const port_b = msb.server.socket.address.getPort();
+
+    const challenge_value = try std.fmt.allocPrint(
+        gpa,
+        "Bearer realm=\"http://127.0.0.1:{d}/token\",service=\"rind-test\",scope=\"repository:test:pull\"",
+        .{port_a},
+    );
+    defer gpa.free(challenge_value);
+    const challenge_headers = [_]http.Header{
+        .{ .name = "www-authenticate", .value = challenge_value },
+    };
+
+    const redirect_target = try std.fmt.allocPrint(
+        gpa,
+        "http://127.0.0.2:{d}/cdn/blob",
+        .{port_b},
+    );
+    defer gpa.free(redirect_target);
+    const redirect_headers = [_]http.Header{
+        .{ .name = "location", .value = redirect_target },
+    };
+
+    msa.steps = &.{
+        .{
+            .path_contains = "/v2/test/blobs/",
+            .head_not_contains = "authorization:",
+            .status = .unauthorized,
+            .extra_headers = &challenge_headers,
+        },
+        .{
+            .path_contains = "/token?service=rind-test",
+            .status = .ok,
+            .body = "{\"token\":\"deadbeef\"}",
+        },
+        .{
+            .path_contains = "/v2/test/blobs/",
+            .head_contains = "Bearer deadbeef",
+            .status = .temporary_redirect,
+            .extra_headers = &redirect_headers,
+        },
+    };
+
+    msb.steps = &.{
+        .{
+            .path_contains = "/cdn/blob",
+            .head_not_contains = "authorization:",
+            .status = .ok,
+            .body = "blob-bytes",
+        },
+    };
+
+    const ta = try std.Thread.spawn(.{}, MockServer.run, .{msa});
+    const tb = try std.Thread.spawn(.{}, MockServer.run, .{msb});
+
+    const url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/v2/test/blobs/sha256:abc", .{port_a});
+    defer gpa.free(url);
+
+    var http_client: http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+
+    var client = Client.init(gpa, io, &http_client, Provider.anonymous);
+    defer client.deinit();
+
+    var body_buf: Io.Writer.Allocating = .init(gpa);
+    defer body_buf.deinit();
+
+    var resp = try client.fetch(.{
+        .url = url,
+        .scope = "repository:test:pull",
+    }, &body_buf.writer);
+    defer resp.deinit(gpa);
+
+    ta.join();
+    tb.join();
+    if (msa.err) |e| return e;
+    if (msb.err) |e| return e;
+
+    try testing.expectEqual(http.Status.ok, resp.status);
+    try testing.expectEqualStrings("blob-bytes", body_buf.written());
 }
 
 test "fetch — token endpoint failure surfaces TokenEndpointFailed" {
