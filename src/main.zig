@@ -86,5 +86,6 @@ test {
     _ = @import("cli/exit.zig");
     _ = @import("cli/output.zig");
     _ = @import("cli/pull.zig");
+    _ = @import("cli/images.zig");
     _ = @import("cli/root.zig");
 }

@@ -21,6 +21,7 @@ const Environ = std.process.Environ;
 const exit = @import("exit.zig");
 const output = @import("output.zig");
 const pull_cli = @import("pull.zig");
+const images_cli = @import("images.zig");
 
 /// Default storage root suffix appended to `$HOME` when `RIND_ROOT`
 /// is unset. Matches the layout described in `docs/rind.md`.
@@ -29,7 +30,7 @@ pub const default_root_suffix: []const u8 = ".rind";
 pub const store_subpath: []const u8 = "store";
 
 /// One-line usage banner for the top-level CLI.
-pub const usage_line: []const u8 = "Usage: rind <command> [args...]\nCommands:\n  pull   Pull an image into the local store\n  help   Show this message";
+pub const usage_line: []const u8 = "Usage: rind <command> [args...]\nCommands:\n  pull    Pull an image into the local store\n  images  List images in the local store\n  help    Show this message";
 
 /// Resolve the rind state-root directory. Precedence:
 /// 1. `RIND_ROOT` env var (used as-is).
@@ -67,6 +68,9 @@ pub fn dispatch(
     }
     if (std.mem.eql(u8, cmd, "pull")) {
         return runPull(io, gpa, argv[2..], env_map, stdout, stderr);
+    }
+    if (std.mem.eql(u8, cmd, "images")) {
+        return runImages(io, gpa, argv[2..], env_map, stdout, stderr);
     }
     try stderr.print("rind: unknown command '{s}'\n{s}\n", .{ cmd, usage_line });
     return error.Usage;
@@ -119,6 +123,38 @@ fn runPull(
     };
 
     try pull_cli.run(io, gpa, &store, &client, args, &renderer, .{});
+}
+
+fn runImages(
+    io: Io,
+    gpa: Allocator,
+    sub_argv: []const []const u8,
+    env_map: *const Environ.Map,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+) !void {
+    var iter: SliceIter = .{ .items = sub_argv };
+    const args = try images_cli.parseArgs(gpa, &iter, stderr);
+    defer images_cli.freeArgs(gpa, args);
+
+    const root_path = try resolveRoot(gpa, env_map);
+    defer gpa.free(root_path);
+
+    var root_dir = try Io.Dir.cwd().createDirPathOpen(io, root_path, .{
+        .open_options = .{ .iterate = true },
+    });
+    defer root_dir.close(io);
+
+    var store = layout.Store.open(io, root_dir, store_subpath) catch |err| switch (err) {
+        layout.StoreError.InvalidLayout => {
+            try stderr.print("rind: no image store at '{s}/{s}' (run `rind pull` first)\n", .{ root_path, store_subpath });
+            return err;
+        },
+        else => |e| return e,
+    };
+    defer store.close(io);
+
+    try images_cli.run(io, gpa, &store, args, stdout, stderr);
 }
 
 const SliceIter = struct {

@@ -2,11 +2,13 @@
 const std = @import("std");
 const Io = std.Io;
 
-/// Image-layer modules: reference parsing, digest helpers, layer extraction.
+/// Image-layer modules: reference parsing, digest helpers, layer
+/// extraction, image-config decoding.
 pub const image = struct {
     pub const ref = @import("image/ref.zig");
     pub const digest = @import("image/digest.zig");
     pub const extract = @import("image/extract.zig");
+    pub const config = @import("image/config.zig");
 };
 
 /// On-disk store modules: OCI image layout, blob ingestion, indexing.
@@ -46,6 +48,7 @@ test {
     _ = image.ref;
     _ = image.digest;
     _ = image.extract;
+    _ = image.config;
     _ = store.layout;
     _ = registry.auth;
     _ = registry.client;
