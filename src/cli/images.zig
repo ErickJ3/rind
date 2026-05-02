@@ -169,7 +169,13 @@ pub fn run(
 
 const col1_w: usize = 32;
 const col2_w: usize = 15;
-const col3_w: usize = 31;
+const col3_w: usize = 13;
+
+/// Width of the date prefix shown in the human CREATED column.
+/// ISO 8601 timestamps always start with `YYYY-MM-DD` (10 chars); the
+/// time-of-day suffix is dropped so the column stays narrow. JSON
+/// output keeps the full timestamp.
+const created_date_len: usize = 10;
 
 /// Number of hex characters shown in the human IMAGE ID column. The
 /// `sha256:` prefix is dropped — at 12 hex chars the collision space
@@ -214,7 +220,8 @@ fn renderHuman(w: *Io.Writer, rows: []const ImageRow) Io.Writer.Error!void {
         const hex = row.digest.encodedHex(&hex_buf);
         try writePadded(w, hex[0..short_id_hex], col2_w);
 
-        const created = row.created_at orelse "<unknown>";
+        const created_full = row.created_at orelse "<unknown>";
+        const created = created_full[0..@min(created_full.len, created_date_len)];
         try writePadded(w, created, col3_w);
 
         try writeHumanSize(w, row.size);
