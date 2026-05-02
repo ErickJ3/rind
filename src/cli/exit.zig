@@ -32,6 +32,9 @@ pub const CliExtras = error{
     /// Storage root could not be resolved: neither `RIND_ROOT` nor
     /// `HOME` was set in the environment.
     HomeNotFound,
+    /// `rind inspect` did not find a descriptor in `index.json`
+    /// matching the supplied tag or digest.
+    RefNotFound,
 };
 
 /// Closed superset returned by CLI entry points. Composes the
@@ -113,4 +116,5 @@ test "mapErrorToExitCode classifies common cases" {
     try testing.expectEqual(Code.network, mapErrorToExitCode(error.ServerError));
     try testing.expectEqual(Code.generic, mapErrorToExitCode(error.OutOfMemory));
     try testing.expectEqual(Code.generic, mapErrorToExitCode(error.HomeNotFound));
+    try testing.expectEqual(Code.generic, mapErrorToExitCode(error.RefNotFound));
 }
