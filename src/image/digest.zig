@@ -95,6 +95,15 @@ pub const Digest = struct {
         @memcpy(buf[prefix.len..], &hex);
         return buf[0..];
     }
+
+    /// Render the bare lowercase hex (no `sha256:` prefix) into `buf`.
+    /// This is the form used as the on-disk filename in an OCI image
+    /// layout (`blobs/sha256/<encodedHex>`).
+    pub fn encodedHex(self: Digest, buf: *[hex_length]u8) []const u8 {
+        const hex = std.fmt.bytesToHex(self.bytes, .lower);
+        @memcpy(buf, &hex);
+        return buf[0..];
+    }
 };
 
 /// Streaming sha256 hasher. Construct with `init`, feed bytes through
@@ -221,6 +230,14 @@ test "format writer hook produces canonical string" {
     var sink: std.Io.Writer = .fixed(&sink_buf);
     try d.format(&sink);
     try testing.expectEqualStrings(prefix ++ abc_hex.*, sink.buffered());
+}
+
+test "encodedHex strips the algorithm prefix" {
+    const d = try Digest.parse(prefix ++ abc_hex.*);
+    var buf: [hex_length]u8 = undefined;
+    const hex = d.encodedHex(&buf);
+    try testing.expectEqualStrings(abc_hex.*[0..], hex);
+    try testing.expectEqual(hex_length, hex.len);
 }
 
 test "fromBytes wraps raw hash" {

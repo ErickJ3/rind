@@ -8,6 +8,11 @@ pub const image = struct {
     pub const digest = @import("image/digest.zig");
 };
 
+/// On-disk store modules: OCI image layout, blob ingestion, indexing.
+pub const store = struct {
+    pub const layout = @import("store/layout.zig");
+};
+
 /// This is a documentation comment to explain the `printAnotherMessage` function below.
 ///
 /// Accepting an `Io.Writer` instance is a handy way to write reusable code.
@@ -26,4 +31,5 @@ test "basic add functionality" {
 test {
     _ = image.ref;
     _ = image.digest;
+    _ = store.layout;
 }
