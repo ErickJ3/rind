@@ -1,3 +1,3 @@
-REPOSITORY:TAG                  IMAGE ID             CREATED                        SIZE
-alpine:3.19                     sha256:111111111111  2024-01-27T00:30:48.6Z         7791693
-ghcr.io/foo/bar:v2              sha256:222222222222  2024-03-15T10:00:00Z           15234567
+REPOSITORY:TAG                  IMAGE ID       CREATED                        SIZE
+alpine:3.19                     111111111111   2024-01-27T00:30:48.6Z         7.79MB
+ghcr.io/foo/bar:v2              222222222222   2024-03-15T10:00:00Z           15.23MB

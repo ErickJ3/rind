@@ -168,11 +168,13 @@ pub fn run(
 }
 
 const col1_w: usize = 32;
-const col2_w: usize = 21;
+const col2_w: usize = 15;
 const col3_w: usize = 31;
 
+/// Number of hex characters shown in the human IMAGE ID column. The
+/// `sha256:` prefix is dropped — at 12 hex chars the collision space
+/// is 2^48, comfortably unique within a single host's local store.
 const short_id_hex: usize = 12;
-const short_id_len: usize = digest_mod.prefix.len + short_id_hex;
 
 fn writePadded(w: *Io.Writer, s: []const u8, width: usize) Io.Writer.Error!void {
     try w.writeAll(s);
@@ -180,6 +182,23 @@ fn writePadded(w: *Io.Writer, s: []const u8, width: usize) Io.Writer.Error!void 
         var n: usize = width - s.len;
         while (n > 0) : (n -= 1) try w.writeByte(' ');
     }
+}
+
+/// Decimal SI byte sizes (matches `docker images` and `go-units.HumanSize`).
+/// Sub-kilobyte renders as raw bytes; everything else uses two decimals
+/// so the column stays narrow without losing useful precision.
+fn writeHumanSize(w: *Io.Writer, n: u64) Io.Writer.Error!void {
+    const units = [_][]const u8{ "B", "kB", "MB", "GB", "TB", "PB" };
+    if (n < 1000) {
+        try w.print("{d}B", .{n});
+        return;
+    }
+    var v: f64 = @floatFromInt(n);
+    var i: usize = 0;
+    while (v >= 1000.0 and i + 1 < units.len) : (i += 1) {
+        v /= 1000.0;
+    }
+    try w.print("{d:.2}{s}", .{ v, units[i] });
 }
 
 fn renderHuman(w: *Io.Writer, rows: []const ImageRow) Io.Writer.Error!void {
@@ -191,14 +210,15 @@ fn renderHuman(w: *Io.Writer, rows: []const ImageRow) Io.Writer.Error!void {
     for (rows) |row| {
         try writePadded(w, row.ref, col1_w);
 
-        var dig_buf: [digest_mod.string_length]u8 = undefined;
-        const full = row.digest.toString(&dig_buf);
-        try writePadded(w, full[0..short_id_len], col2_w);
+        var hex_buf: [digest_mod.hex_length]u8 = undefined;
+        const hex = row.digest.encodedHex(&hex_buf);
+        try writePadded(w, hex[0..short_id_hex], col2_w);
 
         const created = row.created_at orelse "<unknown>";
         try writePadded(w, created, col3_w);
 
-        try w.print("{d}\n", .{row.size});
+        try writeHumanSize(w, row.size);
+        try w.writeByte('\n');
     }
 }
 
