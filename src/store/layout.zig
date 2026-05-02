@@ -36,6 +36,12 @@ pub const Hasher = digest_mod.Hasher;
 /// algorithm in MVP (see `image/digest.zig`).
 pub const blobs_subpath: []const u8 = "blobs/sha256";
 
+/// Subpath, relative to the store root, under which extracted layer
+/// trees live (one subdirectory per layer digest). Owned by T07; the
+/// store itself does not create or manage this path — `Store.init`
+/// leaves it to the pull orchestrator (T09) to materialize on demand.
+pub const extracted_subpath: []const u8 = "extracted";
+
 /// `imageLayoutVersion` value the store writes and the only one it
 /// accepts on open.
 pub const oci_layout_version: []const u8 = "1.0.0";

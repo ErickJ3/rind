@@ -6,6 +6,7 @@ const Io = std.Io;
 pub const image = struct {
     pub const ref = @import("image/ref.zig");
     pub const digest = @import("image/digest.zig");
+    pub const extract = @import("image/extract.zig");
 };
 
 /// On-disk store modules: OCI image layout, blob ingestion, indexing.
@@ -40,6 +41,7 @@ test "basic add functionality" {
 test {
     _ = image.ref;
     _ = image.digest;
+    _ = image.extract;
     _ = store.layout;
     _ = registry.auth;
     _ = registry.client;
