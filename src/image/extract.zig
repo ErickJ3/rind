@@ -11,6 +11,14 @@
 //!      targets are validated lexically *before* the link is created
 //!      (rather than canonicalizing post-create) to avoid TOCTOU and to
 //!      keep the check correct when the target file does not yet exist.
+//!      **Absolute symlink targets are accepted** — real OCI layers
+//!      (busybox-derived images alone ship hundreds of `bin/<applet>
+//!      -> /bin/busybox` links) require it. The kernel does not resolve
+//!      the target at `symlinkat` time; the runtime risk that a later
+//!      extractor op traverses through such a link onto the host is
+//!      tracked separately and will be addressed when the runner
+//!      milestone introduces NOFOLLOW-style path resolution on
+//!      per-layer overlays.
 //!
 //!   2. **Whiteouts** — `.wh.<name>` removes a sibling and `.wh..wh..opq`
 //!      clears its parent directory's contents (preserving the directory
@@ -390,16 +398,31 @@ fn sanitizeLogical(buffer: []u8, path: []const u8) error{Invalid}!usize {
     return i;
 }
 
-/// Reject symlink targets that resolve outside the extraction root.
-/// Absolute targets are rejected unconditionally. For relative targets,
-/// we walk `parent_components(link_path) ++ split(target)` with a depth
-/// counter; if depth ever drops below zero, the link escapes.
+/// Reject symlink targets that, when *resolved relative to the link's
+/// parent directory*, escape the extraction root.
+///
+/// **Absolute targets are accepted.** Real OCI layers ship them
+/// constantly (busybox-derived images alone contain hundreds of
+/// `bin/<applet> -> /bin/busybox` links). The extractor only writes
+/// the target string verbatim — the kernel does not resolve it at
+/// `symlinkat` time — and `runc` later mounts the rootfs as the
+/// container's `/`, where the absolute path resolves inside the
+/// container. The runtime risk that a *subsequent* extractor
+/// operation traverses through such a link onto the host is real but
+/// unrelated to the link's own creation; defending against it
+/// requires NOFOLLOW-style path resolution on every later op and is
+/// tracked separately (see security note in module-level doc).
+///
+/// For relative targets we walk `parent_components(link_path) ++
+/// split(target)` with a depth counter; if depth ever drops below
+/// zero, the link escapes and we reject it.
 ///
 /// SECURITY: lexical check, mirroring `sanitizeLogical`. See its doc
 /// comment for the TOCTOU rationale.
 fn validateSymlinkTarget(link_path: []const u8, target: []const u8) ExtractError!void {
     if (target.len == 0) return ExtractError.UnsafePath;
-    if (target[0] == '/') return ExtractError.UnsafePath;
+    // Absolute targets are allowed; see doc comment.
+    if (target[0] == '/') return;
 
     // Starting depth = number of components in link_path's parent dir.
     // E.g. `bin/sh` has parent `bin/` with depth 1; the symlink lives
@@ -975,8 +998,16 @@ test "validateSymlinkTarget accepts in-tree relative target" {
     try validateSymlinkTarget("a/b/c", "../../d");
 }
 
-test "validateSymlinkTarget rejects absolute target" {
-    try testing.expectError(ExtractError.UnsafePath, validateSymlinkTarget("link", "/etc"));
+test "validateSymlinkTarget accepts absolute target (busybox-style)" {
+    // Real OCI layers ship absolute symlinks like `bin/arch ->
+    // /bin/busybox`. The target string is written verbatim; the
+    // kernel does not resolve it at symlinkat time. See doc comment.
+    try validateSymlinkTarget("bin/arch", "/bin/busybox");
+    try validateSymlinkTarget("usr/bin/awk", "/etc/alternatives/awk");
+}
+
+test "validateSymlinkTarget rejects empty target" {
+    try testing.expectError(ExtractError.UnsafePath, validateSymlinkTarget("link", ""));
 }
 
 test "validateSymlinkTarget rejects target that escapes root" {
@@ -1098,17 +1129,27 @@ test "extractGzip rejects symlink target that escapes rootfs" {
     try testing.expectError(ExtractError.UnsafePath, extractGzip(testing.io, testing.allocator, &reader, tmp.dir));
 }
 
-test "extractGzip rejects absolute symlink target" {
+test "extractGzip preserves absolute symlink target verbatim (busybox-style)" {
+    // Regression: Alpine 3.19 layer contains entries like
+    // `bin/arch -> /bin/busybox`. Earlier sanitiser rejected every
+    // absolute target, blocking the canonical M1 smoke pull. The
+    // accepted policy is to store the verbatim string and defer the
+    // runtime-side defence to the runner milestone.
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
     const blob = try buildTarGz(testing.allocator, &.{
-        .{ .symlink = .{ .path = "link", .target = "/etc" } },
+        .{ .dir = .{ .path = "bin" } },
+        .{ .symlink = .{ .path = "bin/arch", .target = "/bin/busybox" } },
     });
     defer testing.allocator.free(blob);
 
     var reader: Io.Reader = .fixed(blob);
-    try testing.expectError(ExtractError.UnsafePath, extractGzip(testing.io, testing.allocator, &reader, tmp.dir));
+    try extractGzip(testing.io, testing.allocator, &reader, tmp.dir);
+
+    var link_buf: [64]u8 = undefined;
+    const n = try tmp.dir.readLink(testing.io, "bin/arch", &link_buf);
+    try testing.expectEqualStrings("/bin/busybox", link_buf[0..n]);
 }
 
 test "extractGzip materializes a hard link" {
@@ -1294,17 +1335,22 @@ test "extractZstd rejects symlink target that escapes rootfs" {
     try testing.expectError(ExtractError.UnsafePath, extractZstd(testing.io, testing.allocator, &reader, tmp.dir));
 }
 
-test "extractZstd rejects absolute symlink target" {
+test "extractZstd preserves absolute symlink target verbatim" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
     const blob = try buildTarZst(testing.allocator, &.{
-        .{ .symlink = .{ .path = "link", .target = "/etc" } },
+        .{ .dir = .{ .path = "bin" } },
+        .{ .symlink = .{ .path = "bin/arch", .target = "/bin/busybox" } },
     });
     defer testing.allocator.free(blob);
 
     var reader: Io.Reader = .fixed(blob);
-    try testing.expectError(ExtractError.UnsafePath, extractZstd(testing.io, testing.allocator, &reader, tmp.dir));
+    try extractZstd(testing.io, testing.allocator, &reader, tmp.dir);
+
+    var link_buf: [64]u8 = undefined;
+    const n = try tmp.dir.readLink(testing.io, "bin/arch", &link_buf);
+    try testing.expectEqualStrings("/bin/busybox", link_buf[0..n]);
 }
 
 test "extractZstd materializes a hard link" {
