@@ -3,6 +3,21 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
+    const enable_e2e = b.option(
+        bool,
+        "rind-e2e",
+        "Enable e2e tests that pull from real registries (requires RIND_E2E=1 at runtime).",
+    ) orelse false;
+
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "e2e_enabled", enable_e2e);
+
+    const clap_dep = b.dependency("clap", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     const mod = b.addModule("rind", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -16,6 +31,8 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "rind", .module = mod },
+                .{ .name = "clap", .module = clap_dep.module("clap") },
+                .{ .name = "build_options", .module = build_options.createModule() },
             },
         }),
     });

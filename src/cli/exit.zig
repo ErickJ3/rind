@@ -1,0 +1,116 @@
+//! Process exit-code mapping for the `rind` CLI.
+//!
+//! `main.zig` is the only place that calls `std.process.exit`. Every
+//! other layer returns a typed error and lets `mapErrorToExitCode`
+//! assign it to the documented code:
+//!
+//! | Code | Meaning            |
+//! |------|--------------------|
+//! | 0    | Success            |
+//! | 1    | Generic / storage / config / unhandled |
+//! | 2    | Usage (bad flags, bad ref, unsupported platform) |
+//! | 3    | Network (registry transport, DNS, TLS) |
+//! | 4    | Verification (digest / media-type mismatch) |
+//!
+//! The mapping is intentionally forgiving: any error not classified
+//! here falls through to exit 1 rather than crashing the binary.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const Io = std.Io;
+
+const pull_mod = @import("../pull.zig");
+
+/// CLI-specific error names not produced by the pull orchestrator.
+pub const CliExtras = error{
+    /// Argparse rejected the flag combination, the subcommand, or
+    /// the positional. Surfaced from `cli/pull.zig` and `cli/root.zig`.
+    Usage,
+    /// `--platform` was provided and did not match the host. Single
+    /// platform per MVP — see `docs/rind.md`.
+    UnsupportedPlatform,
+    /// Storage root could not be resolved: neither `RIND_ROOT` nor
+    /// `HOME` was set in the environment.
+    HomeNotFound,
+};
+
+/// Closed superset returned by CLI entry points. Composes the
+/// orchestrator's `PullError` with CLI-specific extras so `main.zig`
+/// can `try` everything and map at the edge.
+pub const CliError =
+    CliExtras ||
+    pull_mod.PullError ||
+    Io.Writer.Error;
+
+/// Exit codes the CLI uses. `u8` keeps it in the POSIX range.
+pub const Code = enum(u8) {
+    success = 0,
+    generic = 1,
+    usage = 2,
+    network = 3,
+    verification = 4,
+};
+
+/// Map any error value to an exit code. Accepts `anyerror` so callers
+/// can hand it the result of `catch` without re-spelling the error
+/// set; classification is by name.
+pub fn mapErrorToExitCode(err: anyerror) Code {
+    return switch (err) {
+        // --- Usage / argparse / bad input ---
+        error.Usage,
+        error.UnsupportedPlatform,
+        error.Empty,
+        error.InvalidRegistry,
+        error.InvalidRepository,
+        error.InvalidTag,
+        error.InvalidDigest,
+        error.UnsupportedDigestAlgorithm,
+        => .usage,
+
+        // --- Verification (content-addressed integrity broke) ---
+        error.DigestMismatch,
+        error.MediaTypeMismatch,
+        => .verification,
+
+        // --- Network / registry transport ---
+        error.Unauthorized,
+        error.Forbidden,
+        error.NotFound,
+        error.ChallengeMissing,
+        error.TokenEndpointFailed,
+        error.BadTokenResponse,
+        error.UnexpectedStatus,
+        error.ServerError,
+        error.NoCredentials,
+        error.ConnectionRefused,
+        error.ConnectionResetByPeer,
+        error.ConnectionTimedOut,
+        error.NetworkUnreachable,
+        error.HostUnreachable,
+        error.TemporaryNameServerFailure,
+        error.NameServerFailure,
+        error.UnknownHostName,
+        error.TlsInitializationFailed,
+        error.TlsAlert,
+        error.UnsupportedUriScheme,
+        error.UriMissingHost,
+        => .network,
+
+        else => .generic,
+    };
+}
+
+const testing = std.testing;
+
+test "mapErrorToExitCode classifies common cases" {
+    try testing.expectEqual(Code.usage, mapErrorToExitCode(error.Usage));
+    try testing.expectEqual(Code.usage, mapErrorToExitCode(error.InvalidRepository));
+    try testing.expectEqual(Code.usage, mapErrorToExitCode(error.UnsupportedPlatform));
+    try testing.expectEqual(Code.verification, mapErrorToExitCode(error.DigestMismatch));
+    try testing.expectEqual(Code.verification, mapErrorToExitCode(error.MediaTypeMismatch));
+    try testing.expectEqual(Code.network, mapErrorToExitCode(error.ConnectionRefused));
+    try testing.expectEqual(Code.network, mapErrorToExitCode(error.Unauthorized));
+    try testing.expectEqual(Code.network, mapErrorToExitCode(error.ServerError));
+    try testing.expectEqual(Code.generic, mapErrorToExitCode(error.OutOfMemory));
+    try testing.expectEqual(Code.generic, mapErrorToExitCode(error.HomeNotFound));
+}

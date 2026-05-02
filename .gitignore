@@ -3,3 +3,4 @@ docs/
 .rtk
 zig-out/
 .claude
+zig-pkg/
