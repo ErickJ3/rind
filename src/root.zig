@@ -23,6 +23,10 @@ pub const registry = struct {
     pub const blob_pool = @import("registry/blob_pool.zig");
 };
 
+/// Pull orchestrator (T09): glue that wires ref → manifest → blob
+/// pool → extract → tag.
+pub const pull = @import("pull.zig");
+
 /// This is a documentation comment to explain the `printAnotherMessage` function below.
 ///
 /// Accepting an `Io.Writer` instance is a handy way to write reusable code.
@@ -47,4 +51,5 @@ test {
     _ = registry.client;
     _ = registry.manifest;
     _ = registry.blob_pool;
+    _ = pull;
 }
