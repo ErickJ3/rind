@@ -13,6 +13,13 @@ pub const store = struct {
     pub const layout = @import("store/layout.zig");
 };
 
+/// Registry client modules: HTTP transport with Bearer auth, manifest
+/// fetch (T05), blob fetch (T06).
+pub const registry = struct {
+    pub const auth = @import("registry/auth.zig");
+    pub const client = @import("registry/client.zig");
+};
+
 /// This is a documentation comment to explain the `printAnotherMessage` function below.
 ///
 /// Accepting an `Io.Writer` instance is a handy way to write reusable code.
@@ -32,4 +39,6 @@ test {
     _ = image.ref;
     _ = image.digest;
     _ = store.layout;
+    _ = registry.auth;
+    _ = registry.client;
 }
