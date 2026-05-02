@@ -1,0 +1,32 @@
+rind
+Copyright 2026 Erick Jesus
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product statically links third-party software whose licenses require
+attribution and, in the case of LGPL-2.1 components, the ability for the
+end user to relink against a modified version of the library. Source for
+those components is pinned in this repository's build system; the
+`zig build` recipe rebuilds the binary from source. See
+THIRD_PARTY_LICENSES.md for the full list, pinned versions, license texts,
+and links to upstream source.
+
+Statically-linked third-party components:
+
+  - libcrun (https://github.com/containers/crun, files under `src/libcrun/`)
+    LGPL-2.1-or-later
+
+  - libseccomp (https://github.com/seccomp/libseccomp)
+    LGPL-2.1-only
+
+  - libcap (https://sites.google.com/site/fullycapable/)
+    BSD-3-Clause (selected from the BSD/GPL-2.0 dual-license offer)
+
+  - yajl (https://github.com/lloyd/yajl) -- or libcrun's embedded copy
+    ISC
+
+  - musl libc (Zig-bundled) (https://musl.libc.org/)
+    MIT
+
+`libsystemd` and `libcriu` are explicitly disabled at libcrun configure
+time. The released rind binary contains no GPL-only components.
