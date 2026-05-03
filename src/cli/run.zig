@@ -286,6 +286,13 @@ fn loadEnvFile(io: Io, gpa: Allocator, path: []const u8) ![]const []const u8 {
 /// Run the container. The renderer is invoked for each progress event,
 /// once for the success summary, and once for an error message on
 /// failure. Errors propagate; `main.zig` maps them to exit codes.
+///
+/// Returns the `u8` exit code the rind binary should exit with on the
+/// success path. Convention follows POSIX/bash/Docker/runc:
+/// `result.exit_code` when the container exited normally, or
+/// `128 + result.signal` when it was terminated by a signal. Errors are
+/// signalled the usual way (typed return); `main.zig` maps those
+/// through `cli_exit.mapErrorToExitCode`.
 pub fn run(
     io: Io,
     gpa: Allocator,
@@ -294,7 +301,7 @@ pub fn run(
     args: RunArgs,
     out: *output.Renderer,
     deps: RunDeps,
-) !void {
+) !u8 {
     if (args.platform) |p| {
         if (!std.mem.eql(u8, p, pull_cli.expected_platform)) {
             try out.on_error(out.ctx, "unsupported --platform (host-only in MVP)");
@@ -354,6 +361,8 @@ pub fn run(
     };
 
     try out.on_run_summary(out.ctx, .{ .ref = args.image, .result = &result });
+
+    return if (result.signal != 0) 128 +% result.signal else result.exit_code;
 }
 
 /// Trampoline state. `runImage` is single-threaded so no mutex is
@@ -702,7 +711,7 @@ test "run drives renderer and reports success — human" {
 
     stub_state = .{};
     const args: RunArgs = .{ .image = "alpine:3.19" };
-    try run(
+    const code = try run(
         io,
         gpa,
         &store,
@@ -712,6 +721,7 @@ test "run drives renderer and reports success — human" {
         .{ .run_fn = stubRunSuccess },
     );
 
+    try testing.expectEqual(@as(u8, 0), code);
     try testing.expect(std.mem.indexOf(u8, out_buf.written(), "Running alpine:3.19") != null);
     try testing.expect(std.mem.indexOf(u8, out_buf.written(), "Container abc123def456 exited (code=0, signal=0)") != null);
 }
@@ -737,7 +747,7 @@ test "run drives renderer and reports success — JSON snapshot" {
 
     stub_state = .{};
     const args: RunArgs = .{ .image = "alpine:3.19", .rm = true };
-    try run(
+    _ = try run(
         io,
         gpa,
         &store,
@@ -877,7 +887,7 @@ test "run --rm emits removed event and reports removed=true in summary" {
     var r = human.renderer();
 
     stub_state = .{};
-    try run(
+    _ = try run(
         io,
         gpa,
         &store,
@@ -934,4 +944,65 @@ test "run forwards orchestrator errors and maps to exit codes" {
         try testing.expectEqual(c.code, exit.mapErrorToExitCode(c.err));
     }
     stub_state = .{};
+}
+
+fn runOnceAndGetCode(
+    io: Io,
+    gpa: Allocator,
+    tmp: *std.testing.TmpDir,
+    exit_code: u8,
+    signal: u8,
+) !u8 {
+    var store = try dummyStore(io, tmp);
+    defer store.close(io);
+
+    var out_buf: Io.Writer.Allocating = .init(gpa);
+    defer out_buf.deinit();
+    var err_buf: Io.Writer.Allocating = .init(gpa);
+    defer err_buf.deinit();
+    var human: output.Human = .{
+        .writer = &out_buf.writer,
+        .err_writer = &err_buf.writer,
+        .quiet = false,
+    };
+    var r = human.renderer();
+
+    stub_state = .{ .exit_code = exit_code, .signal = signal };
+    defer stub_state = .{};
+    return try run(
+        io,
+        gpa,
+        &store,
+        .{ .root_dir = tmp.dir, .root_abspath = "/tmp/dummy" },
+        .{ .image = "alpine:3.19" },
+        &r,
+        .{ .run_fn = stubRunSuccess },
+    );
+}
+
+test "run propagates non-zero exit code verbatim" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try testing.expectEqual(@as(u8, 42), try runOnceAndGetCode(io, gpa, &tmp, 42, 0));
+}
+
+test "run encodes signal exit as 128 + signal (POSIX)" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    // SIGKILL (9) → 137; matches bash, Docker, runc.
+    try testing.expectEqual(@as(u8, 137), try runOnceAndGetCode(io, gpa, &tmp, 0, 9));
+    // SIGTERM (15) → 143.
+    try testing.expectEqual(@as(u8, 143), try runOnceAndGetCode(io, gpa, &tmp, 0, 15));
+}
+
+test "run reports 0 on clean exit" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try testing.expectEqual(@as(u8, 0), try runOnceAndGetCode(io, gpa, &tmp, 0, 0));
 }

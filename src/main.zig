@@ -69,7 +69,7 @@ pub fn main(init: std.process.Init) !void {
     const stdout = &stdout_fw.interface;
     const stderr = &stderr_fw.interface;
 
-    cli_root.dispatch(io, arena, argv, init.environ_map, stdout, stderr) catch |err| {
+    const code = cli_root.dispatch(io, arena, argv, init.environ_map, stdout, stderr) catch |err| {
         // Best-effort flush so any in-flight bytes land before exit.
         stdout.flush() catch {};
         stderr.flush() catch {};
@@ -78,6 +78,7 @@ pub fn main(init: std.process.Init) !void {
 
     stdout.flush() catch {};
     stderr.flush() catch {};
+    std.process.exit(code);
 }
 
 test {

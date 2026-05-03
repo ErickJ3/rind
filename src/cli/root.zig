@@ -50,8 +50,12 @@ pub fn resolveRoot(gpa: Allocator, env_map: *const Environ.Map) ![]u8 {
 /// Top-level dispatch. `argv` includes `argv[0]` (program name), so
 /// the subcommand is at `argv[1]`. `stdout` / `stderr` are used for
 /// human renderers, JSON output, and usage diagnostics. Returns an
-/// error on bad input or pull failure; `main.zig` maps it to an
-/// exit code.
+/// error on bad input or subcommand failure; `main.zig` maps it to an
+/// exit code via `cli_exit.mapErrorToExitCode`.
+///
+/// Returns the `u8` exit code the rind binary should propagate on the
+/// success path. Most subcommands return `0`; `run` returns the
+/// container's exit code (`128 + signal` on signal exit, per POSIX).
 pub fn dispatch(
     io: Io,
     gpa: Allocator,
@@ -59,7 +63,7 @@ pub fn dispatch(
     env_map: *const Environ.Map,
     stdout: *Io.Writer,
     stderr: *Io.Writer,
-) !void {
+) !u8 {
     if (argv.len < 2) {
         try stderr.print("{s}\n", .{usage_line});
         return error.Usage;
@@ -68,7 +72,7 @@ pub fn dispatch(
     if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "-h") or std.mem.eql(u8, cmd, "--help")) {
         try stdout.print("{s}\n", .{usage_line});
         try stdout.flush();
-        return;
+        return 0;
     }
     if (std.mem.eql(u8, cmd, "pull")) {
         return runPull(io, gpa, argv[2..], env_map, stdout, stderr);
@@ -93,7 +97,7 @@ fn runPull(
     env_map: *const Environ.Map,
     stdout: *Io.Writer,
     stderr: *Io.Writer,
-) !void {
+) !u8 {
     var iter: SliceIter = .{ .items = sub_argv };
     const args = try pull_cli.parseArgs(gpa, &iter, stderr);
     defer pull_cli.freeArgs(gpa, args);
@@ -154,6 +158,7 @@ fn runPull(
     };
 
     try pull_cli.run(io, gpa, &store, &client, args, &renderer, .{}, &progress_root);
+    return 0;
 }
 
 fn runRun(
@@ -163,7 +168,7 @@ fn runRun(
     env_map: *const Environ.Map,
     stdout: *Io.Writer,
     stderr: *Io.Writer,
-) !void {
+) !u8 {
     var iter: SliceIter = .{ .items = sub_argv };
     const args = try run_cli.parseArgs(gpa, &iter, stderr);
     defer run_cli.freeArgs(gpa, args);
@@ -206,7 +211,7 @@ fn runRun(
         .store_subpath = store_subpath,
     };
 
-    try run_cli.run(io, gpa, &store, env, args, &renderer, .{});
+    return try run_cli.run(io, gpa, &store, env, args, &renderer, .{});
 }
 
 fn runImages(
@@ -216,7 +221,7 @@ fn runImages(
     env_map: *const Environ.Map,
     stdout: *Io.Writer,
     stderr: *Io.Writer,
-) !void {
+) !u8 {
     var iter: SliceIter = .{ .items = sub_argv };
     const args = try images_cli.parseArgs(gpa, &iter, stderr);
     defer images_cli.freeArgs(gpa, args);
@@ -239,6 +244,7 @@ fn runImages(
     defer store.close(io);
 
     try images_cli.run(io, gpa, &store, args, stdout, stderr);
+    return 0;
 }
 
 fn runInspect(
@@ -248,7 +254,7 @@ fn runInspect(
     env_map: *const Environ.Map,
     stdout: *Io.Writer,
     stderr: *Io.Writer,
-) !void {
+) !u8 {
     var iter: SliceIter = .{ .items = sub_argv };
     const args = try inspect_cli.parseArgs(gpa, &iter, stderr);
     defer inspect_cli.freeArgs(gpa, args);
@@ -271,6 +277,7 @@ fn runInspect(
     defer store.close(io);
 
     try inspect_cli.run(io, gpa, &store, args, stdout, stderr);
+    return 0;
 }
 
 const SliceIter = struct {
@@ -314,7 +321,8 @@ test "dispatch help prints banner and returns success" {
 
     var env_map = Environ.Map.init(gpa);
     defer env_map.deinit();
-    try dispatch(io, gpa, &.{ "rind", "help" }, &env_map, &out.writer, &err_buf.writer);
+    const code = try dispatch(io, gpa, &.{ "rind", "help" }, &env_map, &out.writer, &err_buf.writer);
+    try testing.expectEqual(@as(u8, 0), code);
     try testing.expect(std.mem.indexOf(u8, out.written(), "Usage:") != null);
 }
 
