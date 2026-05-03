@@ -121,25 +121,25 @@ pub fn build(b: *std.Build) void {
     if (zlib_ng_lib) |l| {
         exe_module.linkLibrary(l);
         // Wrapper at src/compress/zlib_ng.zig uses @cImport on
-        // <zlib-ng.h>; the header lives at build/cdeps/zlib-ng/.
-        exe_module.addIncludePath(b.path("build/cdeps/zlib-ng"));
+        // <zlib-ng.h>; the header lives at cdeps/zlib-ng/.
+        exe_module.addIncludePath(b.path("cdeps/zlib-ng"));
         // mod re-exports image.extract (and thus the zlib_ng wrapper),
         // so unit tests rooted at root.zig need the same wiring.
         mod.linkLibrary(l);
-        mod.addIncludePath(b.path("build/cdeps/zlib-ng"));
+        mod.addIncludePath(b.path("cdeps/zlib-ng"));
     }
 }
 
 // addLibcrunHeaders — attaches the four header roots required for
 // `@cImport({ @cInclude("container.h"); @cInclude("error.h"); })` in
 // src/runtime/libcrun.zig:
-//   1. build/cdeps/crun                          → <config.h>
+//   1. cdeps/crun                          → <config.h>
 //   2. vendor/crun-1.23/src                      → container.h, error.h, string_map.h
 //   3. vendor/crun-1.23/libocispec/src           → <ocispec/runtime_spec_schema_*>
 //   4. vendor/crun-1.23/libocispec/yajl/src/api  → <yajl/yajl_tree.h> (transitive)
 // All four roots are in-tree (not lazy deps), so this attaches unconditionally.
 fn addLibcrunHeaders(b: *std.Build, mod: *std.Build.Module) void {
-    mod.addIncludePath(b.path("build/cdeps/crun"));
+    mod.addIncludePath(b.path("cdeps/crun"));
     mod.addIncludePath(b.path("vendor/crun-1.23/src"));
     mod.addIncludePath(b.path("vendor/crun-1.23/libocispec/src"));
     mod.addIncludePath(b.path("vendor/crun-1.23/libocispec/yajl/src/api"));
@@ -151,8 +151,8 @@ fn addLibcrunHeaders(b: *std.Build, mod: *std.Build.Module) void {
 // tarball declared in build.zig.zon. Returns null when the dep is
 // resolved-but-unavailable (Zig 0.16 lazy contract).
 //
-// File list per build/cdeps/argp/SOURCES.md. Hand-authored config.h
-// at build/cdeps/argp/config.h pins HAVE_* knobs for x86_64-linux-musl.
+// File list per cdeps/argp/SOURCES.md. Hand-authored config.h
+// at cdeps/argp/config.h pins HAVE_* knobs for x86_64-linux-musl.
 fn cArgpStandalone(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -186,7 +186,7 @@ fn cArgpStandalone(
     });
 
     // Hand-authored config.h (HAVE_PROGRAM_INVOCATION_NAME=0, etc.).
-    mod.addIncludePath(b.path("build/cdeps/argp"));
+    mod.addIncludePath(b.path("cdeps/argp"));
     // argp's own headers (argp.h, argp-fmtstream.h) live at the tarball root.
     mod.addIncludePath(dep.path(""));
 
@@ -201,8 +201,8 @@ fn cArgpStandalone(
 // libcap's upstream Makefile recipe (sed → cap_names.list.h, build
 // _makenames, run it, capture stdout). Source for the cap list is
 // the host's /usr/include/linux/capability.h (per T17 plan; a vendored
-// UAPI snapshot under build/cdeps/cap/uapi/ is the reproducible
-// alternative documented at build/cdeps/cap/generated/PROVENANCE.md).
+// UAPI snapshot under cdeps/cap/uapi/ is the reproducible
+// alternative documented at cdeps/cap/generated/PROVENANCE.md).
 fn capNamesHeader(b: *std.Build, libcap_dep: *std.Build.Dependency) std.Build.LazyPath {
     // 1. sed | awk on host UAPI → cap_names.list.h.
     const sed_run = b.addSystemCommand(&.{
@@ -238,7 +238,7 @@ fn capNamesHeader(b: *std.Build, libcap_dep: *std.Build.Dependency) std.Build.La
 // cLibcap — libcap 2.76 as a static lib. Selected BSD-3-Clause from
 // libcap's BSD/GPL dual-licence offer (recorded in NOTICE +
 // THIRD_PARTY_LICENSES.md). cap_names.h is generated above; the rest
-// of the source list lives at build/cdeps/cap/SOURCES.md.
+// of the source list lives at cdeps/cap/SOURCES.md.
 fn cLibcap(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -275,7 +275,7 @@ fn cLibcap(
     });
 
     // Hand-authored config.h.
-    mod.addIncludePath(b.path("build/cdeps/cap"));
+    mod.addIncludePath(b.path("cdeps/cap"));
     // libcap public API (sys/capability.h, sys/securebits.h).
     mod.addIncludePath(dep.path("libcap/include"));
     // libcap private headers (libcap.h sibling to the .c sources).
@@ -291,8 +291,8 @@ fn cLibcap(
 }
 
 // cSeccomp — libseccomp 2.5.6 as a static lib. Sources per
-// build/cdeps/seccomp/SOURCES.md (x86_64 arch only). Hand-authored
-// configure.h at build/cdeps/seccomp/ (note: the file MUST be named
+// cdeps/seccomp/SOURCES.md (x86_64 arch only). Hand-authored
+// configure.h at cdeps/seccomp/ (note: the file MUST be named
 // `configure.h` because system.h has `#include "configure.h"`).
 //
 // The release tarball ships pre-generated arch-x86_64.h, syscalls.h,
@@ -354,7 +354,7 @@ fn cSeccomp(
     // configure.h — note this dir intentionally only holds configure.h
     // (renamed from config.h in T17 phase B because system.h hard-codes
     // the name).
-    mod.addIncludePath(b.path("build/cdeps/seccomp"));
+    mod.addIncludePath(b.path("cdeps/seccomp"));
     // Public API: seccomp.h.
     mod.addIncludePath(dep.path("include"));
     // Private headers + pre-generated codegen artifacts.
@@ -371,11 +371,11 @@ fn cSeccomp(
 // vendor/crun-1.23/ (Zig 0.16's tar reader rejects the hard-link
 // entries in the upstream release tarball, so this dep is NOT lazy).
 //
-// File list per build/cdeps/crun/SOURCES.md:
+// File list per cdeps/crun/SOURCES.md:
 //   - libcrun core (src/*.c)
 //   - libcrun handlers (src/handlers/handler-utils.c + exec.c only —
 //     wasm/lua/krun/spin/mono handlers excluded; their feature toggles
-//     are 0 in build/cdeps/crun/config.h)
+//     are 0 in cdeps/crun/config.h)
 //   - BLAKE3 portable (src/blake3/blake3.c + blake3_portable.c — no
 //     dispatch.c needed; impl.h aliases portable fns to public names)
 //   - embedded yajl (libocispec/yajl/src/*.c)
@@ -443,7 +443,7 @@ fn cLibcrun(
 
     // Handlers — handler-utils only. The wasm/lua/krun/spin/mono
     // handlers compile when their HAVE_* flags are non-zero, which
-    // they aren't in build/cdeps/crun/config.h. (No handlers/exec.c
+    // they aren't in cdeps/crun/config.h. (No handlers/exec.c
     // in libcrun 1.23; the in-process exec dispatch lives in
     // container.c — SOURCES.md errata.)
     mod.addCSourceFiles(.{
@@ -539,7 +539,7 @@ fn cLibcrun(
     if (b.lazyDependency("argp_standalone", .{})) |argp_dep| {
         mod.addIncludePath(argp_dep.path(""));
     }
-    mod.addIncludePath(b.path("build/cdeps/crun")); // config.h, git-version.h
+    mod.addIncludePath(b.path("cdeps/crun")); // config.h, git-version.h
     mod.addIncludePath(b.path("vendor/crun-1.23/src")); // libcrun internal
     mod.addIncludePath(b.path("vendor/crun-1.23/libocispec/src")); // <ocispec/...>
     mod.addIncludePath(b.path("vendor/crun-1.23/libocispec/yajl/src/api")); // yajl public
@@ -557,7 +557,7 @@ fn cLibcrun(
 // single-thread and ~5–10× slower than zlib-ng's runtime-dispatched
 // SSE2/SSSE3/SSE4.2/PCLMUL/AVX2 inflate path.
 //
-// File list per build/cdeps/zlib-ng/SOURCES.md. Hand-authored
+// File list per cdeps/zlib-ng/SOURCES.md. Hand-authored
 // zconf-ng.h, zlib-ng.h, zlib_name_mangling-ng.h live alongside it
 // (we don't run upstream's CMake, so the @VAR@ template substitution
 // is done once at vendoring time).
@@ -710,7 +710,7 @@ fn cZlibNg(
     });
 
     // Hand-authored zconf-ng.h, zlib-ng.h, zlib_name_mangling-ng.h.
-    mod.addIncludePath(b.path("build/cdeps/zlib-ng"));
+    mod.addIncludePath(b.path("cdeps/zlib-ng"));
     // Library private headers (zbuild.h, inflate.h, etc.) sit at the
     // tarball root.
     mod.addIncludePath(dep.path(""));

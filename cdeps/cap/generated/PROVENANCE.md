@@ -22,7 +22,7 @@ cap_names.h: _makenames
 
 1. A `Step.WriteFile` writes `cap_names.list.h` from a sed of the
    current host's `<linux/capability.h>` (or, more reproducibly, from
-   a vendored copy under `build/cdeps/cap/uapi/capability.h`).
+   a vendored copy under `cdeps/cap/uapi/capability.h`).
 2. A second step compiles + runs `_makenames`, capturing stdout into
    `<cache>/cap_names.h`. The lib build then `addIncludePath`s the
    cache dir.

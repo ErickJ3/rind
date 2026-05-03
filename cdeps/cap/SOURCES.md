@@ -12,7 +12,7 @@
 Plus a one-off codegen step:
 
 1. Compile `libcap/_makenames.c` → `_makenames` (needs `<linux/capability.h>` from kernel UAPI).
-2. Run `_makenames > build/cdeps/cap/generated/cap_names.h`.
+2. Run `_makenames > cdeps/cap/generated/cap_names.h`.
 3. Re-run on `linux/capability.h` change.
 
 License: BSD-3-Clause (selected from libcap's BSD/GPL dual-license offer).
