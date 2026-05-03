@@ -18,6 +18,7 @@
 //! exercise only the auth machinery.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const http = std.http;
@@ -221,6 +222,7 @@ pub const Client = struct {
                     .auth_header = header,
                 }, body_writer);
                 if (final.status == .unauthorized) {
+                    logHttpFailure(req.method, uri, final.status);
                     final.deinit(self.gpa);
                     return error.Unauthorized;
                 }
@@ -278,6 +280,7 @@ pub const Client = struct {
             .auth_header = header,
         }, body_writer);
         if (final.status == .unauthorized) {
+            logHttpFailure(req.method, uri, final.status);
             final.deinit(self.gpa);
             return error.Unauthorized;
         }
@@ -306,13 +309,28 @@ pub const Client = struct {
                 .auth_header = retry_auth_header,
             }, body_writer);
             defer refetch.deinit(self.gpa);
-            return classify(&refetch);
+            return classify(&refetch, req.method, uri);
         }
 
-        return classify(&send_mut);
+        return classify(&send_mut, req.method, uri);
     }
 
-    fn classify(send: *SendResult) FetchError!Response {
+    fn logHttpFailure(method: http.Method, uri: std.Uri, status: http.Status) void {
+        // Tests intentionally trigger 4xx/5xx paths against mock servers;
+        // suppress the diagnostic there to keep test output focused on
+        // the assertion rather than the expected mock response.
+        if (builtin.is_test) return;
+        const phrase = status.phrase() orelse "(unknown)";
+        std.debug.print(
+            "http: {s} {f} -> {d} {s}\n",
+            .{ @tagName(method), &uri, @intFromEnum(status), phrase },
+        );
+    }
+
+    fn classify(send: *SendResult, method: http.Method, uri: std.Uri) FetchError!Response {
+        if (@intFromEnum(send.status) >= 400) {
+            logHttpFailure(method, uri, send.status);
+        }
         switch (send.status) {
             .unauthorized => return error.Unauthorized,
             .forbidden => return error.Forbidden,
@@ -363,7 +381,10 @@ pub const Client = struct {
         }, &body_buf.writer);
         defer send.deinit(self.gpa);
 
-        if (send.status != .ok) return error.TokenEndpointFailed;
+        if (send.status != .ok) {
+            logHttpFailure(.GET, token_uri, send.status);
+            return error.TokenEndpointFailed;
+        }
 
         const TokenResponse = struct {
             token: ?[]const u8 = null,
