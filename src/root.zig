@@ -34,6 +34,7 @@ pub const pull = @import("pull.zig");
 /// downstream container lifecycle helpers (T19+).
 pub const runtime = struct {
     pub const libcrun = @import("runtime/libcrun.zig");
+    pub const state = @import("runtime/state.zig");
 };
 
 /// This is a documentation comment to explain the `printAnotherMessage` function below.
@@ -64,4 +65,5 @@ test {
     _ = registry.blob_pool;
     _ = pull;
     _ = runtime.libcrun;
+    _ = runtime.state;
 }
