@@ -79,4 +79,63 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+
+    // T17 phase A — audit step. Walks vendor/crun-1.23/src/ and prints a
+    // Markdown table of SPDX licenses for every translation unit. Exits
+    // non-zero if a GPL-only file is found in the compile set
+    // (build/cdeps/crun/SOURCES.md). Run with `rtk zig build audit`.
+    const audit_step = b.step("audit", "Walk vendored libcrun source for non-LGPL files");
+    const run_audit = b.addSystemCommand(&.{
+        b.pathFromRoot("scripts/lgpl_audit.sh"),
+        b.pathFromRoot("vendor/crun-1.23/src"),
+    });
+    audit_step.dependOn(&run_audit.step);
+
+    // T17 phase B — static-link libcrun.a + libseccomp.a + libcap.a +
+    // argp_standalone.a into the rind exe and wire a pure-C integration
+    // test (tests/c/run_true.c) against tests/fixtures/bundle/true/.
+    //
+    // Phase A (this commit) lays the foundation: vendor/crun-1.23/ in
+    // tree, build.zig.zon has lazy deps for the other three libs,
+    // build/cdeps/<lib>/config.h is hand-authored, scripts/lgpl_audit.sh
+    // is wired (above), tests/fixtures/bundle/true/ is in place.
+    //
+    // Phase B turns those pieces into a green static binary. Concretely:
+    //   1. Add helpers `cLibcrun`, `cSeccomp`, `cLibcap`, `cArgpStandalone`
+    //      that return *std.Build.Step.Compile via b.addLibrary
+    //      (.linkage = .static). Source roots: vendor/crun-1.23/ for
+    //      libcrun; b.lazyDependency("libseccomp" | "libcap" |
+    //      "argp_standalone", .{}) orelse return for the others.
+    //   2. exe_module.linkLibrary in order: libcrun → libseccomp →
+    //      libcap → argp_standalone (link-order matters because libcrun
+    //      references argp_parse).
+    //   3. Add a `buildTrueBinary` helper that compiles tests/c/true_main.c
+    //      statically (target = x86_64-linux-musl, link_libc = false) and
+    //      installs the result into tests/fixtures/bundle/true/rootfs/bin/true.
+    //   4. Add a `run_true` executable that compiles tests/c/run_true.c
+    //      against the libcrun include path (vendor/crun-1.23/src and
+    //      build/cdeps/crun/), links the four C libs, and is invoked
+    //      via b.addRunArtifact with addArg(bundle_dir) and
+    //      expectExitCode(0). Hook into test_step.
+    //   5. Implement the cap_names.h codegen (see
+    //      build/cdeps/cap/generated/PROVENANCE.md): a Zig Step.Run that
+    //      compiles _makenames.c and writes cap_names.h into the build
+    //      cache; cLibcap addIncludePath the cache dir.
+    //
+    // Acceptance criteria for phase B:
+    //   - `rtk zig build` produces a static binary; `ldd zig-out/bin/rind`
+    //     reports "not a dynamic executable".
+    //   - `rtk zig build test` runs run_true; expectExitCode(0) holds.
+    //   - The four lazy deps fetch on first build (one-time ~5MB).
+    //
+    // Common musl gotchas to address while wiring:
+    //   - Define _GNU_SOURCE globally for libcrun + libseccomp targets.
+    //   - argp-standalone link order is enforced via the linkLibrary
+    //     call sequence above.
+    //   - HAVE_FSCONFIG_CMD_CREATE_LINUX_MOUNT_H=1 in build/cdeps/crun/config.h
+    //     is the musl-correct path; do not flip it to the sys/mount.h
+    //     variant.
+    //   - cgroup-systemd.c, criu.c, and the wasm/lua/krun handlers are
+    //     compiled with their feature toggles set to 0 — this keeps the
+    //     compile graph honest without pulling in disabled deps.
 }
