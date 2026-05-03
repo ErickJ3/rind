@@ -30,6 +30,12 @@ pub const registry = struct {
 /// pool → extract → tag.
 pub const pull = @import("pull.zig");
 
+/// OCI runtime modules: typed Zig surface over libcrun (T18) and
+/// downstream container lifecycle helpers (T19+).
+pub const runtime = struct {
+    pub const libcrun = @import("runtime/libcrun.zig");
+};
+
 /// This is a documentation comment to explain the `printAnotherMessage` function below.
 ///
 /// Accepting an `Io.Writer` instance is a handy way to write reusable code.
@@ -57,4 +63,5 @@ test {
     _ = registry.manifest;
     _ = registry.blob_pool;
     _ = pull;
+    _ = runtime.libcrun;
 }

@@ -95,10 +95,29 @@ pub fn build(b: *std.Build) void {
     const argp_lib = cArgpStandalone(b, target, optimize);
     const zlib_ng_lib = cZlibNg(b, target, optimize);
 
-    if (crun_lib) |l| exe_module.linkLibrary(l);
-    if (seccomp_lib) |l| exe_module.linkLibrary(l);
-    if (cap_lib) |l| exe_module.linkLibrary(l);
-    if (argp_lib) |l| exe_module.linkLibrary(l);
+    if (crun_lib) |l| {
+        exe_module.linkLibrary(l);
+        // src/runtime/libcrun.zig (T18) re-exports libcrun's public headers
+        // via @cImport. Tests rooted at root.zig need to link the lib too,
+        // so wire the same lib + headers onto `mod`.
+        mod.linkLibrary(l);
+        addLibcrunHeaders(b, exe_module);
+        addLibcrunHeaders(b, mod);
+    }
+    if (seccomp_lib) |l| {
+        exe_module.linkLibrary(l);
+        // libcrun pulls libseccomp symbols (seccomp_*) at link time; the
+        // root.zig test binary needs them too once it imports runtime.libcrun.
+        mod.linkLibrary(l);
+    }
+    if (cap_lib) |l| {
+        exe_module.linkLibrary(l);
+        mod.linkLibrary(l);
+    }
+    if (argp_lib) |l| {
+        exe_module.linkLibrary(l);
+        mod.linkLibrary(l);
+    }
     if (zlib_ng_lib) |l| {
         exe_module.linkLibrary(l);
         // Wrapper at src/compress/zlib_ng.zig uses @cImport on
@@ -109,6 +128,21 @@ pub fn build(b: *std.Build) void {
         mod.linkLibrary(l);
         mod.addIncludePath(b.path("build/cdeps/zlib-ng"));
     }
+}
+
+// addLibcrunHeaders — attaches the four header roots required for
+// `@cImport({ @cInclude("container.h"); @cInclude("error.h"); })` in
+// src/runtime/libcrun.zig:
+//   1. build/cdeps/crun                          → <config.h>
+//   2. vendor/crun-1.23/src                      → container.h, error.h, string_map.h
+//   3. vendor/crun-1.23/libocispec/src           → <ocispec/runtime_spec_schema_*>
+//   4. vendor/crun-1.23/libocispec/yajl/src/api  → <yajl/yajl_tree.h> (transitive)
+// All four roots are in-tree (not lazy deps), so this attaches unconditionally.
+fn addLibcrunHeaders(b: *std.Build, mod: *std.Build.Module) void {
+    mod.addIncludePath(b.path("build/cdeps/crun"));
+    mod.addIncludePath(b.path("vendor/crun-1.23/src"));
+    mod.addIncludePath(b.path("vendor/crun-1.23/libocispec/src"));
+    mod.addIncludePath(b.path("vendor/crun-1.23/libocispec/yajl/src/api"));
 }
 
 // cArgpStandalone — argp-standalone 1.5.0 as a static lib. argp is
