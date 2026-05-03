@@ -103,7 +103,12 @@ pub fn runForeground(
     try Forwarder.install(gpa, &ctx);
     defer Forwarder.uninstall(gpa);
 
-    return libcrun.runSync(&ctx, container, .{});
+    return libcrun.runSync(&ctx, container, .{}) catch |err| {
+        if (ctx.last_error) |le| {
+            std.log.err("libcrun: {s} (status={d})", .{ le.message, le.errno });
+        }
+        return err;
+    };
 }
 
 /// Lookup table mapping each forwarded signal to the libcrun-accepted

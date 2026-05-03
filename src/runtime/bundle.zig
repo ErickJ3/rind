@@ -146,8 +146,15 @@ pub fn composeWithEuid(
     const user = try parseUser(if (overrides.user) |u| u else if (img_cfg.config) |c| c.User orelse "" else "");
     const cwd = if (overrides.workdir) |w| w else if (img_cfg.config) |c| c.WorkingDir orelse "/" else "/";
 
-    const seccomp = try resolveSeccomp(aa, .{
-        .caps_held = &.{},
+    // Hand the moby seccomp resolver the same cap set the container
+    // actually holds at runtime. Passing `caps_held = &.{}` would drop
+    // every `caps:`-gated rule in the upstream profile and leave the
+    // container with a tiny allowlist that can't satisfy musl's
+    // startup syscalls — manifesting as SIGSEGV on container init for
+    // unprivileged alpine runs.
+    const seccomp_off = std.c.getenv("RIND_NO_SECCOMP") != null;
+    const seccomp: ?Seccomp = if (seccomp_off) null else try resolveSeccomp(aa, .{
+        .caps_held = default_caps,
         .image_arch = imageArchToSeccomp(img_cfg.architecture),
     });
 
@@ -420,7 +427,16 @@ fn filterMatches(f: MobyFilter, env: SeccompEnv, env_arches: []const []const u8)
     if (f.arches) |arches| if (arches.len > 0) {
         var any = false;
         for (arches) |a| {
-            if (containsString(env_arches, a)) {
+            // The moby profile uses GOARCH-style short names
+            // (`amd64`, `arm64`, `x86`, …) while `env_arches` carries
+            // libseccomp constants (`SCMP_ARCH_X86_64`, …). Compare
+            // through `mobyArchToSeccomp` so amd64/arm64/x86/x32
+            // entries actually match on x86_64 hosts — without this,
+            // `arch_prctl` and friends fall through to the default
+            // ERRNO=ENOSYS arm and the container init segfaults
+            // before reaching its first instruction.
+            const a_scmp = mobyArchToSeccomp(a);
+            if (containsString(env_arches, a_scmp) or containsString(env_arches, a)) {
                 any = true;
                 break;
             }
@@ -430,6 +446,22 @@ fn filterMatches(f: MobyFilter, env: SeccompEnv, env_arches: []const []const u8)
     // minKernel intentionally ignored — runtime floor exceeds every
     // upstream-listed value.
     return true;
+}
+
+fn mobyArchToSeccomp(short: []const u8) []const u8 {
+    if (std.mem.eql(u8, short, "amd64")) return "SCMP_ARCH_X86_64";
+    if (std.mem.eql(u8, short, "arm64")) return "SCMP_ARCH_AARCH64";
+    if (std.mem.eql(u8, short, "x86")) return "SCMP_ARCH_X86";
+    if (std.mem.eql(u8, short, "x32")) return "SCMP_ARCH_X32";
+    if (std.mem.eql(u8, short, "386")) return "SCMP_ARCH_X86";
+    if (std.mem.eql(u8, short, "arm")) return "SCMP_ARCH_ARM";
+    if (std.mem.eql(u8, short, "s390x")) return "SCMP_ARCH_S390X";
+    if (std.mem.eql(u8, short, "s390")) return "SCMP_ARCH_S390";
+    if (std.mem.eql(u8, short, "ppc64le")) return "SCMP_ARCH_PPC64LE";
+    if (std.mem.eql(u8, short, "riscv64")) return "SCMP_ARCH_RISCV64";
+    if (std.mem.eql(u8, short, "mips64le")) return "SCMP_ARCH_MIPSEL64";
+    if (std.mem.eql(u8, short, "mips64")) return "SCMP_ARCH_MIPS64";
+    return short;
 }
 
 fn containsString(list: []const []const u8, needle: []const u8) bool {
@@ -496,7 +528,7 @@ const Linux = struct {
     readonlyPaths: []const []const u8,
     cgroupsPath: []const u8,
     resources: Resources,
-    seccomp: Seccomp,
+    seccomp: ?Seccomp,
 };
 
 const IdMapping = struct {

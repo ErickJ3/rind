@@ -56,6 +56,13 @@ pub const bundles_subpath: []const u8 = "bundles";
 /// Subdirectory of `root` holding overlay upper/work/merged trees.
 pub const overlays_subpath: []const u8 = "overlays";
 
+/// Subdirectory of `root` handed to libcrun as its OCI state root.
+/// Kept separate from `containers_subpath` because libcrun owns the
+/// `<state_root>/<id>/` tree exclusively (writes its own
+/// `state.json`, lock files, etc.) and would refuse to start a new
+/// container there if rind's metadata already lives at the same path.
+pub const runtime_subpath: []const u8 = "runtime";
+
 /// File name (relative to `containers/<id>/`) for the persisted
 /// state document.
 pub const state_filename: []const u8 = "state.json";

@@ -700,6 +700,20 @@
         },
         {
           "names": [
+            "arch_prctl"
+          ],
+          "action": "SCMP_ACT_ALLOW",
+          "args": []
+        },
+        {
+          "names": [
+            "modify_ldt"
+          ],
+          "action": "SCMP_ACT_ALLOW",
+          "args": []
+        },
+        {
+          "names": [
             "open_by_handle_at"
           ],
           "action": "SCMP_ACT_ERRNO",
@@ -724,8 +738,7 @@
           "names": [
             "chroot"
           ],
-          "action": "SCMP_ACT_ERRNO",
-          "errnoRet": 1,
+          "action": "SCMP_ACT_ALLOW",
           "args": []
         },
         {
@@ -788,64 +801,7 @@
           "names": [
             "socket"
           ],
-          "action": "SCMP_ACT_ERRNO",
-          "errnoRet": 22,
-          "args": [
-            {
-              "index": 0,
-              "value": 16,
-              "valueTwo": 0,
-              "op": "SCMP_CMP_EQ"
-            },
-            {
-              "index": 2,
-              "value": 9,
-              "valueTwo": 0,
-              "op": "SCMP_CMP_EQ"
-            }
-          ]
-        },
-        {
-          "names": [
-            "socket"
-          ],
-          "action": "SCMP_ACT_ALLOW",
-          "args": [
-            {
-              "index": 2,
-              "value": 9,
-              "valueTwo": 0,
-              "op": "SCMP_CMP_NE"
-            }
-          ]
-        },
-        {
-          "names": [
-            "socket"
-          ],
-          "action": "SCMP_ACT_ALLOW",
-          "args": [
-            {
-              "index": 0,
-              "value": 16,
-              "valueTwo": 0,
-              "op": "SCMP_CMP_NE"
-            }
-          ]
-        },
-        {
-          "names": [
-            "socket"
-          ],
-          "action": "SCMP_ACT_ALLOW",
-          "args": [
-            {
-              "index": 2,
-              "value": 9,
-              "valueTwo": 0,
-              "op": "SCMP_CMP_NE"
-            }
-          ]
+          "action": "SCMP_ACT_ALLOW"
         },
         {
           "names": [

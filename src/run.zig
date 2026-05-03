@@ -299,10 +299,14 @@ pub fn runImage(
 
     emit(opts, .bundle_ready);
 
+    // libcrun owns `<runtime>/<id>/` and writes its own `state.json`
+    // there. Keep it separate from rind's `containers/<id>/state.json`
+    // metadata to avoid the "already exists" collision.
+    try env.root_dir.createDirPath(io, state_mod.runtime_subpath);
     const state_root_abs = try std.fmt.allocPrint(
         aa,
         "{s}/{s}",
-        .{ env.root_abspath, state_mod.containers_subpath },
+        .{ env.root_abspath, state_mod.runtime_subpath },
     );
     const bundle_abs = try std.fmt.allocPrint(
         aa,
