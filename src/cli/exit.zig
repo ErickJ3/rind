@@ -20,6 +20,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
 const pull_mod = @import("../pull.zig");
+const run_mod = @import("../run.zig");
 
 /// CLI-specific error names not produced by the pull orchestrator.
 pub const CliExtras = error{
@@ -43,6 +44,7 @@ pub const CliExtras = error{
 pub const CliError =
     CliExtras ||
     pull_mod.PullError ||
+    run_mod.RunError ||
     Io.Writer.Error;
 
 /// Exit codes the CLI uses. `u8` keeps it in the POSIX range.
@@ -59,7 +61,6 @@ pub const Code = enum(u8) {
 /// set; classification is by name.
 pub fn mapErrorToExitCode(err: anyerror) Code {
     return switch (err) {
-        // --- Usage / argparse / bad input ---
         error.Usage,
         error.UnsupportedPlatform,
         error.Empty,
@@ -68,14 +69,15 @@ pub fn mapErrorToExitCode(err: anyerror) Code {
         error.InvalidTag,
         error.InvalidDigest,
         error.UnsupportedDigestAlgorithm,
+        error.ImageNotPresent,
+        error.EmptyArgs,
+        error.UnsupportedUserFormat,
+        error.InvalidEnv,
         => .usage,
-
-        // --- Verification (content-addressed integrity broke) ---
         error.DigestMismatch,
         error.MediaTypeMismatch,
+        error.UnsupportedManifestMediaType,
         => .verification,
-
-        // --- Network / registry transport ---
         error.Unauthorized,
         error.Forbidden,
         error.NotFound,
@@ -98,7 +100,6 @@ pub fn mapErrorToExitCode(err: anyerror) Code {
         error.UnsupportedUriScheme,
         error.UriMissingHost,
         => .network,
-
         else => .generic,
     };
 }
@@ -117,4 +118,22 @@ test "mapErrorToExitCode classifies common cases" {
     try testing.expectEqual(Code.generic, mapErrorToExitCode(error.OutOfMemory));
     try testing.expectEqual(Code.generic, mapErrorToExitCode(error.HomeNotFound));
     try testing.expectEqual(Code.generic, mapErrorToExitCode(error.RefNotFound));
+}
+
+test "mapErrorToExitCode classifies run-side errors" {
+    // User-input failures land on .usage so a missing image or bad
+    // override exits with the same code as a malformed flag.
+    try testing.expectEqual(Code.usage, mapErrorToExitCode(error.ImageNotPresent));
+    try testing.expectEqual(Code.usage, mapErrorToExitCode(error.InvalidEnv));
+    try testing.expectEqual(Code.usage, mapErrorToExitCode(error.EmptyArgs));
+    try testing.expectEqual(Code.usage, mapErrorToExitCode(error.UnsupportedUserFormat));
+    // Manifest media-type mismatches at run time are integrity failures
+    // mirroring pull's verification class.
+    try testing.expectEqual(Code.verification, mapErrorToExitCode(error.UnsupportedManifestMediaType));
+    // Runtime / kernel failures fall through to .generic.
+    try testing.expectEqual(Code.generic, mapErrorToExitCode(error.LibcrunFailure));
+    try testing.expectEqual(Code.generic, mapErrorToExitCode(error.BundleNotFound));
+    try testing.expectEqual(Code.generic, mapErrorToExitCode(error.PermissionDenied));
+    try testing.expectEqual(Code.generic, mapErrorToExitCode(error.InvalidConfig));
+    try testing.expectEqual(Code.generic, mapErrorToExitCode(error.AlreadyRunning));
 }

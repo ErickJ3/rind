@@ -16,6 +16,7 @@ const std = @import("std");
 const Io = std.Io;
 
 const pull_mod = @import("../pull.zig");
+const run_mod = @import("../run.zig");
 const digest_mod = @import("../image/digest.zig");
 
 /// Stable JSON event-stream version. Bumping this is a contract
@@ -46,16 +47,31 @@ pub const SummaryInput = struct {
     result: *const pull_mod.PullResult,
 };
 
-/// Vtable handed to the pull handler. Decouples the handler from the
-/// concrete output format so the same call-graph runs under tests
-/// (capturing renderer) and production.
+/// Fields needed to render the final run summary. Distinct from
+/// `SummaryInput` because pull's summary speaks in layers/bytes and
+/// run's speaks in container-id/exit-code/signal.
+pub const RunSummaryInput = struct {
+    /// User-supplied image reference. Echoed for correlation.
+    ref: []const u8,
+    /// Orchestrator outcome. Borrowed; renderer must not keep it.
+    result: *const run_mod.RunResult,
+};
+
+/// Vtable handed to the pull and run handlers. Decouples each handler
+/// from the concrete output format so the same call-graph runs under
+/// tests (capturing renderer) and production. Pull-only and run-only
+/// methods coexist on the same vtable; consumers route by verb.
 pub const Renderer = struct {
-    /// Renderer state. Pointer-stable for the life of a single pull.
+    /// Renderer state. Pointer-stable for the life of a single command.
     ctx: ?*anyopaque,
     /// Called once per `PullEvent` in orchestrator-order.
     on_event: *const fn (?*anyopaque, pull_mod.PullEvent) Io.Writer.Error!void,
-    /// Called once after the orchestrator returns successfully.
+    /// Called once after the pull orchestrator returns successfully.
     on_summary: *const fn (?*anyopaque, SummaryInput) Io.Writer.Error!void,
+    /// Called once per `RunEvent` in orchestrator-order. T24.
+    on_run_event: *const fn (?*anyopaque, run_mod.RunEvent) Io.Writer.Error!void,
+    /// Called once after the run orchestrator returns successfully. T24.
+    on_run_summary: *const fn (?*anyopaque, RunSummaryInput) Io.Writer.Error!void,
     /// Called when the handler is about to return a non-zero exit
     /// code. `msg` is a short user-facing description; renderers may
     /// elaborate (JSON wraps it in an envelope, human writes it raw
@@ -97,6 +113,8 @@ pub const Human = struct {
             .ctx = self,
             .on_event = onEvent,
             .on_summary = onSummary,
+            .on_run_event = onRunEvent,
+            .on_run_summary = onRunSummary,
             .on_error = onError,
         };
     }
@@ -184,6 +202,31 @@ pub const Human = struct {
         try self.err_writer.print("error: {s}\n", .{msg});
         try self.err_writer.flush();
     }
+
+    fn onRunEvent(ctx: ?*anyopaque, ev: run_mod.RunEvent) Io.Writer.Error!void {
+        const self: *Human = @ptrCast(@alignCast(ctx.?));
+        if (self.quiet) return;
+        switch (ev) {
+            .run_started => |r| {
+                try self.writer.print("Running {s} (id {s})\n", .{ r.ref, r.id[0..] });
+            },
+            .overlay_mounted => try self.writer.writeAll("overlay mounted\n"),
+            .bundle_ready => try self.writer.writeAll("bundle ready\n"),
+            .started => |s| try self.writer.print("started (pid {d})\n", .{s.pid}),
+            .exited => |e| try self.writer.print("exited code={d} signal={d}\n", .{ e.code, e.signal }),
+            .removed => try self.writer.writeAll("removed\n"),
+        }
+        try self.writer.flush();
+    }
+
+    fn onRunSummary(ctx: ?*anyopaque, sum: RunSummaryInput) Io.Writer.Error!void {
+        const self: *Human = @ptrCast(@alignCast(ctx.?));
+        try self.writer.print(
+            "Container {s} exited (code={d}, signal={d})\n",
+            .{ sum.result.container_id[0..], sum.result.exit_code, sum.result.signal },
+        );
+        try self.writer.flush();
+    }
 };
 
 /// Truncate `"sha256:<64-hex>"` to `"sha256:<12-hex>"` for terminal
@@ -211,6 +254,8 @@ pub const Json = struct {
             .ctx = self,
             .on_event = onEvent,
             .on_summary = onSummary,
+            .on_run_event = onRunEvent,
+            .on_run_summary = onRunSummary,
             .on_error = onError,
         };
     }
@@ -248,6 +293,31 @@ pub const Json = struct {
         try writeJsonString(self.err_writer, msg);
         try self.err_writer.writeAll("}\n");
         try self.err_writer.flush();
+    }
+
+    fn onRunEvent(ctx: ?*anyopaque, ev: run_mod.RunEvent) Io.Writer.Error!void {
+        const self: *Json = @ptrCast(@alignCast(ctx.?));
+        try writeRunEvent(self.writer, ev);
+        try self.writer.flush();
+    }
+
+    fn onRunSummary(ctx: ?*anyopaque, sum: RunSummaryInput) Io.Writer.Error!void {
+        const self: *Json = @ptrCast(@alignCast(ctx.?));
+        try self.writer.print(
+            "{{\"schema_version\":{d},\"event\":\"run_summary\",\"ref\":",
+            .{schema_version},
+        );
+        try writeJsonString(self.writer, sum.ref);
+        try self.writer.print(
+            ",\"container_id\":\"{s}\",\"exit_code\":{d},\"signal\":{d},\"removed\":{s}}}\n",
+            .{
+                sum.result.container_id[0..],
+                sum.result.exit_code,
+                sum.result.signal,
+                boolName(sum.result.removed),
+            },
+        );
+        try self.writer.flush();
     }
 };
 
@@ -294,6 +364,53 @@ pub fn writeEvent(w: *Io.Writer, ev: pull_mod.PullEvent) Io.Writer.Error!void {
             try w.print(
                 "{{\"schema_version\":{d},\"event\":\"done\",\"manifest_digest\":\"{s}\"}}\n",
                 .{ schema_version, d.manifest_digest.toString(&dig_buf) },
+            );
+        },
+    }
+}
+
+/// Write a single `RunEvent` to `w` as one NDJSON line. Public so
+/// tests can drive it directly without standing up a `Json` instance.
+/// Field order is fixed by hand — wire-format stability matters as
+/// much for run as for pull.
+pub fn writeRunEvent(w: *Io.Writer, ev: run_mod.RunEvent) Io.Writer.Error!void {
+    switch (ev) {
+        .run_started => |r| {
+            try w.print(
+                "{{\"schema_version\":{d},\"event\":\"run_started\",\"ref\":",
+                .{schema_version},
+            );
+            try writeJsonString(w, r.ref);
+            try w.print(",\"id\":\"{s}\"}}\n", .{r.id[0..]});
+        },
+        .overlay_mounted => {
+            try w.print(
+                "{{\"schema_version\":{d},\"event\":\"overlay_mounted\"}}\n",
+                .{schema_version},
+            );
+        },
+        .bundle_ready => {
+            try w.print(
+                "{{\"schema_version\":{d},\"event\":\"bundle_ready\"}}\n",
+                .{schema_version},
+            );
+        },
+        .started => |s| {
+            try w.print(
+                "{{\"schema_version\":{d},\"event\":\"started\",\"pid\":{d}}}\n",
+                .{ schema_version, s.pid },
+            );
+        },
+        .exited => |e| {
+            try w.print(
+                "{{\"schema_version\":{d},\"event\":\"exited\",\"code\":{d},\"signal\":{d}}}\n",
+                .{ schema_version, e.code, e.signal },
+            );
+        },
+        .removed => {
+            try w.print(
+                "{{\"schema_version\":{d},\"event\":\"removed\"}}\n",
+                .{schema_version},
             );
         },
     }
@@ -493,6 +610,73 @@ test "human renderer --quiet drops events but keeps summary" {
     };
     try r.on_summary(r.ctx, .{ .ref = "alpine:3.19", .result = &result });
     try testing.expect(std.mem.indexOf(u8, out.written(), "Pulled alpine:3.19") != null);
+}
+
+test "writeRunEvent JSON snapshot — full sequence" {
+    const gpa = testing.allocator;
+    var buf: Io.Writer.Allocating = .init(gpa);
+    defer buf.deinit();
+
+    const id = [12]u8{ 'a', 'b', 'c', '1', '2', '3', 'd', 'e', 'f', '4', '5', '6' };
+    const events = [_]run_mod.RunEvent{
+        .{ .run_started = .{ .ref = "alpine:3.19", .id = id } },
+        .overlay_mounted,
+        .bundle_ready,
+        .{ .started = .{ .pid = 0 } },
+        .{ .exited = .{ .code = 0, .signal = 0 } },
+        .removed,
+    };
+    for (events) |ev| try writeRunEvent(&buf.writer, ev);
+
+    const expected = @embedFile("testdata/run_events.ndjson");
+    try testing.expectEqualStrings(expected, buf.written());
+}
+
+test "human renderer formats run events terse" {
+    const gpa = testing.allocator;
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(gpa);
+    defer err_out.deinit();
+
+    var human: Human = .{ .writer = &out.writer, .err_writer = &err_out.writer, .quiet = false };
+    const r = human.renderer();
+
+    const id = [12]u8{ 'a', 'b', 'c', '1', '2', '3', 'd', 'e', 'f', '4', '5', '6' };
+    try r.on_run_event(r.ctx, .{ .run_started = .{ .ref = "alpine:3.19", .id = id } });
+    try r.on_run_event(r.ctx, .overlay_mounted);
+    try r.on_run_event(r.ctx, .bundle_ready);
+    try r.on_run_event(r.ctx, .{ .started = .{ .pid = 0 } });
+    try r.on_run_event(r.ctx, .{ .exited = .{ .code = 0, .signal = 0 } });
+    try r.on_run_event(r.ctx, .removed);
+
+    try testing.expect(std.mem.indexOf(u8, out.written(), "Running alpine:3.19 (id abc123def456)") != null);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "overlay mounted") != null);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "bundle ready") != null);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "started (pid 0)") != null);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "exited code=0 signal=0") != null);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "removed") != null);
+}
+
+test "human renderer run summary line" {
+    const gpa = testing.allocator;
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(gpa);
+    defer err_out.deinit();
+
+    var human: Human = .{ .writer = &out.writer, .err_writer = &err_out.writer, .quiet = false };
+    const r = human.renderer();
+
+    const id = [12]u8{ 'a', 'b', 'c', '1', '2', '3', 'd', 'e', 'f', '4', '5', '6' };
+    const result = run_mod.RunResult{
+        .container_id = id,
+        .exit_code = 0,
+        .signal = 0,
+        .removed = true,
+    };
+    try r.on_run_summary(r.ctx, .{ .ref = "alpine:3.19", .result = &result });
+    try testing.expect(std.mem.indexOf(u8, out.written(), "Container abc123def456 exited (code=0, signal=0)") != null);
 }
 
 test "writeJsonString escapes the small set we care about" {

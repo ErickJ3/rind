@@ -1,0 +1,6 @@
+{"schema_version":3,"event":"run_started","ref":"alpine:3.19","id":"abc123def456"}
+{"schema_version":3,"event":"overlay_mounted"}
+{"schema_version":3,"event":"bundle_ready"}
+{"schema_version":3,"event":"started","pid":0}
+{"schema_version":3,"event":"exited","code":0,"signal":0}
+{"schema_version":3,"event":"removed"}
