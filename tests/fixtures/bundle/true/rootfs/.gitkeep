@@ -1,2 +1,0 @@
-# /bin/true is generated into this dir at build time from
-# tests/c/true_main.c via build.zig's `buildTrueBinary` helper.

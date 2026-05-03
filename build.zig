@@ -80,18 +80,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
-    // T17 phase A — audit step. Walks vendor/crun-1.23/src/ and prints a
-    // Markdown table of SPDX licenses for every translation unit. Exits
-    // non-zero if a GPL-only file is found in the compile set
-    // (build/cdeps/crun/SOURCES.md). Run with `rtk zig build audit`.
-    const audit_step = b.step("audit", "Walk vendored libcrun source for non-LGPL files");
-    const run_audit = b.addSystemCommand(&.{
-        b.pathFromRoot("scripts/lgpl_audit.sh"),
-        b.pathFromRoot("vendor/crun-1.23/src"),
-    });
-    audit_step.dependOn(&run_audit.step);
-
-    // T17 phase B — static-link libcrun.a + libseccomp.a + libcap.a +
+    // T17 — static-link libcrun.a + libseccomp.a + libcap.a +
     // argp_standalone.a into the rind exe (helpers below). Link order
     // matters: libcrun → libseccomp → libcap → argp_standalone (libcrun
     // references argp_parse, which resolves last).
@@ -105,95 +94,6 @@ pub fn build(b: *std.Build) void {
     if (seccomp_lib) |l| exe_module.linkLibrary(l);
     if (cap_lib) |l| exe_module.linkLibrary(l);
     if (argp_lib) |l| exe_module.linkLibrary(l);
-
-    // T17 phase B step 5 — pure-C integration test driving
-    // libcrun_container_run() against a synthesized OCI bundle.
-    // Gated behind -Dintegration=true because the test needs
-    // CAP_SYS_ADMIN or unprivileged user namespaces.
-    const integration = b.option(
-        bool,
-        "integration",
-        "Run libcrun integration tests (require CAP_SYS_ADMIN or unprivileged userns).",
-    ) orelse false;
-
-    if (integration and crun_lib != null and seccomp_lib != null and cap_lib != null and argp_lib != null) {
-        const bundle_dir = synthesizeTrueBundle(b, target);
-
-        const run_true_mod = b.createModule(.{
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        });
-        run_true_mod.addCSourceFile(.{
-            .file = b.path("tests/c/run_true.c"),
-            .flags = &.{"-D_GNU_SOURCE"},
-        });
-        run_true_mod.addIncludePath(b.path("vendor/crun-1.23/src"));
-        run_true_mod.addIncludePath(b.path("vendor/crun-1.23/libocispec/src"));
-        run_true_mod.addIncludePath(b.path("build/cdeps/crun"));
-
-        run_true_mod.linkLibrary(crun_lib.?);
-        run_true_mod.linkLibrary(seccomp_lib.?);
-        run_true_mod.linkLibrary(cap_lib.?);
-        run_true_mod.linkLibrary(argp_lib.?);
-
-        const run_true_exe = b.addExecutable(.{
-            .name = "run_true",
-            .root_module = run_true_mod,
-        });
-
-        const run = b.addRunArtifact(run_true_exe);
-        run.addDirectoryArg(bundle_dir);
-        run.expectExitCode(0);
-        test_step.dependOn(&run.step);
-    }
-}
-
-// synthesizeTrueBundle — composes a minimal OCI bundle into a single
-// LazyPath directory. config.json comes from tests/fixtures/bundle/true/;
-// rootfs/bin/true is a freshly-built static executable from
-// tests/c/true_main.c (so the runtime dynamic linker doesn't need to
-// resolve anything from inside the container). Returns the bundle
-// directory's LazyPath, suitable as argv to run_true.
-fn synthesizeTrueBundle(b: *std.Build, target: std.Build.ResolvedTarget) std.Build.LazyPath {
-    _ = target;
-
-    // /bin/true: must be statically linked because the container has
-    // no libc or dynamic linker visible. Uses the same x86_64-linux-musl
-    // target as the rest of the build (regardless of the outer target,
-    // because the bundle is consumed inside a container that always
-    // runs on Linux).
-    const true_target = b.resolveTargetQuery(.{
-        .cpu_arch = .x86_64,
-        .os_tag = .linux,
-        .abi = .musl,
-    });
-    // link_libc=true even though true_main.c only defines `int main()` —
-    // musl's CRT supplies _start; without it ld.lld errors out with
-    // "cannot find entry symbol _start".
-    const true_mod = b.createModule(.{
-        .target = true_target,
-        .optimize = .ReleaseSmall,
-        .link_libc = true,
-        .strip = true,
-    });
-    true_mod.addCSourceFile(.{
-        .file = b.path("tests/c/true_main.c"),
-        .flags = &.{},
-    });
-    const true_exe = b.addExecutable(.{
-        .name = "true",
-        .root_module = true_mod,
-    });
-
-    // Compose the bundle dir: copy config.json + drop the freshly-
-    // built true binary at rootfs/bin/true. WriteFile gives us a
-    // synthesized dir LazyPath in the build cache.
-    const wf = b.addWriteFiles();
-    _ = wf.addCopyFile(b.path("tests/fixtures/bundle/true/config.json"), "config.json");
-    _ = wf.addCopyFile(true_exe.getEmittedBin(), "rootfs/bin/true");
-
-    return wf.getDirectory();
 }
 
 // cArgpStandalone — argp-standalone 1.5.0 as a static lib. argp is

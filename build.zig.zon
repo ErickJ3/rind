@@ -63,10 +63,6 @@
         "src",
         "build",
         "vendor",
-        "tests",
-        "scripts",
         "LICENSE",
-        "NOTICE",
-        "THIRD_PARTY_LICENSES.md",
     },
 }
