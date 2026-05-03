@@ -1,0 +1,36 @@
+seccomp_default.json — license + provenance
+==============================================
+
+Source: github.com/containers/common, file pkg/seccomp/seccomp.json
+        (the default seccomp profile that podman / buildah / cri-o ship).
+
+Upstream license: Apache License, Version 2.0
+                  https://www.apache.org/licenses/LICENSE-2.0
+
+The upstream JSON uses the "moby" seccomp profile shape (archMap with
+sub-architectures + per-syscall includes/excludes filters keyed on caps,
+arches, and minKernel). That shape is not directly accepted by the
+OCI runtime spec.
+
+This file is a one-time vendor-time *resolution* of that profile under
+rind's M2 default container environment:
+
+  - capabilities = {} (rind drops every cap; the bounding set is the
+    14-cap docker default applied at runtime via config.json, but the
+    resolution here is conservative: empty cap set so cap-gated allows
+    are NOT inherited)
+  - architectures = SCMP_ARCH_X86_64, SCMP_ARCH_X86, SCMP_ARCH_X32,
+                    SCMP_ARCH_AARCH64, SCMP_ARCH_ARM
+  - minKernel filter = always satisfied (assume bleeding-edge kernel)
+
+Output shape is pure OCI runtime spec v1.0.2 `linux.seccomp` — the
+exact JSON object that goes inside config.json. bundle.zig embeds
+this file verbatim and parse-and-restringifies it into the assembled
+config.
+
+If rind ever needs to ship a hardened cap-aware profile (e.g. a
+container that requested CAP_NET_BIND_SERVICE), the resolver must run
+with `caps={CAP_NET_BIND_SERVICE}` and re-emit. Punted to v0.2.
+
+NOTICE retained per Apache-2.0 §4(d): this work is derivative of
+containers/common, which is © The Containers contributors.
