@@ -43,6 +43,9 @@ pub const PullArgs = struct {
     no_progress: bool = false,
     /// `--timing`. Print per-phase ms summary on stderr at end.
     timing: bool = false,
+    /// `--ipv4`. Force IPv4-only DNS resolution. Avoids the Happy
+    /// Eyeballs penalty (~50–100ms per AAAA lookup) on v4-only hosts.
+    ipv4: bool = false,
 };
 
 /// Pull-handler dependency injection. Production wires the real
@@ -75,6 +78,7 @@ const params = clap.parseParamsComptime(
     \\    --concurrency <usize>   Max parallel blob downloads + layer extracts (0 = default).
     \\    --no-progress           Disable the live progress UI; print terse log instead.
     \\    --timing                Print per-phase ms summary on stderr at end.
+    \\    --ipv4                  Force IPv4-only connections (skip IPv6 happy-eyeballs).
     \\<str>                       Image reference (e.g. alpine:3.19).
     \\
 );
@@ -86,7 +90,7 @@ const value_parsers = .{
 };
 
 /// One-line usage banner. Stable enough that scripts can grep it.
-pub const usage_line: []const u8 = "Usage: rind pull [--output human|json] [-q|--quiet] [--platform <plat>] [--concurrency <n>] [--no-progress] [--timing] <image>";
+pub const usage_line: []const u8 = "Usage: rind pull [--output human|json] [-q|--quiet] [--platform <plat>] [--concurrency <n>] [--no-progress] [--timing] [--ipv4] <image>";
 
 /// Parse argv (after the `pull` subcommand has already been peeled
 /// off) into a validated `PullArgs`. `iter` is consumed; `gpa` backs
@@ -136,6 +140,7 @@ pub fn parseArgs(
         .concurrency = res.args.concurrency orelse 0,
         .no_progress = res.args.@"no-progress" != 0,
         .timing = res.args.timing != 0,
+        .ipv4 = res.args.ipv4 != 0,
     };
 }
 

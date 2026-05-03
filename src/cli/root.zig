@@ -23,6 +23,7 @@ const output = @import("output.zig");
 const pull_cli = @import("pull.zig");
 const images_cli = @import("images.zig");
 const inspect_cli = @import("inspect.zig");
+const io_v4 = @import("../io_v4.zig");
 
 /// Default storage root suffix appended to `$HOME` when `RIND_ROOT`
 /// is unset. Matches the layout described in `docs/rind.md`.
@@ -81,7 +82,7 @@ pub fn dispatch(
 }
 
 fn runPull(
-    io: Io,
+    io_in: Io,
     gpa: Allocator,
     sub_argv: []const []const u8,
     env_map: *const Environ.Map,
@@ -91,6 +92,8 @@ fn runPull(
     var iter: SliceIter = .{ .items = sub_argv };
     const args = try pull_cli.parseArgs(gpa, &iter, stderr);
     defer pull_cli.freeArgs(gpa, args);
+
+    const io = if (args.ipv4) io_v4.wrap(io_in) else io_in;
 
     const root_path = try resolveRoot(gpa, env_map);
     defer gpa.free(root_path);
