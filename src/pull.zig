@@ -118,6 +118,10 @@ pub const PullOptions = struct {
     /// layer extraction). When null, no Progress tree work is done
     /// and the orchestrator falls back to events-only reporting.
     progress_node: ?std.Progress.Node = null,
+    /// Print a per-phase ms summary on stderr at end of pull. Phases:
+    /// manifest (auth + GET), blobs (pool runAll), extract (drain).
+    /// blobs and extract overlap — sums won't match total.
+    timing: bool = false,
 };
 
 /// Outcome of a successful `pullImage`.
@@ -220,6 +224,30 @@ fn buildManifestBaseUrl(
 
 fn emit(options: PullOptions, ev: PullEvent) void {
     if (options.progress_fn) |f| f(options.progress_ctx, ev);
+}
+
+fn msBetween(a: ?Io.Timestamp, b: ?Io.Timestamp) u64 {
+    const ai = a orelse return 0;
+    const bi = b orelse return 0;
+    const ns = ai.durationTo(bi).nanoseconds;
+    if (ns <= 0) return 0;
+    return @as(u64, @intCast(@divTrunc(ns, std.time.ns_per_ms)));
+}
+
+fn printTiming(
+    t0: ?Io.Timestamp,
+    t_manifest: ?Io.Timestamp,
+    t_blobs: ?Io.Timestamp,
+    t_extract: ?Io.Timestamp,
+) void {
+    const manifest_ms = msBetween(t0, t_manifest);
+    const blobs_ms = msBetween(t_manifest, t_blobs);
+    const extract_ms = msBetween(t_blobs, t_extract);
+    const total_ms = msBetween(t0, t_extract);
+    std.debug.print(
+        "timing: total={d}ms  manifest={d}ms  blobs={d}ms  extract={d}ms  (blobs/extract overlap)\n",
+        .{ total_ms, manifest_ms, blobs_ms, extract_ms },
+    );
 }
 
 const Slot = struct {
@@ -390,6 +418,8 @@ pub fn pullImage(
     ref_text: []const u8,
     options: PullOptions,
 ) PullError!PullResult {
+    const t0: ?Io.Timestamp = if (options.timing) Io.Clock.awake.now(io) else null;
+
     emit(options, .{ .pull_started = .{ .ref = ref_text } });
 
     var ref = try image_ref.parse(gpa, ref_text);
@@ -426,6 +456,7 @@ pub fn pullImage(
         return e;
     };
     if (manifest_node) |n| n.end();
+    const t_manifest: ?Io.Timestamp = if (options.timing) Io.Clock.awake.now(io) else null;
     var mres_owned = true;
     defer if (mres_owned) mres.deinit();
 
@@ -658,6 +689,7 @@ pub fn pullImage(
     var pool = blob_pool.Pool.init(gpa, io, client, eff_concurrency);
     defer pool.deinit();
     try pool.runAll(jobs);
+    const t_blobs: ?Io.Timestamp = if (options.timing) Io.Clock.awake.now(io) else null;
 
     if (blobs_parent) |n| n.end();
 
@@ -686,6 +718,7 @@ pub fn pullImage(
     // more work" so workers exit when the queue drains.
     ex_pool.closeAndJoin();
     ex_pool_closed = true;
+    const t_extract: ?Io.Timestamp = if (options.timing) Io.Clock.awake.now(io) else null;
 
     if (extract_parent) |n| n.end();
 
@@ -701,6 +734,8 @@ pub fn pullImage(
     });
 
     emit(options, .{ .done = .{ .manifest_digest = mres.digest } });
+
+    if (options.timing) printTiming(t0, t_manifest, t_blobs, t_extract);
 
     // Build PullResult into its own arena so the caller can outlive
     // the manifest result.
