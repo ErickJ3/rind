@@ -41,7 +41,22 @@
 #define HAVE_STRCHRNUL   1
 
 /* GCC attribute checks. */
+#define HAVE_GCC_ATTRIBUTE           1
 #define HAVE_GCC_ATTRIBUTE_PURE      1
 #define HAVE_GCC_ATTRIBUTE_FORMAT    1
+
+/* AH_BOTTOM injection (autoheader emits this at the foot of config.h
+ * after running configure). The argp sources reference UNUSED /
+ * NORETURN / PRINTF_STYLE without their own define, expecting these
+ * to live in config.h. */
+#if __GNUC__ && HAVE_GCC_ATTRIBUTE
+# define NORETURN __attribute__ ((__noreturn__))
+# define PRINTF_STYLE(f, a) __attribute__ ((__format__ (__printf__, f, a)))
+# define UNUSED __attribute__ ((__unused__))
+#else
+# define NORETURN
+# define PRINTF_STYLE(f, a)
+# define UNUSED
+#endif
 
 #endif /* RIND_ARGP_STANDALONE_CONFIG_H */

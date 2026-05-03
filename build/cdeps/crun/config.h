@@ -52,8 +52,8 @@
 #define HAVE_LINUX_OPENAT2_H  1   /* kernel ≥ 5.6 */
 #define HAVE_LINUX_IOPRIO_H   1
 /* error.h is a glibc-only header; libcrun does not include it under our
- * compiled set. Leave undefined. */
-#define HAVE_ERROR_H          0
+ * compiled set. Leave undefined (libcrun uses #ifdef HAVE_ERROR_H). */
+/* #undef HAVE_ERROR_H */
 
 /* Function checks. */
 #define HAVE_EACCESS          1
@@ -61,11 +61,11 @@
 #define HAVE_COPY_FILE_RANGE  1
 #define HAVE_FGETXATTR        1
 #define HAVE_STATX            1
-#define HAVE_FGETPWENT_R      0   /* glibc extension; musl lacks it */
+/* #undef HAVE_FGETPWENT_R */ /* glibc extension; musl lacks it. libcrun uses #ifndef HAVE_FGETPWENT_R to swap to a fallback. */
 #define HAVE_ISSETUGID        1   /* musl provides it */
 #define HAVE_MEMFD_CREATE     1
 #define HAVE_LOG2             1
-#define HAVE_SD_NOTIFY_BARRIER 0  /* no systemd */
+/* #undef HAVE_SD_NOTIFY_BARRIER */ /* no systemd */
 
 /* mount API: musl exposes FSCONFIG_CMD_CREATE via linux/mount.h, not sys/mount.h. */
 #define HAVE_FSCONFIG_CMD_CREATE_LINUX_MOUNT_H 1
@@ -79,20 +79,24 @@
 #define HAVE_SECCOMP_GET_NOTIF_SIZES 1
 #define HAVE_EBPF                    1
 
-/* Disabled feature toggles — explicitly 0 so #if HAVE_X compiles. */
-#define HAVE_DLOPEN     0
-#define HAVE_SYSTEMD    0
-#define HAVE_CRIU       0
-#define CRIU_JOIN_NS_SUPPORT       0
-#define CRIU_PRE_DUMP_SUPPORT      0
-#define CRIU_NETWORK_LOCK_SKIP_SUPPORT 0
-#define HAVE_LIBKRUN    0
-#define HAVE_MONO       0
-#define HAVE_WASMER     0
-#define HAVE_WASMTIME   0
-#define HAVE_WASMEDGE   0
-#define HAVE_WAMR       0
-#define HAVE_SPIN       0
+/* Disabled feature toggles — autoconf convention is defined-to-1 OR
+ * undefined. libcrun mixes `#ifdef HAVE_X` and `#if HAVE_X` checks
+ * across files (see grep `#ifdef HAVE_DLOPEN` vs `#if HAVE_CRIU`);
+ * defining to 0 breaks the `#ifdef` ones, so we leave these undefined.
+ * Comments below name each disabled feature for the audit trail. */
+/* #undef HAVE_DLOPEN     */ /* --disable-dl */
+/* #undef HAVE_SYSTEMD    */ /* --disable-systemd */
+/* #undef HAVE_CRIU       */ /* --disable-criu */
+/* #undef CRIU_JOIN_NS_SUPPORT */
+/* #undef CRIU_PRE_DUMP_SUPPORT */
+/* #undef CRIU_NETWORK_LOCK_SKIP_SUPPORT */
+/* #undef HAVE_LIBKRUN    */
+/* #undef HAVE_MONO       */
+/* #undef HAVE_WASMER     */
+/* #undef HAVE_WASMTIME   */
+/* #undef HAVE_WASMEDGE   */
+/* #undef HAVE_WAMR       */
+/* #undef HAVE_SPIN       */
 
 /* Linkage. */
 #define SHARED_LIBCRUN  0

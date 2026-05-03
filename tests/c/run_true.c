@@ -13,15 +13,27 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
-#include "libcrun/container.h"
-#include "libcrun/error.h"
+/* container.h + error.h live at vendor/crun-1.23/src/ in our build;
+ * no `libcrun/` prefix because we don't use libcrun's installed
+ * include layout. The Zig wrapper in T18 follows the same convention. */
+#include "container.h"
+#include "error.h"
 
 int main(int argc, char **argv)
 {
     if (argc != 2) {
         fprintf(stderr, "usage: %s <bundle-dir>\n", argv[0]);
         return 2;
+    }
+
+    /* libcrun_container_load_from_file resolves "config.json" relative
+     * to cwd; the OCI runtime convention is to chdir to the bundle
+     * before loading. */
+    if (chdir(argv[1]) != 0) {
+        perror("chdir");
+        return 5;
     }
 
     libcrun_context_t ctx;
