@@ -1,0 +1,29 @@
+{
+  "architecture": "amd64",
+  "os": "linux",
+  "created": "2026-01-15T12:00:00Z",
+  "config": {
+    "Env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
+    "Cmd": ["/usr/bin/server"],
+    "Entrypoint": ["/init"],
+    "WorkingDir": "/srv",
+    "User": "1000:1000",
+    "Labels": {
+      "org.opencontainers.image.title": "rind-fixture",
+      "org.opencontainers.image.version": "0.1.0"
+    },
+    "ExposedPorts": {
+      "8080/tcp": {},
+      "9090/tcp": {}
+    },
+    "Volumes": {
+      "/data": {},
+      "/var/log": {}
+    },
+    "StopSignal": "SIGTERM"
+  },
+  "rootfs": {
+    "type": "layers",
+    "diff_ids": ["sha256:0000000000000000000000000000000000000000000000000000000000000000"]
+  }
+}
