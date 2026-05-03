@@ -94,7 +94,9 @@ pub const EuidSource = struct {
 
 fn defaultEuidFetch(ctx: ?*anyopaque) u32 {
     _ = ctx;
-    return @intCast(std.posix.geteuid());
+    // `std.posix.geteuid` is not surfaced in Zig 0.16; the linux
+    // syscall wrapper is the canonical source. Matches `overlay.zig`.
+    return @intCast(std.os.linux.geteuid());
 }
 
 /// Default resolver for `euid_source`. Reads the live host euid.

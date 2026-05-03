@@ -30,6 +30,10 @@ pub const registry = struct {
 /// pool → extract → tag.
 pub const pull = @import("pull.zig");
 
+/// Run orchestrator (T23): glue that wires ref → store lookup →
+/// extract → state alloc → overlay mount → bundle compose → libcrun.
+pub const run = @import("run.zig");
+
 /// OCI runtime modules: typed Zig surface over libcrun (T18) and
 /// downstream container lifecycle helpers (T19+).
 pub const runtime = struct {
@@ -67,6 +71,7 @@ test {
     _ = registry.manifest;
     _ = registry.blob_pool;
     _ = pull;
+    _ = run;
     _ = runtime.libcrun;
     _ = runtime.state;
     _ = runtime.overlay;

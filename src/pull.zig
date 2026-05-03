@@ -171,19 +171,6 @@ pub const PullError =
         UnsupportedLayerMediaType,
     };
 
-const oci_layer_gzip = "application/vnd.oci.image.layer.v1.tar+gzip";
-const docker_layer_gzip = "application/vnd.docker.image.rootfs.diff.tar.gzip";
-const oci_layer_zstd = "application/vnd.oci.image.layer.v1.tar+zstd";
-
-const LayerCompression = enum { gzip, zstd };
-
-fn classifyLayer(media_type: []const u8) ?LayerCompression {
-    if (std.mem.eql(u8, media_type, oci_layer_gzip)) return .gzip;
-    if (std.mem.eql(u8, media_type, docker_layer_gzip)) return .gzip;
-    if (std.mem.eql(u8, media_type, oci_layer_zstd)) return .zstd;
-    return null;
-}
-
 /// Slice 12 hex chars (without the "sha256:" prefix) from a digest
 /// string for use as a docker-style short identifier in progress-node
 /// labels. Returns the input on shorter strings.
@@ -343,55 +330,8 @@ fn finalizePending(self: *Pending, io: Io) (Io.File.Atomic.LinkError || Io.File.
     self.atomic.deinit(io);
 }
 
-fn ensureExtractedRoot(
-    io: Io,
-    store: *layout.Store,
-) Io.Dir.CreateDirPathError!void {
-    try store.dir.createDirPath(io, layout.extracted_subpath);
-}
-
-fn extractIfMissing(
-    io: Io,
-    gpa: Allocator,
-    store: *layout.Store,
-    digest: Digest,
-    media_type: []const u8,
-) PullError!void {
-    var hex_buf: [digest_mod.hex_length]u8 = undefined;
-    const hex = digest.encodedHex(&hex_buf);
-
-    var path_buf: [layout.extracted_subpath.len + 1 + digest_mod.hex_length]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ layout.extracted_subpath, hex }) catch
-        unreachable;
-
-    // Idempotency: skip if the dir already exists.
-    const exists = blk: {
-        store.dir.access(io, path, .{}) catch |err| switch (err) {
-            error.FileNotFound => break :blk false,
-            else => |e| return e,
-        };
-        break :blk true;
-    };
-    if (exists) return;
-
-    try store.dir.createDirPath(io, path);
-    var dest_dir = try store.dir.openDir(io, path, .{ .iterate = true });
-    defer dest_dir.close(io);
-
-    var blob_file = try store.openBlob(io, digest);
-    defer blob_file.close(io);
-
-    var read_buf: [64 * 1024]u8 = undefined;
-    var fr = blob_file.reader(io, &read_buf);
-
-    switch (classifyLayer(media_type) orelse return error.UnsupportedLayerMediaType) {
-        .gzip => try extract.extractGzip(io, gpa, &fr.interface, dest_dir),
-        .zstd => try extract.extractZstd(io, gpa, &fr.interface, dest_dir),
-    }
-}
-
 /// Adapter for `extract_pool.ExtractFn`. Forwards to
-/// `extractIfMissing` and widens the error to `anyerror` so the
+/// `extract.ensureLayer` and widens the error to `anyerror` so the
 /// pool stays decoupled from `PullError`. The orchestrator narrows
 /// back via `@errorCast` after the pool joins.
 fn extractAdapter(
@@ -401,7 +341,7 @@ fn extractAdapter(
     digest: Digest,
     media_type: []const u8,
 ) anyerror!void {
-    return extractIfMissing(io, gpa, store, digest, media_type);
+    return extract.ensureLayer(io, gpa, store, digest, media_type);
 }
 
 /// Pull `ref_text` into `store` using `client` for transport. Returns
@@ -478,7 +418,7 @@ pub fn pullImage(
     // Validate every layer media type up-front. Returning before any
     // download keeps the store unchanged on UnsupportedLayerMediaType.
     for (layers) |l| {
-        if (classifyLayer(l.mediaType) == null) {
+        if (extract.classifyLayer(l.mediaType) == null) {
             return error.UnsupportedLayerMediaType;
         }
     }
@@ -547,7 +487,7 @@ pub fn pullImage(
     // so layer N's bytes can land in `onBlobComplete` and immediately
     // submit to a running extract worker, overlapping extract of
     // layer N with download of layer N+k.
-    try ensureExtractedRoot(io, store);
+    try extract.ensureExtractedRoot(io, store);
 
     const eff_concurrency = if (options.concurrency == 0)
         blob_pool.Pool.defaultConcurrency()
@@ -670,8 +610,8 @@ pub fn pullImage(
     // before the pool runs so warm-cache pulls do not appear to
     // stall while the pool spins up workers for the rest. Cached
     // layers also need their extract job submitted so the extract
-    // pool processes them — they will hit the `extractIfMissing`
-    // fast-path inside the worker.
+    // pool processes them — they will hit the `extract.ensureLayer`
+    // idempotent fast-path inside the worker.
     for (slots, 0..) |s, slot_idx| if (s.cached) {
         emit(options, .{ .blob_done = .{
             .digest = s.digest,
@@ -1080,7 +1020,7 @@ test "pullImage end-to-end against mock registry, two-layer image" {
     const gpa = testing.allocator;
     const io = testing.io;
 
-    var img = try buildTestImage(gpa, oci_layer_gzip);
+    var img = try buildTestImage(gpa, extract.oci_layer_gzip);
     defer img.deinit(gpa);
 
     var c_buf: [digest_mod.string_length]u8 = undefined;
@@ -1179,7 +1119,7 @@ test "pullImage skips blobs already present in the store" {
     const gpa = testing.allocator;
     const io = testing.io;
 
-    var img = try buildTestImage(gpa, oci_layer_gzip);
+    var img = try buildTestImage(gpa, extract.oci_layer_gzip);
     defer img.deinit(gpa);
 
     var c_buf: [digest_mod.string_length]u8 = undefined;
@@ -1312,7 +1252,7 @@ test "pullImage emits progress events in deterministic order" {
     const gpa = testing.allocator;
     const io = testing.io;
 
-    var img = try buildTestImage(gpa, oci_layer_gzip);
+    var img = try buildTestImage(gpa, extract.oci_layer_gzip);
     defer img.deinit(gpa);
 
     var c_buf: [digest_mod.string_length]u8 = undefined;
@@ -1408,14 +1348,6 @@ test "pullImage emits progress events in deterministic order" {
     try testing.expectEqual(@as(usize, 3), blob_done_count);
     try testing.expectEqual(@as(usize, 2), extracted_count);
     try testing.expectEqual(@as(usize, 1), done_count);
-}
-
-test "classifyLayer recognises gzip and zstd, rejects unknown" {
-    try testing.expectEqual(LayerCompression.gzip, classifyLayer(oci_layer_gzip).?);
-    try testing.expectEqual(LayerCompression.gzip, classifyLayer(docker_layer_gzip).?);
-    try testing.expectEqual(LayerCompression.zstd, classifyLayer(oci_layer_zstd).?);
-    try testing.expectEqual(@as(?LayerCompression, null), classifyLayer("application/json"));
-    try testing.expectEqual(@as(?LayerCompression, null), classifyLayer(""));
 }
 
 test "buildBlobUrl applies docker.io rewrite" {

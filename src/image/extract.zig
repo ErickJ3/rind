@@ -45,6 +45,8 @@ const zstd = std.compress.zstd;
 // gzip streams (zlib-ng is the consumer side). Keeping it scoped to test
 // code only.
 const flate = std.compress.flate;
+const layout = @import("../store/layout.zig");
+const digest_mod = @import("digest.zig");
 
 /// Semantic errors returned by the extractor. Per-method error sets
 /// union these with the relevant `flate.Decompress.Error`,
@@ -93,6 +95,120 @@ pub const ExtractGzipError = ExtractTarError || zlib_ng.Error;
 /// every zstd-decode error the underlying `zstd.Decompress` may
 /// stash on `error.ReadFailed`.
 pub const ExtractZstdError = ExtractTarError || zstd.Decompress.Error;
+
+/// OCI layer media type strings the ensure-helpers below recognise.
+/// The Docker variant is treated as gzip — its on-the-wire tar stream
+/// is identical.
+pub const oci_layer_gzip: []const u8 = "application/vnd.oci.image.layer.v1.tar+gzip";
+pub const docker_layer_gzip: []const u8 = "application/vnd.docker.image.rootfs.diff.tar.gzip";
+pub const oci_layer_zstd: []const u8 = "application/vnd.oci.image.layer.v1.tar+zstd";
+
+/// Compression scheme of an OCI layer blob; what `classifyLayer` returns.
+pub const LayerCompression = enum { gzip, zstd };
+
+/// Map a layer descriptor's `mediaType` to its compression scheme.
+/// Returns `null` for any media type rind cannot decode (signals
+/// `error.UnsupportedLayerMediaType` at call sites).
+pub fn classifyLayer(media_type: []const u8) ?LayerCompression {
+    if (std.mem.eql(u8, media_type, oci_layer_gzip)) return .gzip;
+    if (std.mem.eql(u8, media_type, docker_layer_gzip)) return .gzip;
+    if (std.mem.eql(u8, media_type, oci_layer_zstd)) return .zstd;
+    return null;
+}
+
+/// Closed error set returned by `ensureLayer` and `ensureExtracted`.
+/// Composes the gzip and zstd extractor surfaces with the store /
+/// filesystem operations the helpers perform plus the lone semantic
+/// `UnsupportedLayerMediaType`.
+pub const EnsureLayerError =
+    ExtractGzipError ||
+    ExtractZstdError ||
+    layout.Store.OpenBlobError ||
+    Io.Dir.AccessError ||
+    Io.Dir.OpenError ||
+    Io.Dir.CreateDirPathError ||
+    Allocator.Error ||
+    error{
+        /// A layer descriptor declared a media type outside the gzip
+        /// or zstd OCI variants. Caller cannot continue without a
+        /// re-rolled layer.
+        UnsupportedLayerMediaType,
+    };
+
+/// Idempotent `mkdir -p` of `<store>/extracted/`. Cheap; safe to call
+/// before every per-layer extract attempt. Pull and run both invoke
+/// this once before the per-layer loop.
+pub fn ensureExtractedRoot(
+    io: Io,
+    store: *layout.Store,
+) Io.Dir.CreateDirPathError!void {
+    try store.dir.createDirPath(io, layout.extracted_subpath);
+}
+
+/// Extract a single layer into `<store>/extracted/<hex>/`, skipping the
+/// work if the destination directory already exists. The store's
+/// `<extracted>/` root must already exist (call `ensureExtractedRoot`
+/// once up-front). Idempotent: a second call with the same digest is
+/// a single `access` syscall fast path.
+pub fn ensureLayer(
+    io: Io,
+    gpa: Allocator,
+    store: *layout.Store,
+    digest: digest_mod.Digest,
+    media_type: []const u8,
+) EnsureLayerError!void {
+    var hex_buf: [digest_mod.hex_length]u8 = undefined;
+    const hex = digest.encodedHex(&hex_buf);
+
+    var path_buf: [layout.extracted_subpath.len + 1 + digest_mod.hex_length]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ layout.extracted_subpath, hex }) catch
+        unreachable;
+
+    // Idempotency: skip if the dir already exists.
+    const exists = blk: {
+        store.dir.access(io, path, .{}) catch |err| switch (err) {
+            error.FileNotFound => break :blk false,
+            else => |e| return e,
+        };
+        break :blk true;
+    };
+    if (exists) return;
+
+    try store.dir.createDirPath(io, path);
+    var dest_dir = try store.dir.openDir(io, path, .{ .iterate = true });
+    defer dest_dir.close(io);
+
+    var blob_file = try store.openBlob(io, digest);
+    defer blob_file.close(io);
+
+    var read_buf: [64 * 1024]u8 = undefined;
+    var fr = blob_file.reader(io, &read_buf);
+
+    switch (classifyLayer(media_type) orelse return error.UnsupportedLayerMediaType) {
+        .gzip => try extractGzip(io, gpa, &fr.interface, dest_dir),
+        .zstd => try extractZstd(io, gpa, &fr.interface, dest_dir),
+    }
+}
+
+/// Sequentially extract every layer in `layer_digests`, indexed in
+/// lockstep with `layer_media_types`. Calls `ensureExtractedRoot` once
+/// before the loop. Used by the run orchestrator (M2) and the future
+/// builder (M3) where a synchronous walk over already-pulled blobs is
+/// sufficient — the parallel pool path lives in `pull.zig` because
+/// downloads and extracts overlap there.
+pub fn ensureExtracted(
+    io: Io,
+    gpa: Allocator,
+    store: *layout.Store,
+    layer_digests: []const digest_mod.Digest,
+    layer_media_types: []const []const u8,
+) EnsureLayerError!void {
+    std.debug.assert(layer_digests.len == layer_media_types.len);
+    try ensureExtractedRoot(io, store);
+    for (layer_digests, layer_media_types) |dig, mt| {
+        try ensureLayer(io, gpa, store, dig, mt);
+    }
+}
 
 /// Extract a `tar+gzip` layer blob into `dest_dir`.
 ///
@@ -967,6 +1083,14 @@ fn writeOctal(buf: []u8, value: u64) void {
         buf[i] = '0' + @as(u8, @intCast(v & 0o7));
         v >>= 3;
     }
+}
+
+test "classifyLayer recognises gzip and zstd, rejects unknown" {
+    try testing.expectEqual(LayerCompression.gzip, classifyLayer(oci_layer_gzip).?);
+    try testing.expectEqual(LayerCompression.gzip, classifyLayer(docker_layer_gzip).?);
+    try testing.expectEqual(LayerCompression.zstd, classifyLayer(oci_layer_zstd).?);
+    try testing.expectEqual(@as(?LayerCompression, null), classifyLayer("application/json"));
+    try testing.expectEqual(@as(?LayerCompression, null), classifyLayer(""));
 }
 
 test "sanitizeLogical accepts simple paths" {
