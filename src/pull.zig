@@ -22,9 +22,13 @@
 //!      Already-extracted dirs are left alone (idempotent warm cache).
 //!   7. Tag `index.json` with the user-supplied reference text.
 //!
-//! Progress is reported through an optional callback. All callback
-//! invocations happen on the orchestrator's own thread — never from a
-//! pool worker — so the call order is deterministic.
+//! Progress is reported through an optional callback. The callback
+//! may fire from a pool worker thread (T18: blob_done events fire as
+//! each download lands rather than being batched on the orchestrator
+//! thread), so the caller must serialize against shared state — see
+//! `cli/pull.zig`'s trampoline mutex. Live byte-level progress is
+//! also surfaced through an optional `std.Progress.Node`; that path
+//! is lock-free.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -37,6 +41,7 @@ const layout = @import("store/layout.zig");
 const client_mod = @import("registry/client.zig");
 const manifest_mod = @import("registry/manifest.zig");
 const blob_pool = @import("registry/blob_pool.zig");
+const extract_pool = @import("image/extract_pool.zig");
 
 /// Sha256 content digest. Re-exported so callers don't double-import.
 pub const Digest = digest_mod.Digest;
@@ -54,9 +59,10 @@ pub const BlobKind = enum { config, layer };
 /// `manifest`, `blob_started` for every slot in slot order (config
 /// first, then layers), `blob_done` for every cached slot in slot
 /// order (these are decided up-front), then `blob_done` for each
-/// non-cached slot as its blob lands on disk (post-pool finalize
-/// order, same as slot order among the non-cached subset),
-/// `extracted` for every layer in layer order, then `done`.
+/// non-cached slot as its worker thread finishes downloading +
+/// linking the blob (T18: completion order, not slot order — may
+/// interleave with `extracted`). `extracted` fires per layer as
+/// each extract worker finishes (also out-of-order). `done` last.
 pub const PullEvent = union(enum) {
     /// Pull invocation accepted; no I/O has happened yet. Lets
     /// renderers print "Pulling <ref>…" before the (potentially slow)
@@ -82,8 +88,10 @@ pub const PullEvent = union(enum) {
     done: struct { manifest_digest: Digest },
 };
 
-/// Progress callback. The orchestrator never calls this from a pool
-/// worker, so the function does not need to be thread-safe.
+/// Progress callback. May be invoked from worker threads (blob and
+/// extract pools), so the function must be thread-safe — typically
+/// by serialising on a caller-owned mutex. See
+/// `cli/pull.zig:TrampolineCtx` for the production wiring.
 pub const ProgressFn = *const fn (ctx: ?*anyopaque, event: PullEvent) void;
 
 /// Optional knobs handed to `pullImage`.
@@ -104,6 +112,12 @@ pub const PullOptions = struct {
     progress_ctx: ?*anyopaque = null,
     /// Progress sink. `null` disables progress reporting entirely.
     progress_fn: ?ProgressFn = null,
+    /// Optional `std.Progress` root passed in by the CLI. When
+    /// non-null, the orchestrator builds child nodes for each phase
+    /// (manifest fetch, per-blob downloads with byte counters, per
+    /// layer extraction). When null, no Progress tree work is done
+    /// and the orchestrator falls back to events-only reporting.
+    progress_node: ?std.Progress.Node = null,
 };
 
 /// Outcome of a successful `pullImage`.
@@ -227,9 +241,13 @@ const Pending = struct {
     scope: []u8,
     linked: bool,
     /// Index back into the orchestrator's `slots` table so the
-    /// post-pool finalize loop can emit `blob_done` with the right
+    /// completion callback can emit `blob_done` with the right
     /// digest+kind without parallel arrays.
     slot_idx: usize,
+    /// Set by the worker-thread completion callback if `finalizePending`
+    /// failed. The orchestrator surfaces it after the pool joins.
+    /// Default `{}` = success (or finalize not yet attempted).
+    finalize_result: anyerror!void = {},
 
     fn cleanup(self: *Pending, io: Io, gpa: Allocator) void {
         if (!self.linked) self.atomic.deinit(io);
@@ -275,6 +293,7 @@ fn initPending(
 
     self.linked = false;
     self.slot_idx = slot_idx;
+    self.finalize_result = {};
     self.fw = self.atomic.file.writer(io, self.write_buf);
 }
 
@@ -298,10 +317,11 @@ fn extractIfMissing(
     io: Io,
     gpa: Allocator,
     store: *layout.Store,
-    slot: Slot,
+    digest: Digest,
+    media_type: []const u8,
 ) PullError!void {
     var hex_buf: [digest_mod.hex_length]u8 = undefined;
-    const hex = slot.digest.encodedHex(&hex_buf);
+    const hex = digest.encodedHex(&hex_buf);
 
     var path_buf: [layout.extracted_subpath.len + 1 + digest_mod.hex_length]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ layout.extracted_subpath, hex }) catch
@@ -321,16 +341,30 @@ fn extractIfMissing(
     var dest_dir = try store.dir.openDir(io, path, .{ .iterate = true });
     defer dest_dir.close(io);
 
-    var blob_file = try store.openBlob(io, slot.digest);
+    var blob_file = try store.openBlob(io, digest);
     defer blob_file.close(io);
 
     var read_buf: [64 * 1024]u8 = undefined;
     var fr = blob_file.reader(io, &read_buf);
 
-    switch (classifyLayer(slot.media_type) orelse return error.UnsupportedLayerMediaType) {
+    switch (classifyLayer(media_type) orelse return error.UnsupportedLayerMediaType) {
         .gzip => try extract.extractGzip(io, gpa, &fr.interface, dest_dir),
         .zstd => try extract.extractZstd(io, gpa, &fr.interface, dest_dir),
     }
+}
+
+/// Adapter for `extract_pool.ExtractFn`. Forwards to
+/// `extractIfMissing` and widens the error to `anyerror` so the
+/// pool stays decoupled from `PullError`. The orchestrator narrows
+/// back via `@errorCast` after the pool joins.
+fn extractAdapter(
+    io: Io,
+    gpa: Allocator,
+    store: *layout.Store,
+    digest: Digest,
+    media_type: []const u8,
+) anyerror!void {
+    return extractIfMissing(io, gpa, store, digest, media_type);
 }
 
 /// Pull `ref_text` into `store` using `client` for transport. Returns
@@ -420,8 +454,10 @@ pub fn pullImage(
     }
 
     var pending_count: usize = 0;
+    var pending_bytes: u64 = 0;
     for (slots) |s| if (!s.cached) {
         pending_count += 1;
+        pending_bytes +%= s.size;
     };
 
     // Per-non-cached-slot atomic + writer + URL/scope.
@@ -431,13 +467,35 @@ pub fn pullImage(
     var jobs = try gpa.alloc(blob_pool.BlobJob, pending_count);
     defer gpa.free(jobs);
 
+    // Per-job worker-thread context. Lives in a parallel slice so
+    // `BlobJob.complete_ctx` can point at a stable address through
+    // the entire `runAll` lifetime.
+    var slot_ctxs = try gpa.alloc(BlobCompleteSlot, pending_count);
+    defer gpa.free(slot_ctxs);
+
+    // Per-blob progress children. Created lazily — only when
+    // `options.progress_node` is non-null.
+    var blob_nodes = try gpa.alloc(?std.Progress.Node, pending_count);
+    defer gpa.free(blob_nodes);
+    @memset(blob_nodes, null);
+
     // Track how many `pendings` slots are initialized so the errdefer
     // cleans up the right prefix on a partial-init failure.
     var init_count: usize = 0;
     errdefer {
         var k: usize = 0;
-        while (k < init_count) : (k += 1) pendings[k].cleanup(io, gpa);
+        while (k < init_count) : (k += 1) {
+            if (blob_nodes[k]) |n| n.end();
+            pendings[k].cleanup(io, gpa);
+        }
     }
+
+    // Build the "blobs" parent node up-front so children can attach.
+    const blobs_parent: ?std.Progress.Node = if (options.progress_node) |root|
+        root.start("downloading blobs", pending_count)
+    else
+        null;
+    errdefer if (blobs_parent) |n| n.end();
 
     {
         var j: usize = 0;
@@ -445,12 +503,41 @@ pub fn pullImage(
             if (s.cached) continue;
             try initPending(&pendings[j], io, gpa, store, options.scheme, &ref, s, slot_idx);
             init_count = j + 1;
+
+            if (blobs_parent) |bp| {
+                var dig_buf: [digest_mod.string_length]u8 = undefined;
+                const dig_str = s.digest.toString(&dig_buf);
+                const short = if (dig_str.len > "sha256:".len + 12)
+                    dig_str[0 .. "sha256:".len + 12]
+                else
+                    dig_str;
+                const kind_label: []const u8 = switch (s.kind) {
+                    .config => "config",
+                    .layer => "layer",
+                };
+                blob_nodes[j] = bp.startFmt(
+                    @intCast(s.size),
+                    "{s} {s}",
+                    .{ short, kind_label },
+                );
+            }
+
+            slot_ctxs[j] = .{
+                .pending = &pendings[j],
+                .slot = s,
+                .progress_fn = options.progress_fn,
+                .progress_ctx = options.progress_ctx,
+                .blob_node = blob_nodes[j],
+                .io = io,
+            };
             jobs[j] = .{
                 .url = pendings[j].url,
                 .scope = pendings[j].scope,
                 .digest = s.digest,
                 .writer = &pendings[j].fw.interface,
-                .opts = .{},
+                .opts = .{ .progress_node = blob_nodes[j] },
+                .on_complete = onBlobComplete,
+                .complete_ctx = @ptrCast(&slot_ctxs[j]),
             };
             j += 1;
         }
@@ -476,7 +563,8 @@ pub fn pullImage(
         } });
     };
 
-    // Step 5: drive the pool.
+    // Step 5: drive the pool. Workers fire `blob_done` and finalize
+    // each Pending as they complete (see `onBlobComplete`).
     const eff_concurrency = if (options.concurrency == 0)
         blob_pool.Pool.defaultConcurrency()
     else
@@ -486,20 +574,17 @@ pub fn pullImage(
     defer pool.deinit();
     try pool.runAll(jobs);
 
-    // Step 6: surface per-job errors, link the temps into place, and
-    // emit `blob_done` for each non-cached slot as it lands. The
-    // workers have already finished — we are on the orchestrator
-    // thread — so the callback is single-threaded and the user sees
-    // one line per blob as the finalize loop walks the jobs.
+    if (blobs_parent) |n| n.end();
+
+    // Step 6: surface per-job errors. Workers already emitted
+    // `blob_done` and ran `finalizePending`; we just collect any
+    // first-error here.
     for (jobs, 0..) |job, jx| {
         try job.result;
-        try finalizePending(&pendings[jx], io);
-        const s = slots[pendings[jx].slot_idx];
-        emit(options, .{ .blob_done = .{
-            .digest = s.digest,
-            .kind = s.kind,
-            .hit_cache = false,
-        } });
+        // Narrow the worker-stored anyerror back to PullError. The
+        // worker only ever stores errors out of `finalizePending`,
+        // which are a strict subset of PullError.
+        pendings[jx].finalize_result catch |e| return @errorCast(e);
     }
 
     // After link, pendings hold no atomic resources — but we still
@@ -511,15 +596,60 @@ pub fn pullImage(
         init_count = 0;
     }
 
-    // Step 7: extract layers (serial; T09 brief does not require
-    // concurrent extraction).
+    // Step 7: extract layers concurrently (T18: was serial). Each
+    // worker calls `extractAdapter` then fires `extracted` via the
+    // shared callback under the trampoline mutex.
     try ensureExtractedRoot(io, store);
-    for (slots[1..]) |s| {
-        try extractIfMissing(io, gpa, store, s);
-        emit(options, .{ .extracted = .{
+
+    var extract_jobs = try gpa.alloc(extract_pool.ExtractJob, layers.len);
+    defer gpa.free(extract_jobs);
+
+    var extract_nodes = try gpa.alloc(?std.Progress.Node, layers.len);
+    defer gpa.free(extract_nodes);
+    @memset(extract_nodes, null);
+
+    const extract_parent: ?std.Progress.Node = if (options.progress_node) |root|
+        root.start("extracting layers", layers.len)
+    else
+        null;
+    errdefer if (extract_parent) |n| n.end();
+
+    var extract_ctxs = try gpa.alloc(ExtractCompleteSlot, layers.len);
+    defer gpa.free(extract_ctxs);
+
+    for (slots[1..], 0..) |s, i| {
+        if (extract_parent) |ep| {
+            var dig_buf: [digest_mod.string_length]u8 = undefined;
+            const dig_str = s.digest.toString(&dig_buf);
+            const short = if (dig_str.len > "sha256:".len + 12)
+                dig_str[0 .. "sha256:".len + 12]
+            else
+                dig_str;
+            extract_nodes[i] = ep.start(short, 0);
+        }
+        extract_ctxs[i] = .{
             .digest = s.digest,
             .media_type = s.media_type,
-        } });
+            .progress_fn = options.progress_fn,
+            .progress_ctx = options.progress_ctx,
+            .extract_node = extract_nodes[i],
+        };
+        extract_jobs[i] = .{
+            .digest = s.digest,
+            .media_type = s.media_type,
+            .on_complete = onExtractComplete,
+            .complete_ctx = @ptrCast(&extract_ctxs[i]),
+        };
+    }
+
+    var ex_pool = extract_pool.Pool.init(gpa, io, store, eff_concurrency, extractAdapter);
+    defer ex_pool.deinit();
+    try ex_pool.runAll(extract_jobs);
+
+    if (extract_parent) |n| n.end();
+
+    for (extract_jobs) |ej| {
+        ej.result catch |e| return @errorCast(e);
     }
 
     // Step 8: tag index.json.
@@ -549,6 +679,69 @@ pub fn pullImage(
     mres.deinit();
     mres_owned = false;
     return out;
+}
+
+/// Per-blob worker-thread context. `BlobJob.complete_ctx` points at
+/// one of these; the worker hands it back to `onBlobComplete`. Holds
+/// everything the callback needs to (a) finalize the temp file, (b)
+/// emit `blob_done` through the (locked) trampoline, and (c) close
+/// the per-blob progress child. Lives in a parallel slice in
+/// `pullImage` so the pointer is stable through `runAll`.
+const BlobCompleteSlot = struct {
+    pending: *Pending,
+    slot: Slot,
+    progress_fn: ?ProgressFn,
+    progress_ctx: ?*anyopaque,
+    blob_node: ?std.Progress.Node,
+    io: Io,
+};
+
+fn onBlobComplete(ctx_opaque: ?*anyopaque, job: *blob_pool.BlobJob) void {
+    const ctx: *BlobCompleteSlot = @ptrCast(@alignCast(ctx_opaque.?));
+    if (job.result) |_| {
+        // Finalize the atomic temp into the store. Errors land in
+        // the Pending so the orchestrator can surface them after
+        // the pool joins.
+        if (finalizePending(ctx.pending, ctx.io)) |_| {
+            if (ctx.progress_fn) |f| {
+                f(ctx.progress_ctx, .{ .blob_done = .{
+                    .digest = ctx.slot.digest,
+                    .kind = ctx.slot.kind,
+                    .hit_cache = false,
+                } });
+            }
+        } else |e| {
+            ctx.pending.finalize_result = e;
+        }
+    } else |_| {
+        // Download failed; main thread reads `job.result` directly.
+    }
+    if (ctx.blob_node) |n| n.end();
+}
+
+/// Per-layer extract-worker context. Same idea as `BlobCompleteSlot`
+/// but for the extract pool's completion hook.
+const ExtractCompleteSlot = struct {
+    digest: Digest,
+    media_type: []const u8,
+    progress_fn: ?ProgressFn,
+    progress_ctx: ?*anyopaque,
+    extract_node: ?std.Progress.Node,
+};
+
+fn onExtractComplete(ctx_opaque: ?*anyopaque, job: *extract_pool.ExtractJob) void {
+    const ctx: *ExtractCompleteSlot = @ptrCast(@alignCast(ctx_opaque.?));
+    if (job.result) |_| {
+        if (ctx.progress_fn) |f| {
+            f(ctx.progress_ctx, .{ .extracted = .{
+                .digest = ctx.digest,
+                .media_type = ctx.media_type,
+            } });
+        }
+    } else |_| {
+        // Extract failed; main thread reads `job.result` directly.
+    }
+    if (ctx.extract_node) |n| n.end();
 }
 
 const testing = std.testing;
@@ -733,6 +926,10 @@ fn buildTestImage(
 const EventCapture = struct {
     list: std.ArrayList(PullEvent) = .empty,
     gpa: Allocator,
+    /// Pull worker pools fire `blob_done` and `extracted` from
+    /// worker threads; the callback must serialise.
+    mu: Io.Mutex = .init,
+    io: Io,
 
     fn deinit(self: *EventCapture) void {
         self.list.deinit(self.gpa);
@@ -740,6 +937,8 @@ const EventCapture = struct {
 
     fn cb(ctx: ?*anyopaque, ev: PullEvent) void {
         const self: *EventCapture = @ptrCast(@alignCast(ctx.?));
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
         self.list.append(self.gpa, ev) catch {};
     }
 };
@@ -825,7 +1024,7 @@ test "pullImage end-to-end against mock registry, two-layer image" {
     const ref_text = try buildLoopbackRefText(gpa, port);
     defer gpa.free(ref_text);
 
-    var capture: EventCapture = .{ .gpa = gpa };
+    var capture: EventCapture = .{ .gpa = gpa, .io = io };
     defer capture.deinit();
 
     var result = try pullImage(io, gpa, &store, &client, ref_text, .{
@@ -930,7 +1129,7 @@ test "pullImage skips blobs already present in the store" {
     const ref_text = try buildLoopbackRefText(gpa, port);
     defer gpa.free(ref_text);
 
-    var capture: EventCapture = .{ .gpa = gpa };
+    var capture: EventCapture = .{ .gpa = gpa, .io = io };
     defer capture.deinit();
 
     var result = try pullImage(io, gpa, &store, &client, ref_text, .{
@@ -1057,7 +1256,7 @@ test "pullImage emits progress events in deterministic order" {
     const ref_text = try buildLoopbackRefText(gpa, port);
     defer gpa.free(ref_text);
 
-    var capture: EventCapture = .{ .gpa = gpa };
+    var capture: EventCapture = .{ .gpa = gpa, .io = io };
     defer capture.deinit();
 
     var result = try pullImage(io, gpa, &store, &client, ref_text, .{

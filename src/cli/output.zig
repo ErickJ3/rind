@@ -26,7 +26,15 @@ const digest_mod = @import("../image/digest.zig");
 /// rather than after the whole pool joins. Cached slots fire
 /// `blob_done` before the pool runs. Field shapes for existing
 /// events are unchanged.
-pub const schema_version: u32 = 2;
+///
+/// v3 (T18): non-cached `blob_done` and `extracted` are now emitted
+/// from worker threads (download / extract pools) in completion
+/// order rather than slot order. The two event kinds may also
+/// interleave because layer extraction now runs in parallel with
+/// any still-finishing downloads of later layers. Cached
+/// `blob_done` ordering is unchanged. Field shapes for existing
+/// events are unchanged.
+pub const schema_version: u32 = 3;
 
 /// Fields needed to render the final summary line. The renderer never
 /// allocates — all strings borrow from caller-owned storage.

@@ -134,6 +134,12 @@ pub fn freeArgs(gpa: Allocator, args: PullArgs) void {
 /// Run the pull. The renderer is invoked for each progress event,
 /// once for the success summary, and once for an error message on
 /// failure. Errors propagate; `main.zig` maps them to exit codes.
+///
+/// `progress_root` is the optional `std.Progress` tree root the CLI
+/// owns. The orchestrator builds child nodes underneath it for
+/// per-blob byte progress and per-layer extract progress. Pass
+/// `null` to disable the live progress UI (JSON output, --quiet,
+/// non-TTY runs).
 pub fn run(
     io: Io,
     gpa: Allocator,
@@ -142,6 +148,7 @@ pub fn run(
     args: PullArgs,
     out: *output.Renderer,
     deps: PullDeps,
+    progress_root: ?std.Progress.Node,
 ) !void {
     if (args.platform) |p| {
         if (!std.mem.eql(u8, p, expected_platform)) {
@@ -150,10 +157,11 @@ pub fn run(
         }
     }
 
-    const trampoline_ctx: TrampolineCtx = .{ .renderer = out };
+    var trampoline_ctx: TrampolineCtx = .{ .renderer = out, .io = io };
     const opts: pull_mod.PullOptions = .{
-        .progress_ctx = @ptrCast(@constCast(&trampoline_ctx)),
+        .progress_ctx = @ptrCast(&trampoline_ctx),
         .progress_fn = trampoline,
+        .progress_node = progress_root,
     };
 
     var result = deps.pull_fn(io, gpa, store, client, args.image, opts) catch |err| {
@@ -165,12 +173,19 @@ pub fn run(
     try out.on_summary(out.ctx, .{ .ref = args.image, .result = &result });
 }
 
+/// Trampoline state. `mu` serialises renderer writes against worker
+/// threads firing `blob_done` / `extracted` from the blob and
+/// extract pools. `io` is needed to drive the mutex.
 const TrampolineCtx = struct {
     renderer: *output.Renderer,
+    io: Io,
+    mu: Io.Mutex = .init,
 };
 
 fn trampoline(ctx: ?*anyopaque, ev: pull_mod.PullEvent) void {
-    const self: *const TrampolineCtx = @ptrCast(@alignCast(ctx.?));
+    const self: *TrampolineCtx = @ptrCast(@alignCast(ctx.?));
+    self.mu.lockUncancelable(self.io);
+    defer self.mu.unlock(self.io);
     // Renderer write failures are swallowed: the orchestrator's
     // ProgressFn signature is `void`, so we cannot propagate. A
     // broken stdout pipe will surface again on the next write the
@@ -349,7 +364,7 @@ test "run drives renderer and reports success" {
 
     stub_state = .{};
     const args: PullArgs = .{ .image = "alpine:3.19" };
-    try run(io, gpa, &bundle.store, &bundle.client, args, &r, .{ .pull_fn = stubPullSuccess });
+    try run(io, gpa, &bundle.store, &bundle.client, args, &r, .{ .pull_fn = stubPullSuccess }, null);
 
     try testing.expect(std.mem.indexOf(u8, out_buf.written(), "Pulled alpine:3.19") != null);
 }
@@ -379,7 +394,7 @@ test "run surfaces UnsupportedPlatform on non-host platform" {
     const args: PullArgs = .{ .image = "alpine:3.19", .platform = "windows/i386" };
     try testing.expectError(
         error.UnsupportedPlatform,
-        run(io, gpa, &bundle.store, &bundle.client, args, &r, .{ .pull_fn = stubPullSuccess }),
+        run(io, gpa, &bundle.store, &bundle.client, args, &r, .{ .pull_fn = stubPullSuccess }, null),
     );
     try testing.expectEqual(exit.Code.usage, exit.mapErrorToExitCode(error.UnsupportedPlatform));
 }
@@ -410,7 +425,7 @@ test "run forwards orchestrator errors and maps to exit codes" {
     stub_state = .{ .return_err = error.ConnectionRefused };
     try testing.expectError(
         error.ConnectionRefused,
-        run(io, gpa, &bundle.store, &bundle.client, .{ .image = "x:1" }, &r, .{ .pull_fn = stubPullSuccess }),
+        run(io, gpa, &bundle.store, &bundle.client, .{ .image = "x:1" }, &r, .{ .pull_fn = stubPullSuccess }, null),
     );
     try testing.expectEqual(exit.Code.network, exit.mapErrorToExitCode(error.ConnectionRefused));
 
@@ -418,7 +433,7 @@ test "run forwards orchestrator errors and maps to exit codes" {
     stub_state = .{ .return_err = error.DigestMismatch };
     try testing.expectError(
         error.DigestMismatch,
-        run(io, gpa, &bundle.store, &bundle.client, .{ .image = "x:1" }, &r, .{ .pull_fn = stubPullSuccess }),
+        run(io, gpa, &bundle.store, &bundle.client, .{ .image = "x:1" }, &r, .{ .pull_fn = stubPullSuccess }, null),
     );
     try testing.expectEqual(exit.Code.verification, exit.mapErrorToExitCode(error.DigestMismatch));
 
@@ -426,7 +441,7 @@ test "run forwards orchestrator errors and maps to exit codes" {
     stub_state = .{ .return_err = error.UnsupportedLayerMediaType };
     try testing.expectError(
         error.UnsupportedLayerMediaType,
-        run(io, gpa, &bundle.store, &bundle.client, .{ .image = "x:1" }, &r, .{ .pull_fn = stubPullSuccess }),
+        run(io, gpa, &bundle.store, &bundle.client, .{ .image = "x:1" }, &r, .{ .pull_fn = stubPullSuccess }, null),
     );
     try testing.expectEqual(exit.Code.generic, exit.mapErrorToExitCode(error.UnsupportedLayerMediaType));
 

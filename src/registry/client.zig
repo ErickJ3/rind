@@ -667,6 +667,12 @@ pub const Client = struct {
         initial_backoff_ms: u32 = 100,
         /// Upper bound for backoff between retries, in milliseconds.
         max_backoff_ms: u32 = 10_000,
+        /// Optional progress sink. When non-null, `getBlobByUrl`
+        /// updates the node's completed-items count to the running
+        /// byte total on every drained chunk. The node's
+        /// estimated-total should be set by the caller to the blob
+        /// `size` so the `std.Progress` renderer can fill its bar.
+        progress_node: ?std.Progress.Node = null,
     };
 
     /// Errors returned by `getBlob` / `getBlobByUrl`. Unions transport,
@@ -754,7 +760,11 @@ pub const Client = struct {
             // explicitly `flush` after the fetch so `hasher` and
             // `bytes_written` reflect every byte streamed before we
             // act on either branch.
-            const hc: HashCount = .{ .hasher = &hasher, .bytes = &bytes_written };
+            const hc: HashCount = .{
+                .hasher = &hasher,
+                .bytes = &bytes_written,
+                .progress_node = opts.progress_node,
+            };
             var sink_buf: [16 * 1024]u8 = undefined;
             var sink = std.Io.Writer.Hashed(HashCount).initHasher(
                 dest_writer,
@@ -830,12 +840,17 @@ pub const Client = struct {
 const HashCount = struct {
     hasher: *digest_mod.Hasher,
     bytes: *u64,
+    /// Optional `std.Progress` sink. Bumped lock-free on every
+    /// drained chunk so callers see live byte progress without
+    /// any extra writer plumbing.
+    progress_node: ?std.Progress.Node = null,
 
     /// Forwarder. `pub` because `std.Io.Writer.Hashed(HashCount)`
     /// reaches in via comptime to call this on every drained chunk.
     pub fn update(self: *HashCount, data: []const u8) void {
         self.hasher.update(data);
         self.bytes.* += data.len;
+        if (self.progress_node) |n| n.setCompletedItems(self.bytes.*);
     }
 };
 

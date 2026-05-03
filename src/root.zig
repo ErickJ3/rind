@@ -8,6 +8,7 @@ pub const image = struct {
     pub const ref = @import("image/ref.zig");
     pub const digest = @import("image/digest.zig");
     pub const extract = @import("image/extract.zig");
+    pub const extract_pool = @import("image/extract_pool.zig");
     pub const config = @import("image/config.zig");
 };
 
@@ -48,6 +49,7 @@ test {
     _ = image.ref;
     _ = image.digest;
     _ = image.extract;
+    _ = image.extract_pool;
     _ = image.config;
     _ = store.layout;
     _ = registry.auth;

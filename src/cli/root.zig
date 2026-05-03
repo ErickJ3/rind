@@ -126,7 +126,22 @@ fn runPull(
         .json => json_renderer.renderer(),
     };
 
-    try pull_cli.run(io, gpa, &store, &client, args, &renderer, .{});
+    // std.Progress for live multi-line stderr UI. Skipped for JSON
+    // output (machine-readable contract on stdout, would garble) and
+    // for --quiet. std.Progress.start auto-disables when stderr is
+    // not a TTY, so piping to a file is also safe.
+    const want_progress = args.output == .human and !args.quiet;
+    var progress_buf: [256]u8 = undefined;
+    const progress_root: ?std.Progress.Node = if (want_progress)
+        std.Progress.start(io, .{
+            .draw_buffer = &progress_buf,
+            .root_name = "pulling",
+        })
+    else
+        null;
+    defer if (progress_root) |n| n.end();
+
+    try pull_cli.run(io, gpa, &store, &client, args, &renderer, .{}, progress_root);
 }
 
 fn runImages(

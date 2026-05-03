@@ -49,6 +49,13 @@ pub const BlobJob = struct {
     /// Set by the worker on completion. `{}` on success, otherwise
     /// the typed error returned by `Client.getBlobByUrl`.
     result: GetBlobError!void = {},
+    /// Worker-thread completion hook. Invoked once `getBlobByUrl`
+    /// returns (success or error), with `result` already populated.
+    /// The callback runs on the worker thread, so any shared state
+    /// it touches must be synchronized by the caller.
+    on_complete: ?*const fn (ctx: ?*anyopaque, job: *BlobJob) void = null,
+    /// Opaque pointer forwarded to `on_complete`.
+    complete_ctx: ?*anyopaque = null,
 };
 
 /// Concurrent blob-download pool over a shared `*Client`.
@@ -150,6 +157,8 @@ pub const Pool = struct {
                 jobs[idx].writer,
                 jobs[idx].opts,
             );
+
+            if (jobs[idx].on_complete) |cb| cb(jobs[idx].complete_ctx, &jobs[idx]);
 
             _ = self.inflight.fetchSub(1, .acq_rel);
         }
