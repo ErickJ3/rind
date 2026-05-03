@@ -467,7 +467,7 @@ pub const Client = struct {
 
             var req = try self.http.request(opts.method, current_uri, .{
                 .extra_headers = headers_buf[0..n],
-                .keep_alive = false,
+                .keep_alive = true,
                 .redirect_behavior = .unhandled,
             });
             var req_alive = true;
@@ -534,7 +534,7 @@ pub const Client = struct {
                 }
             }
 
-            var transfer_buf: [16 * 1024]u8 = undefined;
+            var transfer_buf: [64 * 1024]u8 = undefined;
             const body_reader = response.reader(&transfer_buf);
             if (will_stream) {
                 _ = body_reader.streamRemaining(body_writer.?) catch |err| switch (err) {
@@ -737,6 +737,23 @@ pub const Client = struct {
         var hasher = digest_mod.Hasher.init();
         var bytes_written: u64 = 0;
 
+        // Pre-format the short digest once for the throughput-display
+        // node name. Lives the whole call so HashCount can borrow it
+        // across retries. Docker-style: 12 hex chars without the
+        // "sha256:" prefix.
+        var dig_buf: [digest_mod.string_length]u8 = undefined;
+        const dig_str = expected.toString(&dig_buf);
+        const dig_short = if (dig_str.len >= "sha256:".len + 12)
+            dig_str["sha256:".len .. "sha256:".len + 12]
+        else
+            dig_str;
+
+        // Throughput state shared across retries. Cumulative MB/s
+        // averages over recovered bytes — close enough for a UI hint.
+        var hc_started_ns: i96 = 0;
+        var hc_chunk_count: u32 = 0;
+        var hc_name_buf: [64]u8 = undefined;
+
         var attempt: u32 = 0;
         retry: while (true) : (attempt += 1) {
             // Build the optional Range header for the second attempt
@@ -764,6 +781,11 @@ pub const Client = struct {
                 .hasher = &hasher,
                 .bytes = &bytes_written,
                 .progress_node = opts.progress_node,
+                .digest_short = dig_short,
+                .io = self.io,
+                .started_ns = &hc_started_ns,
+                .chunk_count = &hc_chunk_count,
+                .name_buf = &hc_name_buf,
             };
             var sink_buf: [16 * 1024]u8 = undefined;
             var sink = std.Io.Writer.Hashed(HashCount).initHasher(
@@ -845,12 +867,55 @@ const HashCount = struct {
     /// any extra writer plumbing.
     progress_node: ?std.Progress.Node = null,
 
+    /// Pre-formatted "sha256:abc123…" prefix for the node-name
+    /// throughput display. Empty disables the display.
+    digest_short: []const u8 = "",
+    /// `Io` instance used to read the monotonic clock. Null disables
+    /// the throughput display (e.g. unit tests with no progress UI).
+    io: ?Io = null,
+    /// Monotonic-clock reading at the first non-empty chunk, in
+    /// nanoseconds. Zero before then. Pointed at caller-frame
+    /// storage so retries keep the same clock origin.
+    started_ns: ?*i96 = null,
+    /// Drain-call counter; we refresh the node name every 64 chunks
+    /// to keep `setName` cost negligible.
+    chunk_count: ?*u32 = null,
+    /// Caller-owned scratch the formatted name is written into.
+    /// `setName` copies into the Progress ring buffer, so this only
+    /// needs to outlive the `setName` call.
+    name_buf: ?[]u8 = null,
+
     /// Forwarder. `pub` because `std.Io.Writer.Hashed(HashCount)`
     /// reaches in via comptime to call this on every drained chunk.
     pub fn update(self: *HashCount, data: []const u8) void {
         self.hasher.update(data);
         self.bytes.* += data.len;
-        if (self.progress_node) |n| n.setCompletedItems(self.bytes.*);
+        const node = self.progress_node orelse return;
+        node.setCompletedItems(self.bytes.*);
+
+        const io = self.io orelse return;
+        const started_ns = self.started_ns orelse return;
+        const chunk_count = self.chunk_count orelse return;
+        const name_buf = self.name_buf orelse return;
+        if (self.digest_short.len == 0) return;
+
+        if (started_ns.* == 0) {
+            started_ns.* = Io.Clock.awake.now(io).toNanoseconds();
+        }
+        chunk_count.* +%= 1;
+        if (chunk_count.* % 64 != 0) return;
+
+        const now_ns = Io.Clock.awake.now(io).toNanoseconds();
+        const elapsed_ns: i96 = now_ns - started_ns.*;
+        if (elapsed_ns <= 0) return;
+        const mbps = @as(f64, @floatFromInt(self.bytes.*)) * 1e9 /
+            @as(f64, @floatFromInt(@as(i128, elapsed_ns))) / (1024.0 * 1024.0);
+        const txt = std.fmt.bufPrint(
+            name_buf,
+            "{s}: Downloading {d:.1} MB/s",
+            .{ self.digest_short, mbps },
+        ) catch return;
+        node.setName(txt);
     }
 };
 

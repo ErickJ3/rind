@@ -35,6 +35,10 @@ pub fn build(b: *std.Build) void {
     const mod = b.addModule("rind", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
+        // src/compress/zlib_ng.zig uses @cImport on <zlib-ng.h>; the
+        // module needs libc + the header search path so unit tests
+        // built off this module compile.
+        .link_libc = true,
     });
 
     const exe_module = b.createModule(.{
@@ -89,11 +93,22 @@ pub fn build(b: *std.Build) void {
     const seccomp_lib = cSeccomp(b, target, optimize);
     const cap_lib = cLibcap(b, target, optimize);
     const argp_lib = cArgpStandalone(b, target, optimize);
+    const zlib_ng_lib = cZlibNg(b, target, optimize);
 
     if (crun_lib) |l| exe_module.linkLibrary(l);
     if (seccomp_lib) |l| exe_module.linkLibrary(l);
     if (cap_lib) |l| exe_module.linkLibrary(l);
     if (argp_lib) |l| exe_module.linkLibrary(l);
+    if (zlib_ng_lib) |l| {
+        exe_module.linkLibrary(l);
+        // Wrapper at src/compress/zlib_ng.zig uses @cImport on
+        // <zlib-ng.h>; the header lives at build/cdeps/zlib-ng/.
+        exe_module.addIncludePath(b.path("build/cdeps/zlib-ng"));
+        // mod re-exports image.extract (and thus the zlib_ng wrapper),
+        // so unit tests rooted at root.zig need the same wiring.
+        mod.linkLibrary(l);
+        mod.addIncludePath(b.path("build/cdeps/zlib-ng"));
+    }
 }
 
 // cArgpStandalone — argp-standalone 1.5.0 as a static lib. argp is
@@ -498,6 +513,179 @@ fn cLibcrun(
 
     return b.addLibrary(.{
         .name = "crun",
+        .linkage = .static,
+        .root_module = mod,
+    });
+}
+
+// cZlibNg — zlib-ng 2.2.5 as a static lib, native API (zng_*).
+// Replaces std.compress.flate for layer extract: pure-zig flate is
+// single-thread and ~5–10× slower than zlib-ng's runtime-dispatched
+// SSE2/SSSE3/SSE4.2/PCLMUL/AVX2 inflate path.
+//
+// File list per build/cdeps/zlib-ng/SOURCES.md. Hand-authored
+// zconf-ng.h, zlib-ng.h, zlib_name_mangling-ng.h live alongside it
+// (we don't run upstream's CMake, so the @VAR@ template substitution
+// is done once at vendoring time).
+//
+// AVX-512 + VPCLMULQDQ paths are intentionally skipped — they're
+// runtime-gated and add binary size for marginal gain on the
+// decompress-dominated `pull` workload. Re-enable here if a
+// compress-heavy workload appears.
+fn cZlibNg(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) ?*std.Build.Step.Compile {
+    const dep = b.lazyDependency("zlib_ng", .{}) orelse return null;
+
+    const mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
+    // Feature-detect macros that upstream's CMake would set after
+    // probing the host. Pinned for x86_64-linux + GCC/Clang; add a
+    // target-aware switch if rind ever ships for arm64.
+    const zng_macros = [_]struct { []const u8, []const u8 }{
+        .{ "HAVE_VISIBILITY_HIDDEN", "1" },
+        .{ "HAVE_ATTRIBUTE_ALIGNED", "1" },
+        .{ "HAVE_BUILTIN_CTZ", "1" },
+        .{ "HAVE_BUILTIN_CTZLL", "1" },
+        .{ "HAVE_BUILTIN_ASSUME_ALIGNED", "1" },
+        .{ "HAVE_POSIX_MEMALIGN", "1" },
+        .{ "HAVE_ALIGNED_ALLOC", "1" },
+        .{ "HAVE_SYS_AUXV_H", "1" },
+        .{ "HAVE_UNISTD_H", "1" },
+        .{ "HAVE_THREAD_LOCAL", "1" },
+        .{ "_LARGEFILE64_SOURCE", "1" },
+        .{ "__USE_LARGEFILE64", "1" },
+        .{ "WITH_RUNTIME_CPU_DETECTION", "1" },
+        .{ "X86_FEATURES", "1" },
+        .{ "X86_SSE2", "1" },
+        .{ "X86_SSSE3", "1" },
+        .{ "X86_SSE42", "1" },
+        .{ "X86_PCLMULQDQ_CRC", "1" },
+        .{ "X86_AVX2", "1" },
+        .{ "HASH_SIZE", "65536u" },
+    };
+    for (zng_macros) |m| mod.addCMacro(m[0], m[1]);
+
+    const base_flags = &[_][]const u8{
+        "-std=gnu11",
+        "-Wno-unused-parameter",
+        "-Wno-unused-function",
+        "-Wno-implicit-fallthrough",
+    };
+
+    // Core sources — see SOURCES.md for the rationale on including
+    // deflate-side files even though rind only inflates.
+    mod.addCSourceFiles(.{
+        .root = dep.path(""),
+        .files = &.{
+            "adler32.c",
+            "compress.c",
+            "cpu_features.c",
+            "crc32.c",
+            "crc32_braid_comb.c",
+            "deflate.c",
+            "deflate_fast.c",
+            "deflate_huff.c",
+            "deflate_medium.c",
+            "deflate_quick.c",
+            "deflate_rle.c",
+            "deflate_slow.c",
+            "deflate_stored.c",
+            "functable.c",
+            "infback.c",
+            "inflate.c",
+            "inftrees.c",
+            "insert_string.c",
+            "insert_string_roll.c",
+            "trees.c",
+            "uncompr.c",
+            "zutil.c",
+        },
+        .flags = base_flags,
+    });
+
+    // arch/generic — portable C fallbacks. functable.c initialises every
+    // dispatch slot to these and overrides only the slots whose SIMD
+    // counterpart was detected at runtime; missing them = unresolved symbols.
+    mod.addCSourceFiles(.{
+        .root = dep.path("arch/generic"),
+        .files = &.{
+            "adler32_c.c",
+            "adler32_fold_c.c",
+            "chunkset_c.c",
+            "compare256_c.c",
+            "crc32_braid_c.c",
+            "crc32_fold_c.c",
+            "slide_hash_c.c",
+        },
+        .flags = base_flags,
+    });
+
+    // arch/x86 — baseline (SSE2 is implicit on x86_64).
+    mod.addCSourceFiles(.{
+        .root = dep.path("arch/x86"),
+        .files = &.{
+            "x86_features.c",
+            "chunkset_sse2.c",
+            "compare256_sse2.c",
+            "slide_hash_sse2.c",
+        },
+        .flags = base_flags,
+    });
+
+    // arch/x86 — SSSE3 group.
+    mod.addCSourceFiles(.{
+        .root = dep.path("arch/x86"),
+        .files = &.{
+            "adler32_ssse3.c",
+            "chunkset_ssse3.c",
+        },
+        .flags = base_flags ++ &[_][]const u8{"-mssse3"},
+    });
+
+    // arch/x86 — SSE4.2.
+    mod.addCSourceFiles(.{
+        .root = dep.path("arch/x86"),
+        .files = &.{"adler32_sse42.c"},
+        .flags = base_flags ++ &[_][]const u8{"-msse4.2"},
+    });
+
+    // arch/x86 — PCLMUL (also needs SSE4.2 for the intrinsics it pulls).
+    mod.addCSourceFiles(.{
+        .root = dep.path("arch/x86"),
+        .files = &.{"crc32_pclmulqdq.c"},
+        .flags = base_flags ++ &[_][]const u8{ "-msse4.2", "-mpclmul" },
+    });
+
+    // arch/x86 — AVX2.
+    mod.addCSourceFiles(.{
+        .root = dep.path("arch/x86"),
+        .files = &.{
+            "adler32_avx2.c",
+            "chunkset_avx2.c",
+            "compare256_avx2.c",
+            "slide_hash_avx2.c",
+        },
+        .flags = base_flags ++ &[_][]const u8{"-mavx2"},
+    });
+
+    // Hand-authored zconf-ng.h, zlib-ng.h, zlib_name_mangling-ng.h.
+    mod.addIncludePath(b.path("build/cdeps/zlib-ng"));
+    // Library private headers (zbuild.h, inflate.h, etc.) sit at the
+    // tarball root.
+    mod.addIncludePath(dep.path(""));
+    // arch/x86 headers (x86_features.h, x86_functions.h) referenced
+    // by cpu_features.h and arch_functions.h.
+    mod.addIncludePath(dep.path("arch/x86"));
+
+    return b.addLibrary(.{
+        .name = "z-ng",
         .linkage = .static,
         .root_module = mod,
     });

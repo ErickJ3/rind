@@ -111,10 +111,29 @@ fn runPull(
     var client = client_mod.Client.init(gpa, io, &http_client, auth_mod.Provider.anonymous);
     defer client.deinit();
 
+    // Live per-layer progress is delegated to `std.Progress`. The
+    // orchestrator already builds byte-metered children for each
+    // blob and a row per layer for extract; we just hand it a root
+    // node. Skipped for JSON (machine-readable contract; would
+    // garble), `--quiet`, and `--no-progress`. `std.Progress`
+    // auto-disables on non-TTY too, so this is also safe in CI.
+    const want_progress = args.output == .human and !args.quiet and !args.no_progress;
+
+    var progress_root: ?std.Progress.Node = if (want_progress)
+        std.Progress.start(io, .{ .root_name = "" })
+    else
+        null;
+    // Fallback teardown for the platform-error early return below.
+    // On the success path `pull_cli.run` ends the root before
+    // `on_summary` so the summary line lands cleanly below the
+    // already-cleared progress region.
+    defer if (progress_root) |n| n.end();
+
     var human: output.Human = .{
         .writer = stdout,
         .err_writer = stderr,
         .quiet = args.quiet,
+        .progress_active = want_progress,
     };
     var json_renderer: output.Json = .{
         .writer = stdout,
@@ -126,22 +145,7 @@ fn runPull(
         .json => json_renderer.renderer(),
     };
 
-    // std.Progress for live multi-line stderr UI. Skipped for JSON
-    // output (machine-readable contract on stdout, would garble) and
-    // for --quiet. std.Progress.start auto-disables when stderr is
-    // not a TTY, so piping to a file is also safe.
-    const want_progress = args.output == .human and !args.quiet;
-    var progress_buf: [256]u8 = undefined;
-    const progress_root: ?std.Progress.Node = if (want_progress)
-        std.Progress.start(io, .{
-            .draw_buffer = &progress_buf,
-            .root_name = "pulling",
-        })
-    else
-        null;
-    defer if (progress_root) |n| n.end();
-
-    try pull_cli.run(io, gpa, &store, &client, args, &renderer, .{}, progress_root);
+    try pull_cli.run(io, gpa, &store, &client, args, &renderer, .{}, &progress_root);
 }
 
 fn runImages(

@@ -1,8 +1,19 @@
 //! Concurrent layer-extraction worker pool.
 //!
-//! Mirrors `registry/blob_pool.zig`: per-batch worker pool with an
-//! atomic cursor over a job slice, no long-lived workers between
-//! calls. Layers extract into independent `<store>/extracted/<hex>/`
+//! Two execution modes share the same `Pool` type:
+//!
+//!   * Per-batch (`runAll`) — the original T06 contract. Spawns N
+//!     worker threads that drain a fixed `[]ExtractJob` slice via a
+//!     mutex-guarded LIFO, joins on the way out. Used by tests and
+//!     by callers that have all jobs up front.
+//!
+//!   * Persistent (`start` + `submit` + `closeAndJoin`) — workers
+//!     wait on a queue protected by `Io.Mutex` + `Io.Condition`, so
+//!     `pull.zig` can submit extract jobs from the blob-completion
+//!     callback as each layer's bytes land. Lets extracts overlap
+//!     with the still-running download pool.
+//!
+//! Layers extract into independent `<store>/extracted/<hex>/`
 //! directories, so concurrent workers do not contend on the same
 //! paths.
 //!
@@ -45,17 +56,31 @@ pub const ExtractJob = struct {
     complete_ctx: ?*anyopaque = null,
 };
 
-/// Concurrent extract pool. No long-lived state between `runAll`
-/// invocations; `init` only stores configuration.
+/// Concurrent extract pool. Supports both per-batch (`runAll`) and
+/// persistent (`start` / `submit` / `closeAndJoin`) modes — see the
+/// module doc-comment for when to use each.
 pub const Pool = struct {
     gpa: Allocator,
     io: Io,
     store: *layout.Store,
     concurrency: usize,
     extract_fn: ExtractFn,
-    next_idx: std.atomic.Value(usize),
     inflight: std.atomic.Value(usize),
     peak_inflight: std.atomic.Value(usize),
+    /// LIFO queue of pending extract jobs. Order does not matter
+    /// because layers extract into independent directories.
+    queue: std.ArrayListUnmanaged(*ExtractJob) = .empty,
+    /// Guards `queue` and `closed`.
+    mu: Io.Mutex = .init,
+    /// Signaled by `submit` (one waiter) and `closeAndJoin`
+    /// (broadcast). Workers re-check the predicate after each wake.
+    cond_nonempty: Io.Condition = .init,
+    /// Set by `closeAndJoin`; once true, workers exit when the queue
+    /// drains.
+    closed: bool = false,
+    /// Worker thread handles owned by the pool while persistent mode
+    /// is active. Empty at all other times.
+    threads: []std.Thread = &.{},
 
     pub fn init(
         gpa: Allocator,
@@ -70,73 +95,126 @@ pub const Pool = struct {
             .store = store,
             .concurrency = if (concurrency == 0) 1 else concurrency,
             .extract_fn = extract_fn,
-            .next_idx = .init(0),
             .inflight = .init(0),
             .peak_inflight = .init(0),
         };
     }
 
     pub fn deinit(self: *Pool) void {
+        std.debug.assert(self.threads.len == 0);
         self.* = undefined;
     }
 
-    /// Default concurrency: `min(host_cpus, 4)`. Falls back to 4 if
+    /// Default concurrency: `min(host_cpus, 8)`. Falls back to 4 if
     /// cpu count is unavailable. Same heuristic as `blob_pool` so a
     /// shared `--concurrency` knob means the same thing for both
     /// phases.
     pub fn defaultConcurrency() usize {
         const cpus = std.Thread.getCpuCount() catch return 4;
-        return @min(cpus, 4);
+        return @min(cpus, 8);
     }
 
     pub fn peakInflight(self: *const Pool) usize {
         return self.peak_inflight.load(.acquire);
     }
 
-    pub fn runAll(self: *Pool, jobs: []ExtractJob) (Allocator.Error || std.Thread.SpawnError)!void {
-        self.next_idx.store(0, .release);
+    /// Persistent mode: spawn `concurrency` workers that wait on the
+    /// internal queue. Pair with `submit` calls and one terminating
+    /// `closeAndJoin`.
+    pub fn start(self: *Pool) (Allocator.Error || std.Thread.SpawnError)!void {
+        std.debug.assert(self.threads.len == 0);
         self.inflight.store(0, .release);
         self.peak_inflight.store(0, .release);
+        self.closed = false;
+        self.queue = .empty;
 
-        if (jobs.len == 0) return;
-
-        const n_threads = @min(self.concurrency, jobs.len);
-        const threads = try self.gpa.alloc(std.Thread, n_threads);
-        defer self.gpa.free(threads);
-
+        self.threads = try self.gpa.alloc(std.Thread, self.concurrency);
         var spawned: usize = 0;
         errdefer {
-            self.next_idx.store(jobs.len, .release);
-            for (threads[0..spawned]) |t| t.join();
+            // Drain anyone already waiting and join them before we bail.
+            self.mu.lockUncancelable(self.io);
+            self.closed = true;
+            self.cond_nonempty.broadcast(self.io);
+            self.mu.unlock(self.io);
+            for (self.threads[0..spawned]) |t| t.join();
+            self.queue.deinit(self.gpa);
+            self.gpa.free(self.threads);
+            self.threads = &.{};
         }
-
-        while (spawned < n_threads) : (spawned += 1) {
-            threads[spawned] = try std.Thread.spawn(.{}, worker, .{ self, jobs });
+        while (spawned < self.concurrency) : (spawned += 1) {
+            self.threads[spawned] = try std.Thread.spawn(.{}, persistentWorker, .{self});
         }
-
-        for (threads) |t| t.join();
     }
 
-    fn worker(self: *Pool, jobs: []ExtractJob) void {
+    /// Persistent mode: enqueue one job. Threadsafe — workers and
+    /// other submitters serialise on `mu`.
+    pub fn submit(self: *Pool, job: *ExtractJob) Allocator.Error!void {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        try self.queue.append(self.gpa, job);
+        self.cond_nonempty.signal(self.io);
+    }
+
+    /// Persistent mode: signal "no more submissions" then wait for
+    /// every queued job to finish. Safe to call exactly once per
+    /// `start`.
+    pub fn closeAndJoin(self: *Pool) void {
+        {
+            self.mu.lockUncancelable(self.io);
+            defer self.mu.unlock(self.io);
+            self.closed = true;
+            self.cond_nonempty.broadcast(self.io);
+        }
+        for (self.threads) |t| t.join();
+        self.queue.deinit(self.gpa);
+        self.gpa.free(self.threads);
+        self.threads = &.{};
+    }
+
+    fn persistentWorker(self: *Pool) void {
         while (true) {
-            const idx = self.next_idx.fetchAdd(1, .acq_rel);
-            if (idx >= jobs.len) return;
+            self.mu.lockUncancelable(self.io);
+            while (self.queue.items.len == 0 and !self.closed) {
+                self.cond_nonempty.waitUncancelable(self.io, &self.mu);
+            }
+            if (self.queue.items.len == 0 and self.closed) {
+                self.mu.unlock(self.io);
+                return;
+            }
+            // LIFO pop; layer order does not matter for extract.
+            const job = self.queue.pop().?;
+            self.mu.unlock(self.io);
 
             const cur = self.inflight.fetchAdd(1, .acq_rel) + 1;
             _ = self.peak_inflight.fetchMax(cur, .acq_rel);
 
-            jobs[idx].result = self.extract_fn(
+            job.result = self.extract_fn(
                 self.io,
                 self.gpa,
                 self.store,
-                jobs[idx].digest,
-                jobs[idx].media_type,
+                job.digest,
+                job.media_type,
             );
-
-            if (jobs[idx].on_complete) |cb| cb(jobs[idx].complete_ctx, &jobs[idx]);
+            if (job.on_complete) |cb| cb(job.complete_ctx, job);
 
             _ = self.inflight.fetchSub(1, .acq_rel);
         }
+    }
+
+    /// Per-batch mode: enqueue every job, then drain. Composes
+    /// `start` + `submit` + `closeAndJoin` so callers that already
+    /// have the full job slice keep their original control flow.
+    pub fn runAll(self: *Pool, jobs: []ExtractJob) (Allocator.Error || std.Thread.SpawnError)!void {
+        if (jobs.len == 0) return;
+        try self.start();
+        // start() succeeded — workers are alive; we own the cleanup.
+        for (jobs) |*j| {
+            self.submit(j) catch |e| {
+                self.closeAndJoin();
+                return e;
+            };
+        }
+        self.closeAndJoin();
     }
 };
 
@@ -145,7 +223,7 @@ const testing = std.testing;
 test "Pool.defaultConcurrency clamped sensibly" {
     const c = Pool.defaultConcurrency();
     try testing.expect(c >= 1);
-    try testing.expect(c <= 4);
+    try testing.expect(c <= 8);
 }
 
 test "Pool.runAll noop on empty job slice" {

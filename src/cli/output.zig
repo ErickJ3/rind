@@ -74,11 +74,21 @@ pub const Human = struct {
     err_writer: *Io.Writer,
     /// When set, drop everything except the final summary line.
     quiet: bool,
+    /// When true, `std.Progress` owns the live UI on `err_writer`.
+    /// The renderer suppresses the per-event lines it would
+    /// otherwise print on stdout (they'd interleave with the
+    /// progress tree and add nothing the tree isn't already
+    /// showing). The terse `manifest` line is also dropped — the
+    /// full digest reappears in the summary.
+    progress_active: bool = false,
     /// Layer byte total accumulated as `blob_started` events arrive.
     /// Used to render the summary without re-walking the result.
     total_bytes: u64 = 0,
     /// Layer count tracked the same way.
     layer_count: usize = 0,
+    /// `blob_done` (layer, !hit_cache) count. Zero at end ⇒ nothing
+    /// new pulled ⇒ "Image is up to date" status line.
+    cache_misses: usize = 0,
 
     /// Return a `Renderer` view over `*self`. `*self` must outlive
     /// every renderer call.
@@ -99,11 +109,11 @@ pub const Human = struct {
                 try self.writer.print("Pulling {s}\n", .{p.ref});
             },
             .manifest => |m| {
-                if (self.quiet) return;
+                if (self.quiet or self.progress_active) return;
                 var buf: [digest_mod.string_length]u8 = undefined;
                 try self.writer.print(
-                    "manifest {s} ({d} bytes, {s})\n",
-                    .{ shortDigest(m.digest.toString(&buf)), m.size, m.media_type.toString() },
+                    "{s}\n",
+                    .{shortDigest(m.digest.toString(&buf))},
                 );
             },
             .blob_started => |b| {
@@ -113,6 +123,11 @@ pub const Human = struct {
                 }
             },
             .blob_done => |b| {
+                if (b.kind == .layer and !b.hit_cache) self.cache_misses += 1;
+                // `std.Progress` already shows per-blob progress on
+                // stderr; emitting a per-event line on stdout would
+                // just duplicate it.
+                if (self.progress_active) return;
                 if (self.quiet) return;
                 var buf: [digest_mod.string_length]u8 = undefined;
                 const status: []const u8 = if (b.hit_cache) "hit " else "miss";
@@ -126,6 +141,9 @@ pub const Human = struct {
                 );
             },
             .extracted => |x| {
+                // Same reasoning as `blob_done`: the live progress
+                // tree on stderr is the source of truth here.
+                if (self.progress_active) return;
                 if (self.quiet) return;
                 var buf: [digest_mod.string_length]u8 = undefined;
                 try self.writer.print(
@@ -140,10 +158,24 @@ pub const Human = struct {
 
     fn onSummary(ctx: ?*anyopaque, sum: SummaryInput) Io.Writer.Error!void {
         const self: *Human = @ptrCast(@alignCast(ctx.?));
+        // "Image is up to date" only makes sense in the live-UI
+        // path; `--no-progress` and JSON callers expect the verbose
+        // "Pulled …" line regardless.
+        const all_cached = self.progress_active and self.cache_misses == 0 and self.layer_count > 0;
+        if (!all_cached) {
+            try self.writer.print(
+                "Pulled {s} ({d} layers, {d} bytes)\n",
+                .{ sum.ref, self.layer_count, self.total_bytes },
+            );
+        }
+        var dig_buf: [digest_mod.string_length]u8 = undefined;
         try self.writer.print(
-            "Pulled {s} ({d} layers, {d} bytes)\n",
-            .{ sum.ref, self.layer_count, self.total_bytes },
+            "Digest: {s}\n",
+            .{sum.result.manifest_digest.toString(&dig_buf)},
         );
+        if (all_cached) {
+            try self.writer.print("Status: Image is up to date for {s}\n", .{sum.ref});
+        }
         try self.writer.flush();
     }
 
@@ -369,6 +401,70 @@ test "human renderer formats events terse" {
     // blob_started is silent (state-only); blob_done writes one line.
     try testing.expect(std.mem.indexOf(u8, out.written(), "layer  hit") != null);
     try testing.expect(std.mem.indexOf(u8, out.written(), "sha256:abababababab") != null);
+}
+
+test "human renderer suppresses per-blob/per-extract lines when progress_active" {
+    const gpa = testing.allocator;
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(gpa);
+    defer err_out.deinit();
+
+    var human: Human = .{
+        .writer = &out.writer,
+        .err_writer = &err_out.writer,
+        .quiet = false,
+        .progress_active = true,
+    };
+    const r = human.renderer();
+
+    const dig = fixedDigest(0xab);
+    try r.on_event(r.ctx, .{ .pull_started = .{ .ref = "alpine:3.19" } });
+    try r.on_event(r.ctx, .{ .manifest = .{
+        .digest = dig,
+        .media_type = .oci_manifest,
+        .size = 100,
+    } });
+    try r.on_event(r.ctx, .{ .blob_started = .{ .digest = dig, .kind = .layer, .size = 100 } });
+    try r.on_event(r.ctx, .{ .blob_done = .{ .digest = dig, .kind = .layer, .hit_cache = false } });
+    try r.on_event(r.ctx, .{ .extracted = .{
+        .digest = dig,
+        .media_type = "application/vnd.oci.image.layer.v1.tar+gzip",
+    } });
+
+    // `Pulling` prelude stays on stdout; `manifest`, per-blob, and
+    // per-extract lines are all suppressed because `std.Progress`
+    // owns the live UI on stderr now.
+    try testing.expect(std.mem.indexOf(u8, out.written(), "Pulling alpine:3.19") != null);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "sha256:abababababab") == null);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "layer  miss") == null);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "extract sha256:") == null);
+    // The Human renderer no longer touches stderr in progress mode
+    // (apart from `on_error`, which this test does not exercise).
+    try testing.expectEqualStrings("", err_out.written());
+}
+
+test "human renderer manifest terse format outside progress mode" {
+    const gpa = testing.allocator;
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(gpa);
+    defer err_out.deinit();
+
+    var human: Human = .{ .writer = &out.writer, .err_writer = &err_out.writer, .quiet = false };
+    const r = human.renderer();
+
+    const dig = fixedDigest(0xcd);
+    try r.on_event(r.ctx, .{ .manifest = .{
+        .digest = dig,
+        .media_type = .oci_manifest,
+        .size = 100,
+    } });
+
+    // Short digest only; no bytes/media_type noise.
+    try testing.expect(std.mem.indexOf(u8, out.written(), "sha256:cdcdcdcdcdcd") != null);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "bytes") == null);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "manifest") == null);
 }
 
 test "human renderer --quiet drops events but keeps summary" {

@@ -56,6 +56,11 @@
             .hash = "N-V-__8AABTDAwBuawEWBE-P-NIkZF5T4pwX9tRHsf0rRCkO",
             .lazy = true,
         },
+        .zlib_ng = .{
+            .url = "https://github.com/zlib-ng/zlib-ng/archive/refs/tags/2.2.5.tar.gz",
+            .hash = "N-V-__8AAM_abQARVOuSWYyopJIgTFhIR_mCG1ZS6XAVi2lO",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",

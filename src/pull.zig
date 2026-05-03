@@ -180,6 +180,15 @@ fn classifyLayer(media_type: []const u8) ?LayerCompression {
     return null;
 }
 
+/// Slice 12 hex chars (without the "sha256:" prefix) from a digest
+/// string for use as a docker-style short identifier in progress-node
+/// labels. Returns the input on shorter strings.
+fn shortHex12(dig_str: []const u8) []const u8 {
+    const prefix_len: usize = "sha256:".len;
+    if (dig_str.len < prefix_len + 12) return dig_str;
+    return dig_str[prefix_len .. prefix_len + 12];
+}
+
 fn buildBlobUrl(
     gpa: Allocator,
     scheme: []const u8,
@@ -397,13 +406,26 @@ pub fn pullImage(
     defer gpa.free(manifest_scope);
     const expected_manifest_digest: ?Digest = if (ref.digest) |d| try Digest.parse(d) else null;
 
-    var mres = try client.getManifestByUrl(
+    // Indeterminate spinner while we auth + GET the manifest. Closed
+    // immediately after the call returns so subsequent phases get a
+    // clean parent.
+    const manifest_node: ?std.Progress.Node = if (options.progress_node) |root|
+        root.start("fetching manifest", 0)
+    else
+        null;
+    errdefer if (manifest_node) |n| n.end();
+
+    var mres = client.getManifestByUrl(
         manifest_base,
         reference,
         manifest_scope,
         expected_manifest_digest,
         .{ .platform = options.platform },
-    );
+    ) catch |e| {
+        if (manifest_node) |n| n.end();
+        return e;
+    };
+    if (manifest_node) |n| n.end();
     var mres_owned = true;
     defer if (mres_owned) mres.deinit();
 
@@ -490,9 +512,67 @@ pub fn pullImage(
         }
     }
 
+    // T-progress: build the extract pool + jobs BEFORE the blob pool
+    // so layer N's bytes can land in `onBlobComplete` and immediately
+    // submit to a running extract worker, overlapping extract of
+    // layer N with download of layer N+k.
+    try ensureExtractedRoot(io, store);
+
+    const eff_concurrency = if (options.concurrency == 0)
+        blob_pool.Pool.defaultConcurrency()
+    else
+        options.concurrency;
+
+    var extract_jobs = try gpa.alloc(extract_pool.ExtractJob, layers.len);
+    defer gpa.free(extract_jobs);
+
+    var extract_nodes = try gpa.alloc(?std.Progress.Node, layers.len);
+    defer gpa.free(extract_nodes);
+    @memset(extract_nodes, null);
+
+    var extract_ctxs = try gpa.alloc(ExtractCompleteSlot, layers.len);
+    defer gpa.free(extract_ctxs);
+
+    const extract_parent: ?std.Progress.Node = if (options.progress_node) |root|
+        root.start("extracting", layers.len)
+    else
+        null;
+    errdefer if (extract_parent) |n| n.end();
+
+    for (slots[1..], 0..) |s, i| {
+        if (extract_parent) |ep| {
+            var dig_buf: [digest_mod.string_length]u8 = undefined;
+            const dig_str = s.digest.toString(&dig_buf);
+            const short12 = shortHex12(dig_str);
+            extract_nodes[i] = ep.startFmt(0, "{s}: Extracting", .{short12});
+        }
+        extract_ctxs[i] = .{
+            .digest = s.digest,
+            .media_type = s.media_type,
+            .progress_fn = options.progress_fn,
+            .progress_ctx = options.progress_ctx,
+            .extract_node = extract_nodes[i],
+        };
+        extract_jobs[i] = .{
+            .digest = s.digest,
+            .media_type = s.media_type,
+            .on_complete = onExtractComplete,
+            .complete_ctx = @ptrCast(&extract_ctxs[i]),
+        };
+    }
+
+    var ex_pool = extract_pool.Pool.init(gpa, io, store, eff_concurrency, extractAdapter);
+    defer ex_pool.deinit();
+    try ex_pool.start();
+    // Persistent workers are now running; ensure they always join,
+    // even on a blob-pool error path. `closeAndJoin` is idempotent
+    // against being called once after the success path closes.
+    var ex_pool_closed = false;
+    errdefer if (!ex_pool_closed) ex_pool.closeAndJoin();
+
     // Build the "blobs" parent node up-front so children can attach.
     const blobs_parent: ?std.Progress.Node = if (options.progress_node) |root|
-        root.start("downloading blobs", pending_count)
+        root.start("downloading", pending_count)
     else
         null;
     errdefer if (blobs_parent) |n| n.end();
@@ -507,20 +587,21 @@ pub fn pullImage(
             if (blobs_parent) |bp| {
                 var dig_buf: [digest_mod.string_length]u8 = undefined;
                 const dig_str = s.digest.toString(&dig_buf);
-                const short = if (dig_str.len > "sha256:".len + 12)
-                    dig_str[0 .. "sha256:".len + 12]
-                else
-                    dig_str;
-                const kind_label: []const u8 = switch (s.kind) {
-                    .config => "config",
-                    .layer => "layer",
-                };
+                const short12 = shortHex12(dig_str);
                 blob_nodes[j] = bp.startFmt(
                     @intCast(s.size),
-                    "{s} {s}",
-                    .{ short, kind_label },
+                    "{s}: Downloading",
+                    .{short12},
                 );
             }
+
+            // Layer slots: wire the matching extract job so the blob
+            // worker can submit it the moment download finalizes.
+            // Config slot has no extract phase.
+            const extract_job_ptr: ?*extract_pool.ExtractJob = switch (s.kind) {
+                .layer => &extract_jobs[slot_idx - 1], // slots[0] is config
+                .config => null,
+            };
 
             slot_ctxs[j] = .{
                 .pending = &pendings[j],
@@ -529,6 +610,8 @@ pub fn pullImage(
                 .progress_ctx = options.progress_ctx,
                 .blob_node = blob_nodes[j],
                 .io = io,
+                .ex_pool = &ex_pool,
+                .extract_job = extract_job_ptr,
             };
             jobs[j] = .{
                 .url = pendings[j].url,
@@ -554,22 +637,24 @@ pub fn pullImage(
 
     // Cached slots are decided up-front; emit their `blob_done`
     // before the pool runs so warm-cache pulls do not appear to
-    // stall while the pool spins up workers for the rest.
-    for (slots) |s| if (s.cached) {
+    // stall while the pool spins up workers for the rest. Cached
+    // layers also need their extract job submitted so the extract
+    // pool processes them — they will hit the `extractIfMissing`
+    // fast-path inside the worker.
+    for (slots, 0..) |s, slot_idx| if (s.cached) {
         emit(options, .{ .blob_done = .{
             .digest = s.digest,
             .kind = s.kind,
             .hit_cache = true,
         } });
+        if (s.kind == .layer) {
+            try ex_pool.submit(&extract_jobs[slot_idx - 1]);
+        }
     };
 
-    // Step 5: drive the pool. Workers fire `blob_done` and finalize
-    // each Pending as they complete (see `onBlobComplete`).
-    const eff_concurrency = if (options.concurrency == 0)
-        blob_pool.Pool.defaultConcurrency()
-    else
-        options.concurrency;
-
+    // Step 5: drive the blob pool. Workers fire `blob_done`,
+    // finalize each Pending, and submit each layer's extract job to
+    // `ex_pool` as it completes (see `onBlobComplete`).
     var pool = blob_pool.Pool.init(gpa, io, client, eff_concurrency);
     defer pool.deinit();
     try pool.runAll(jobs);
@@ -577,8 +662,8 @@ pub fn pullImage(
     if (blobs_parent) |n| n.end();
 
     // Step 6: surface per-job errors. Workers already emitted
-    // `blob_done` and ran `finalizePending`; we just collect any
-    // first-error here.
+    // `blob_done`, ran `finalizePending`, and submitted extract
+    // jobs; we just collect any first-error here.
     for (jobs, 0..) |job, jx| {
         try job.result;
         // Narrow the worker-stored anyerror back to PullError. The
@@ -596,55 +681,11 @@ pub fn pullImage(
         init_count = 0;
     }
 
-    // Step 7: extract layers concurrently (T18: was serial). Each
-    // worker calls `extractAdapter` then fires `extracted` via the
-    // shared callback under the trampoline mutex.
-    try ensureExtractedRoot(io, store);
-
-    var extract_jobs = try gpa.alloc(extract_pool.ExtractJob, layers.len);
-    defer gpa.free(extract_jobs);
-
-    var extract_nodes = try gpa.alloc(?std.Progress.Node, layers.len);
-    defer gpa.free(extract_nodes);
-    @memset(extract_nodes, null);
-
-    const extract_parent: ?std.Progress.Node = if (options.progress_node) |root|
-        root.start("extracting layers", layers.len)
-    else
-        null;
-    errdefer if (extract_parent) |n| n.end();
-
-    var extract_ctxs = try gpa.alloc(ExtractCompleteSlot, layers.len);
-    defer gpa.free(extract_ctxs);
-
-    for (slots[1..], 0..) |s, i| {
-        if (extract_parent) |ep| {
-            var dig_buf: [digest_mod.string_length]u8 = undefined;
-            const dig_str = s.digest.toString(&dig_buf);
-            const short = if (dig_str.len > "sha256:".len + 12)
-                dig_str[0 .. "sha256:".len + 12]
-            else
-                dig_str;
-            extract_nodes[i] = ep.start(short, 0);
-        }
-        extract_ctxs[i] = .{
-            .digest = s.digest,
-            .media_type = s.media_type,
-            .progress_fn = options.progress_fn,
-            .progress_ctx = options.progress_ctx,
-            .extract_node = extract_nodes[i],
-        };
-        extract_jobs[i] = .{
-            .digest = s.digest,
-            .media_type = s.media_type,
-            .on_complete = onExtractComplete,
-            .complete_ctx = @ptrCast(&extract_ctxs[i]),
-        };
-    }
-
-    var ex_pool = extract_pool.Pool.init(gpa, io, store, eff_concurrency, extractAdapter);
-    defer ex_pool.deinit();
-    try ex_pool.runAll(extract_jobs);
+    // Step 7: drain remaining extract workers. Submissions for any
+    // layer not yet processed are already queued; close signals "no
+    // more work" so workers exit when the queue drains.
+    ex_pool.closeAndJoin();
+    ex_pool_closed = true;
 
     if (extract_parent) |n| n.end();
 
@@ -694,6 +735,14 @@ const BlobCompleteSlot = struct {
     progress_ctx: ?*anyopaque,
     blob_node: ?std.Progress.Node,
     io: Io,
+    /// Persistent extract pool the layer's extract job is submitted
+    /// to once download finalises. `null` for callers that don't run
+    /// an overlapping extract phase.
+    ex_pool: ?*extract_pool.Pool = null,
+    /// Stable pointer into the orchestrator's `extract_jobs` slice.
+    /// `null` for the config slot (no extract) or when extract is
+    /// disabled.
+    extract_job: ?*extract_pool.ExtractJob = null,
 };
 
 fn onBlobComplete(ctx_opaque: ?*anyopaque, job: *blob_pool.BlobJob) void {
@@ -710,6 +759,15 @@ fn onBlobComplete(ctx_opaque: ?*anyopaque, job: *blob_pool.BlobJob) void {
                     .hit_cache = false,
                 } });
             }
+            // Layer is on disk — kick off its extract immediately so
+            // it overlaps with the next blob downloads. Submission
+            // failure (only path: OOM growing the queue) is recorded
+            // on the extract job so the main thread surfaces it.
+            if (ctx.ex_pool) |ep| if (ctx.extract_job) |ej| {
+                ep.submit(ej) catch |e| {
+                    ej.result = e;
+                };
+            };
         } else |e| {
             ctx.pending.finalize_result = e;
         }
@@ -1270,10 +1328,15 @@ test "pullImage emits progress events in deterministic order" {
     thread.join();
     if (ms.err) |e| return e;
 
-    // Expected order with no cached slots:
-    // pull_started, manifest, blob_started×3, (no cached blob_done),
-    // blob_done×3 (post-pool, in non-cached/slot order),
-    // extracted×2, done.
+    // After T-progress restructuring, extract events interleave with
+    // late blob_done events (extract of layer N runs while later
+    // blobs are still downloading). The test now asserts:
+    //   * stable head: pull_started → manifest → 3× blob_started.
+    //   * stable tail: done is last.
+    //   * counts: 3 blob_done, 2 extracted, exactly one done.
+    //   * causality: every extracted is preceded by at least as many
+    //     blob_done events as itself (i.e. layer extract never
+    //     fires before the layer's own blob_done).
     const tags = blk: {
         var arr: std.ArrayList(std.meta.Tag(PullEvent)) = .empty;
         defer arr.deinit(gpa);
@@ -1282,20 +1345,34 @@ test "pullImage emits progress events in deterministic order" {
     };
     defer gpa.free(tags);
 
-    const expected = [_]std.meta.Tag(PullEvent){
-        .pull_started,
-        .manifest,
-        .blob_started,
-        .blob_started,
-        .blob_started,
-        .blob_done,
-        .blob_done,
-        .blob_done,
-        .extracted,
-        .extracted,
-        .done,
+    try testing.expectEqual(@as(usize, 11), tags.len);
+    try testing.expectEqual(std.meta.Tag(PullEvent).pull_started, tags[0]);
+    try testing.expectEqual(std.meta.Tag(PullEvent).manifest, tags[1]);
+    try testing.expectEqual(std.meta.Tag(PullEvent).blob_started, tags[2]);
+    try testing.expectEqual(std.meta.Tag(PullEvent).blob_started, tags[3]);
+    try testing.expectEqual(std.meta.Tag(PullEvent).blob_started, tags[4]);
+    try testing.expectEqual(std.meta.Tag(PullEvent).done, tags[tags.len - 1]);
+
+    var blob_done_count: usize = 0;
+    var extracted_count: usize = 0;
+    var done_count: usize = 0;
+    for (tags) |t| switch (t) {
+        .blob_done => {
+            blob_done_count += 1;
+            // Each extracted seen so far must correspond to an
+            // earlier blob_done (causality: layer must download
+            // before its extract can complete).
+        },
+        .extracted => {
+            extracted_count += 1;
+            try testing.expect(extracted_count <= blob_done_count);
+        },
+        .done => done_count += 1,
+        else => {},
     };
-    try testing.expectEqualSlices(std.meta.Tag(PullEvent), &expected, tags);
+    try testing.expectEqual(@as(usize, 3), blob_done_count);
+    try testing.expectEqual(@as(usize, 2), extracted_count);
+    try testing.expectEqual(@as(usize, 1), done_count);
 }
 
 test "classifyLayer recognises gzip and zstd, rejects unknown" {

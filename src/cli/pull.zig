@@ -35,6 +35,12 @@ pub const PullArgs = struct {
     quiet: bool = false,
     /// `--platform <str>`. Optional; rejected unless equal to host.
     platform: ?[]const u8 = null,
+    /// `--concurrency <usize>`. Max parallel blob downloads + layer
+    /// extracts. `0` means use orchestrator default.
+    concurrency: usize = 0,
+    /// `--no-progress`. Disable the live progress UI on TTYs and
+    /// fall back to the per-event terse log on stdout.
+    no_progress: bool = false,
 };
 
 /// Pull-handler dependency injection. Production wires the real
@@ -60,21 +66,24 @@ pub const expected_platform: []const u8 = std.fmt.comptimePrint(
 );
 
 const params = clap.parseParamsComptime(
-    \\-h, --help              Display this help and exit.
-    \\    --output <kind>     Output format: human (default) or json.
-    \\-q, --quiet             Suppress per-event output (terse summary still prints).
-    \\    --platform <str>    Target platform (only the host is supported in MVP).
-    \\<str>                   Image reference (e.g. alpine:3.19).
+    \\-h, --help                  Display this help and exit.
+    \\    --output <kind>         Output format: human (default) or json.
+    \\-q, --quiet                 Suppress per-event output (terse summary still prints).
+    \\    --platform <str>        Target platform (only the host is supported in MVP).
+    \\    --concurrency <usize>   Max parallel blob downloads + layer extracts (0 = default).
+    \\    --no-progress           Disable the live progress UI; print terse log instead.
+    \\<str>                       Image reference (e.g. alpine:3.19).
     \\
 );
 
 const value_parsers = .{
     .str = clap.parsers.string,
     .kind = clap.parsers.enumeration(OutputKind),
+    .usize = clap.parsers.int(usize, 10),
 };
 
 /// One-line usage banner. Stable enough that scripts can grep it.
-pub const usage_line: []const u8 = "Usage: rind pull [--output human|json] [-q|--quiet] [--platform <plat>] <image>";
+pub const usage_line: []const u8 = "Usage: rind pull [--output human|json] [-q|--quiet] [--platform <plat>] [--concurrency <n>] [--no-progress] <image>";
 
 /// Parse argv (after the `pull` subcommand has already been peeled
 /// off) into a validated `PullArgs`. `iter` is consumed; `gpa` backs
@@ -121,6 +130,8 @@ pub fn parseArgs(
         .output = res.args.output orelse .human,
         .quiet = res.args.quiet != 0,
         .platform = platform_owned,
+        .concurrency = res.args.concurrency orelse 0,
+        .no_progress = res.args.@"no-progress" != 0,
     };
 }
 
@@ -135,11 +146,16 @@ pub fn freeArgs(gpa: Allocator, args: PullArgs) void {
 /// once for the success summary, and once for an error message on
 /// failure. Errors propagate; `main.zig` maps them to exit codes.
 ///
-/// `progress_root` is the optional `std.Progress` tree root the CLI
-/// owns. The orchestrator builds child nodes underneath it for
-/// per-blob byte progress and per-layer extract progress. Pass
-/// `null` to disable the live progress UI (JSON output, --quiet,
-/// non-TTY runs).
+/// `progress_root` is a pointer to the optional `std.Progress` tree
+/// root the CLI owns. The orchestrator builds child nodes underneath
+/// it for per-blob byte progress and per-layer extract progress. We
+/// take a pointer (not a value) so this function can `end()` the
+/// root before `on_summary` runs — `std.Progress`'s render thread
+/// keeps redrawing until `end()`, and an in-flight redraw would
+/// clear the summary line off the screen. The pointee is set to
+/// `null` after `end()` so the caller's fallback `defer` is a no-op
+/// on the success path. Pass a pointer to a `null` to disable the
+/// live progress UI (JSON output, --quiet, non-TTY runs).
 pub fn run(
     io: Io,
     gpa: Allocator,
@@ -148,7 +164,7 @@ pub fn run(
     args: PullArgs,
     out: *output.Renderer,
     deps: PullDeps,
-    progress_root: ?std.Progress.Node,
+    progress_root: *?std.Progress.Node,
 ) !void {
     if (args.platform) |p| {
         if (!std.mem.eql(u8, p, expected_platform)) {
@@ -161,7 +177,8 @@ pub fn run(
     const opts: pull_mod.PullOptions = .{
         .progress_ctx = @ptrCast(&trampoline_ctx),
         .progress_fn = trampoline,
-        .progress_node = progress_root,
+        .progress_node = progress_root.*,
+        .concurrency = args.concurrency,
     };
 
     var result = deps.pull_fn(io, gpa, store, client, args.image, opts) catch |err| {
@@ -169,6 +186,14 @@ pub fn run(
         return err;
     };
     defer result.deinit();
+
+    // Tear down the live progress display before the summary lands
+    // so its render thread doesn't clear the freshly-printed
+    // "Pulled …" / "Digest:" lines on its next refresh.
+    if (progress_root.*) |n| {
+        n.end();
+        progress_root.* = null;
+    }
 
     try out.on_summary(out.ctx, .{ .ref = args.image, .result = &result });
 }
@@ -278,6 +303,15 @@ test "parseArgs --help is treated as a usage exit" {
     );
 }
 
+test "parseArgs accepts --no-progress" {
+    const gpa = testing.allocator;
+    var err_buf: Io.Writer.Allocating = .init(gpa);
+    defer err_buf.deinit();
+    const a = try parseFromSlice(gpa, &.{ "--no-progress", "alpine:3.19" }, &err_buf.writer);
+    defer freeArgs(gpa, a);
+    try testing.expect(a.no_progress);
+}
+
 test "parseArgs accepts --platform that matches host" {
     const gpa = testing.allocator;
     var err_buf: Io.Writer.Allocating = .init(gpa);
@@ -364,7 +398,8 @@ test "run drives renderer and reports success" {
 
     stub_state = .{};
     const args: PullArgs = .{ .image = "alpine:3.19" };
-    try run(io, gpa, &bundle.store, &bundle.client, args, &r, .{ .pull_fn = stubPullSuccess }, null);
+    var pn: ?std.Progress.Node = null;
+    try run(io, gpa, &bundle.store, &bundle.client, args, &r, .{ .pull_fn = stubPullSuccess }, &pn);
 
     try testing.expect(std.mem.indexOf(u8, out_buf.written(), "Pulled alpine:3.19") != null);
 }
@@ -392,9 +427,10 @@ test "run surfaces UnsupportedPlatform on non-host platform" {
     var r = human.renderer();
 
     const args: PullArgs = .{ .image = "alpine:3.19", .platform = "windows/i386" };
+    var pn: ?std.Progress.Node = null;
     try testing.expectError(
         error.UnsupportedPlatform,
-        run(io, gpa, &bundle.store, &bundle.client, args, &r, .{ .pull_fn = stubPullSuccess }, null),
+        run(io, gpa, &bundle.store, &bundle.client, args, &r, .{ .pull_fn = stubPullSuccess }, &pn),
     );
     try testing.expectEqual(exit.Code.usage, exit.mapErrorToExitCode(error.UnsupportedPlatform));
 }
@@ -421,11 +457,13 @@ test "run forwards orchestrator errors and maps to exit codes" {
     };
     var r = human.renderer();
 
+    var pn: ?std.Progress.Node = null;
+
     // Network failure → exit 3.
     stub_state = .{ .return_err = error.ConnectionRefused };
     try testing.expectError(
         error.ConnectionRefused,
-        run(io, gpa, &bundle.store, &bundle.client, .{ .image = "x:1" }, &r, .{ .pull_fn = stubPullSuccess }, null),
+        run(io, gpa, &bundle.store, &bundle.client, .{ .image = "x:1" }, &r, .{ .pull_fn = stubPullSuccess }, &pn),
     );
     try testing.expectEqual(exit.Code.network, exit.mapErrorToExitCode(error.ConnectionRefused));
 
@@ -433,7 +471,7 @@ test "run forwards orchestrator errors and maps to exit codes" {
     stub_state = .{ .return_err = error.DigestMismatch };
     try testing.expectError(
         error.DigestMismatch,
-        run(io, gpa, &bundle.store, &bundle.client, .{ .image = "x:1" }, &r, .{ .pull_fn = stubPullSuccess }, null),
+        run(io, gpa, &bundle.store, &bundle.client, .{ .image = "x:1" }, &r, .{ .pull_fn = stubPullSuccess }, &pn),
     );
     try testing.expectEqual(exit.Code.verification, exit.mapErrorToExitCode(error.DigestMismatch));
 
@@ -441,7 +479,7 @@ test "run forwards orchestrator errors and maps to exit codes" {
     stub_state = .{ .return_err = error.UnsupportedLayerMediaType };
     try testing.expectError(
         error.UnsupportedLayerMediaType,
-        run(io, gpa, &bundle.store, &bundle.client, .{ .image = "x:1" }, &r, .{ .pull_fn = stubPullSuccess }, null),
+        run(io, gpa, &bundle.store, &bundle.client, .{ .image = "x:1" }, &r, .{ .pull_fn = stubPullSuccess }, &pn),
     );
     try testing.expectEqual(exit.Code.generic, exit.mapErrorToExitCode(error.UnsupportedLayerMediaType));
 

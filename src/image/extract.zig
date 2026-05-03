@@ -39,8 +39,12 @@
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
-const flate = std.compress.flate;
+const zlib_ng = @import("../compress/zlib_ng.zig");
 const zstd = std.compress.zstd;
+// std.compress.flate is still used by the test fixtures below to PRODUCE
+// gzip streams (zlib-ng is the consumer side). Keeping it scoped to test
+// code only.
+const flate = std.compress.flate;
 
 /// Semantic errors returned by the extractor. Per-method error sets
 /// union these with the relevant `flate.Decompress.Error`,
@@ -81,9 +85,9 @@ pub const ExtractTarError = ExtractError ||
     Allocator.Error;
 
 /// Errors returned by `extractGzip`. Combines `ExtractTarError` with
-/// every gzip-decode error the underlying `flate.Decompress` may
+/// every gzip-decode error the underlying `zlib_ng.Decompress` may
 /// stash on `error.ReadFailed`.
-pub const ExtractGzipError = ExtractTarError || flate.Decompress.Error;
+pub const ExtractGzipError = ExtractTarError || zlib_ng.Error;
 
 /// Errors returned by `extractZstd`. Combines `ExtractTarError` with
 /// every zstd-decode error the underlying `zstd.Decompress` may
@@ -109,15 +113,17 @@ pub fn extractGzip(
     blob_reader: *Io.Reader,
     dest_dir: Io.Dir,
 ) ExtractGzipError!void {
-    const window = try gpa.alloc(u8, flate.max_window_len);
+    const window = try gpa.alloc(u8, zlib_ng.max_window_len);
     defer gpa.free(window);
 
-    var dec: flate.Decompress = .init(blob_reader, .gzip, window);
+    var dec: zlib_ng.Decompress = undefined;
+    try dec.init(blob_reader, .gzip, window);
+    defer dec.deinit();
 
     extractTar(io, gpa, &dec.reader, dest_dir) catch |err| switch (err) {
         // Decompress.Reader returns ReadFailed and stashes the real
         // diagnostic in `dec.err`. Surface that so callers see, e.g.,
-        // `error.BadGzipHeader` rather than a generic `ReadFailed`.
+        // `error.CorruptStream` rather than a generic `ReadFailed`.
         error.ReadFailed => return dec.err orelse error.ReadFailed,
         else => |e| return e,
     };
@@ -1193,7 +1199,10 @@ test "extractGzip surfaces typed error for non-gzip blob" {
 
     const garbage = "not a gzip stream, not even close" ** 8;
     var reader: Io.Reader = .fixed(garbage);
-    try testing.expectError(error.BadGzipHeader, extractGzip(testing.io, testing.allocator, &reader, tmp.dir));
+    // zlib-ng surfaces a generic Z_DATA_ERROR for any malformed header
+    // (gzip magic, zlib check, mid-stream block) without distinguishing
+    // BadGzipHeader / WrongChecksum — we map them all to CorruptStream.
+    try testing.expectError(zlib_ng.Error.CorruptStream, extractGzip(testing.io, testing.allocator, &reader, tmp.dir));
 }
 
 test "extractGzip overwrites a previous-layer file with a new symlink" {

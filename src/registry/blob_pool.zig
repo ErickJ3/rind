@@ -98,11 +98,13 @@ pub const Pool = struct {
     }
 
     /// Default concurrency used by callers that don't specify one:
-    /// `min(host_cpus, 4)`. Falls back to 4 if cpu count is
-    /// unavailable.
+    /// `min(host_cpus, 8)`. Falls back to 4 if cpu count is
+    /// unavailable. Cap raised to 8 (T-progress): blob fetches are
+    /// I/O-bound, so extra workers fill TCP+TLS handshake stalls
+    /// without burning CPU.
     pub fn defaultConcurrency() usize {
         const cpus = std.Thread.getCpuCount() catch return 4;
-        return @min(cpus, 4);
+        return @min(cpus, 8);
     }
 
     /// Snapshot of the highest concurrent-inflight count seen during
@@ -389,7 +391,7 @@ test "Pool — runAll drains jobs and surfaces per-job results" {
 test "Pool.defaultConcurrency clamped sensibly" {
     const c = Pool.defaultConcurrency();
     try testing.expect(c >= 1);
-    try testing.expect(c <= 4);
+    try testing.expect(c <= 8);
 }
 
 test "Pool.runAll noop on empty job slice" {
