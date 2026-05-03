@@ -158,10 +158,11 @@ pub const Container = struct {
     }
 
     /// Frees the underlying `libcrun_container_t`. Single-use: poisons `raw`
-    /// so a double-deinit traps in debug builds.
+    /// (`undefined` is filled with 0xaa in debug builds) so a double-deinit
+    /// traps loudly.
     pub fn deinit(self: *Container) void {
         c.libcrun_container_free(self.raw);
-        self.raw = @ptrFromInt(0xdead_beef);
+        self.raw = undefined;
     }
 };
 

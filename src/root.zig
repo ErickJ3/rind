@@ -37,6 +37,7 @@ pub const runtime = struct {
     pub const state = @import("runtime/state.zig");
     pub const overlay = @import("runtime/overlay.zig");
     pub const bundle = @import("runtime/bundle.zig");
+    pub const core = @import("runtime/core.zig");
 };
 
 /// This is a documentation comment to explain the `printAnotherMessage` function below.
@@ -70,4 +71,5 @@ test {
     _ = runtime.state;
     _ = runtime.overlay;
     _ = runtime.bundle;
+    _ = runtime.core;
 }
