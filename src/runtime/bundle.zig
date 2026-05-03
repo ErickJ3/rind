@@ -144,7 +144,10 @@ pub fn composeWithEuid(
     const user = try parseUser(if (overrides.user) |u| u else if (img_cfg.config) |c| c.User orelse "" else "");
     const cwd = if (overrides.workdir) |w| w else if (img_cfg.config) |c| c.WorkingDir orelse "/" else "/";
 
-    const seccomp = try parseEmbeddedSeccomp(aa);
+    const seccomp = try resolveSeccomp(aa, .{
+        .caps_held = &.{},
+        .image_arch = imageArchToSeccomp(img_cfg.architecture),
+    });
 
     const euid: u32 = euid_source.fetch(euid_source.ctx);
 
@@ -287,15 +290,149 @@ fn parseUser(text: []const u8) BundleError!struct { uid: u32, gid: u32 } {
     return .{ .uid = uid, .gid = gid };
 }
 
+/// Embedded upstream seccomp profile, kept verbatim from
+/// containers/common's moby-shape default (`pkg/seccomp/seccomp.json`,
+/// Apache-2.0). The shape is **not** the OCI runtime spec — `archMap`
+/// flattens to OCI `architectures` and per-syscall `includes`/`excludes`
+/// gates resolve at compose time against the live container env. See
+/// `data/LICENSE.seccomp`.
 const seccomp_default_bytes: []const u8 = @embedFile("data/seccomp_default.json");
 
-fn parseEmbeddedSeccomp(aa: Allocator) BundleError!Seccomp {
+/// Container env passed to the moby→OCI seccomp resolver. M2 runs
+/// every container with no extra caps (the bounding set is the
+/// 14-cap docker default applied separately via
+/// `process.capabilities`); the resolver treats `caps_held` as the
+/// set of capabilities a `caps:` filter is allowed to require — empty
+/// here means cap-gated allows are dropped, which is the correct
+/// rootless behaviour. v0.2 will widen this when `--cap-add` lands.
+const SeccompEnv = struct {
+    /// Effective cap set. Empty in M2.
+    caps_held: []const []const u8,
+    /// Architecture family the container's processes execute under.
+    /// Drives `archMap` lookup and per-syscall `arches` filters.
+    image_arch: []const u8,
+};
+
+fn imageArchToSeccomp(image_arch: []const u8) []const u8 {
+    if (std.mem.eql(u8, image_arch, "amd64")) return "SCMP_ARCH_X86_64";
+    if (std.mem.eql(u8, image_arch, "arm64")) return "SCMP_ARCH_AARCH64";
+    if (std.mem.eql(u8, image_arch, "386")) return "SCMP_ARCH_X86";
+    if (std.mem.eql(u8, image_arch, "arm")) return "SCMP_ARCH_ARM";
+    if (std.mem.eql(u8, image_arch, "s390x")) return "SCMP_ARCH_S390X";
+    if (std.mem.eql(u8, image_arch, "mips64le")) return "SCMP_ARCH_MIPSEL64";
+    return "SCMP_ARCH_X86_64";
+}
+
+const MobyProfile = struct {
+    defaultAction: []const u8,
+    defaultErrnoRet: ?u32 = null,
+    architectures: ?[][]const u8 = null,
+    archMap: ?[]MobyArchEntry = null,
+    syscalls: []MobySyscall,
+};
+
+const MobyArchEntry = struct {
+    architecture: []const u8,
+    subArchitectures: ?[][]const u8 = null,
+};
+
+const MobySyscall = struct {
+    names: [][]const u8,
+    action: []const u8,
+    errnoRet: ?u32 = null,
+    args: ?[]SyscallArg = null,
+    includes: ?MobyFilter = null,
+    excludes: ?MobyFilter = null,
+};
+
+const MobyFilter = struct {
+    caps: ?[][]const u8 = null,
+    arches: ?[][]const u8 = null,
+    minKernel: ?[]const u8 = null,
+};
+
+/// Parse the embedded moby-shape profile and resolve it against `env`
+/// into a pure OCI `linux.seccomp` object. Filter semantics mirror the
+/// upstream resolver in github.com/containers/common's seccomp pkg:
+///   - `excludes` matches the env  → syscall is dropped.
+///   - `includes` non-empty and doesn't match → syscall is dropped.
+///   - otherwise the syscall ships through (with `args`/`errnoRet`).
+///
+/// `minKernel` filters are intentionally treated as always-satisfied:
+/// rind's M2 runtime floor is Linux 5.11 (rootless overlayfs) which is
+/// already past every minKernel value the upstream profile carries.
+fn resolveSeccomp(aa: Allocator, env: SeccompEnv) BundleError!Seccomp {
     const opts: std.json.ParseOptions = .{
         .ignore_unknown_fields = true,
         .duplicate_field_behavior = .@"error",
     };
-    return std.json.parseFromSliceLeaky(Seccomp, aa, seccomp_default_bytes, opts) catch
+    const moby = std.json.parseFromSliceLeaky(MobyProfile, aa, seccomp_default_bytes, opts) catch
         return BundleError.InvalidSeccompProfile;
+
+    var arches = std.array_list.Aligned([]const u8, null).empty;
+    if (moby.archMap) |entries| {
+        for (entries) |e| {
+            if (!std.mem.eql(u8, e.architecture, env.image_arch)) continue;
+            try arches.append(aa, e.architecture);
+            if (e.subArchitectures) |subs| {
+                for (subs) |s| try arches.append(aa, s);
+            }
+        }
+    } else if (moby.architectures) |list| {
+        for (list) |s| try arches.append(aa, s);
+    }
+
+    var rules = std.array_list.Aligned(SyscallRule, null).empty;
+    for (moby.syscalls) |sc| {
+        if (sc.excludes) |f| if (!filterIsEmpty(f) and filterMatches(f, env, arches.items)) continue;
+        if (sc.includes) |f| if (!filterIsEmpty(f) and !filterMatches(f, env, arches.items)) continue;
+        try rules.append(aa, .{
+            .names = sc.names,
+            .action = sc.action,
+            .errnoRet = sc.errnoRet,
+            .args = sc.args,
+        });
+    }
+
+    return .{
+        .defaultAction = moby.defaultAction,
+        .defaultErrnoRet = moby.defaultErrnoRet,
+        .architectures = arches.items,
+        .syscalls = rules.items,
+    };
+}
+
+fn filterIsEmpty(f: MobyFilter) bool {
+    const no_caps = f.caps == null or f.caps.?.len == 0;
+    const no_arches = f.arches == null or f.arches.?.len == 0;
+    const no_kernel = f.minKernel == null;
+    return no_caps and no_arches and no_kernel;
+}
+
+fn filterMatches(f: MobyFilter, env: SeccompEnv, env_arches: []const []const u8) bool {
+    if (f.caps) |caps| if (caps.len > 0) {
+        for (caps) |needed| {
+            if (!containsString(env.caps_held, needed)) return false;
+        }
+    };
+    if (f.arches) |arches| if (arches.len > 0) {
+        var any = false;
+        for (arches) |a| {
+            if (containsString(env_arches, a)) {
+                any = true;
+                break;
+            }
+        }
+        if (!any) return false;
+    };
+    // minKernel intentionally ignored — runtime floor exceeds every
+    // upstream-listed value.
+    return true;
+}
+
+fn containsString(list: []const []const u8, needle: []const u8) bool {
+    for (list) |s| if (std.mem.eql(u8, s, needle)) return true;
+    return false;
 }
 
 const Document = struct {
@@ -377,11 +514,8 @@ const Resources = struct {};
 const Seccomp = struct {
     defaultAction: []const u8,
     defaultErrnoRet: ?u32 = null,
-    architectures: ?[][]const u8 = null,
-    flags: ?[][]const u8 = null,
-    listenerPath: ?[]const u8 = null,
-    listenerMetadata: ?[]const u8 = null,
-    syscalls: ?[]SyscallRule = null,
+    architectures: []const []const u8,
+    syscalls: []const SyscallRule,
 };
 
 const SyscallRule = struct {

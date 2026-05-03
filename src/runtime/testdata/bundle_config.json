@@ -207,9 +207,7 @@
       "architectures": [
         "SCMP_ARCH_X86_64",
         "SCMP_ARCH_X86",
-        "SCMP_ARCH_X32",
-        "SCMP_ARCH_AARCH64",
-        "SCMP_ARCH_ARM"
+        "SCMP_ARCH_X32"
       ],
       "syscalls": [
         {
@@ -251,7 +249,8 @@
             "vmsplice"
           ],
           "action": "SCMP_ACT_ERRNO",
-          "errnoRet": 1
+          "errnoRet": 1,
+          "args": []
         },
         {
           "names": [
@@ -626,7 +625,8 @@
             "write",
             "writev"
           ],
-          "action": "SCMP_ACT_ALLOW"
+          "action": "SCMP_ACT_ALLOW",
+          "args": []
         },
         {
           "names": [
@@ -703,7 +703,8 @@
             "open_by_handle_at"
           ],
           "action": "SCMP_ACT_ERRNO",
-          "errnoRet": 1
+          "errnoRet": 1,
+          "args": []
         },
         {
           "names": [
@@ -716,14 +717,16 @@
             "setns"
           ],
           "action": "SCMP_ACT_ERRNO",
-          "errnoRet": 1
+          "errnoRet": 1,
+          "args": []
         },
         {
           "names": [
             "chroot"
           ],
           "action": "SCMP_ACT_ERRNO",
-          "errnoRet": 1
+          "errnoRet": 1,
+          "args": []
         },
         {
           "names": [
@@ -733,14 +736,16 @@
             "query_module"
           ],
           "action": "SCMP_ACT_ERRNO",
-          "errnoRet": 1
+          "errnoRet": 1,
+          "args": []
         },
         {
           "names": [
             "acct"
           ],
           "action": "SCMP_ACT_ERRNO",
-          "errnoRet": 1
+          "errnoRet": 1,
+          "args": []
         },
         {
           "names": [
@@ -748,7 +753,8 @@
             "process_madvise"
           ],
           "action": "SCMP_ACT_ERRNO",
-          "errnoRet": 1
+          "errnoRet": 1,
+          "args": []
         },
         {
           "names": [
@@ -756,7 +762,8 @@
             "iopl"
           ],
           "action": "SCMP_ACT_ERRNO",
-          "errnoRet": 1
+          "errnoRet": 1,
+          "args": []
         },
         {
           "names": [
@@ -766,14 +773,16 @@
             "stime"
           ],
           "action": "SCMP_ACT_ERRNO",
-          "errnoRet": 1
+          "errnoRet": 1,
+          "args": []
         },
         {
           "names": [
             "vhangup"
           ],
           "action": "SCMP_ACT_ERRNO",
-          "errnoRet": 1
+          "errnoRet": 1,
+          "args": []
         },
         {
           "names": [
@@ -843,14 +852,16 @@
             "bpf"
           ],
           "action": "SCMP_ACT_ERRNO",
-          "errnoRet": 1
+          "errnoRet": 1,
+          "args": []
         },
         {
           "names": [
             "perf_event_open"
           ],
           "action": "SCMP_ACT_ERRNO",
-          "errnoRet": 1
+          "errnoRet": 1,
+          "args": []
         }
       ]
     }
