@@ -186,3 +186,27 @@ rtk zig build test       # run tests
 rtk zig build run        # build + run
 rtk zig fmt src/         # format
 ```
+
+# Subagent Delegation (token optimization)
+
+Main session (Opus) handles implementation. Always delegate exploration to project subagents in `.claude/agents/`:
+
+| Need | Agent | Model |
+|------|-------|-------|
+| Zig 0.16 stdlib API/source lookup | `zig-std-explorer` | Haiku |
+| Repo cross-file search, wiring, callers | `code-explorer` | Sonnet |
+| Single file/symbol/value lookup | `quick-lookup` | Haiku |
+| Architectural design for non-trivial change | `Plan` (built-in) | Opus |
+
+Rule: do NOT run `grep`, `find`, or read >2 files directly from main session. Spawn the right agent. Implementation edits stay in main (Opus).
+
+Routing heuristics:
+- Question about `std.*` API or any file under `~/.zvm/0.16.0/lib/std/` → `zig-std-explorer`
+- "How does X work?", "where is Y wired?", multi-file trace → `code-explorer`
+- "Where is symbol Z?", "what's the value of K?" → `quick-lookup`
+- Designing a non-trivial change before implementing → built-in `Plan` agent
+
+Context hygiene:
+- `/clear` when switching tasks
+- `/compact` mid-task when context grows long
+- Subagents must return concise summaries with `file:line` refs, never file dumps
