@@ -338,6 +338,20 @@ pub fn runImage(
         .container_id = container.id,
         .pid_file_path = pid_file_path,
     };
+
+    // Block SIGCHLD on this thread for the duration of the spawn so the
+    // watcher inherits it blocked. libcrun's `wait_for_process` uses a
+    // signalfd to consume SIGCHLD on the main thread; if SIGCHLD is
+    // unblocked on the watcher, the kernel can route the container's
+    // death-time SIGCHLD there (default disposition: ignore) and
+    // libcrun's signalfd never fires `runSync` then hangs in
+    // epoll_wait forever. Mirrors `runtime/Pty.zig:start`.
+    var prev_set: std.posix.sigset_t = undefined;
+    {
+        var block_set: std.posix.sigset_t = std.posix.sigemptyset();
+        std.posix.sigaddset(&block_set, .CHLD);
+        std.posix.sigprocmask(std.posix.SIG.BLOCK, &block_set, &prev_set);
+    }
     const watcher_thread_opt: ?std.Thread = std.Thread.spawn(
         .{},
         PidWatcher.run,
@@ -346,6 +360,7 @@ pub fn runImage(
         std.log.debug("rind: pid watcher spawn failed: {s}", .{@errorName(err)});
         break :spawn_blk null;
     };
+    std.posix.sigprocmask(std.posix.SIG.SETMASK, &prev_set, null);
     var watcher_joined = false;
     defer if (!watcher_joined) {
         watcher.done.store(true, .release);
