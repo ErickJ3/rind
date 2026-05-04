@@ -1,4 +1,4 @@
-//! `rind images` subcommand (T11).
+//! `rind images` subcommand.
 //!
 //! Read-side counterpart to `rind pull`: enumerates locally tagged
 //! manifests in `index.json`, reads each manifest blob plus its image
@@ -7,8 +7,8 @@
 //! array.
 //!
 //! Local-only: never touches the registry. The single new piece of
-//! parsing is `image/config.zig`; the rest is glue over `Store` (T03)
-//! and `manifest.parseManifest` (T05).
+//! parsing is `image/config.zig`; the rest is glue over `Store` and
+//! `manifest.parseManifest`.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

@@ -1,10 +1,10 @@
 //! Overlayfs mount/unmount for rind container rootfs.
 //!
-//! T20 deliverable. `mount` lays the OCI image's extracted layers
-//! (oldest-first) as `lowerdir`s under a single overlay mount whose
-//! upper/work/merged trees live under `<container_dir>/{upper,work,merged}`.
-//! T21 (bundle composer) takes `MountedOverlay.merged_path` and writes it
-//! into `config.json` as `rootfs.path`; T23 (run orchestrator) closes the
+//! `mount` lays the OCI image's extracted layers (oldest-first) as
+//! `lowerdir`s under a single overlay mount whose upper/work/merged
+//! trees live under `<container_dir>/{upper,work,merged}`. The bundle
+//! composer takes `MountedOverlay.merged_path` and writes it into
+//! `config.json` as `rootfs.path`; the run orchestrator closes the
 //! lifecycle by calling `unmount` after libcrun returns.
 //!
 //! Privilege model
@@ -69,7 +69,7 @@ const Frame = packed struct(u64) {
 
 /// Closed semantic error set covering every failure path through
 /// `mount`/`unmount`. Callers should propagate or re-classify these;
-/// the runtime orchestrator (T23) maps them to user-facing diagnostics.
+/// the runtime orchestrator maps them to user-facing diagnostics.
 pub const OverlayError = error{
     /// Linux < 5.11 detected and the caller is rootless. Native
     /// overlayfs in an unprivileged user namespace was added in 5.11;
@@ -112,14 +112,15 @@ pub const OverlayError = error{
 /// Live overlay handle returned by `mount`. The mount is held in the
 /// process's mount namespace (which, in the rootless flow, is a fresh
 /// namespace this process now belongs to). `merged_path` is the kernel
-/// view of the mount; T21 hands it to libcrun as `rootfs.path`.
+/// view of the mount; the bundle composer hands it to libcrun as
+/// `rootfs.path`.
 pub const MountedOverlay = struct {
     allocator: Allocator,
     /// NUL-terminated absolute path to the merged tree. Freed by
     /// `deinit`.
     merged_path: [:0]u8,
     /// Absolute path to the upper tree (writable layer). Freed by
-    /// `deinit`. Useful for diagnostic + the M2 cleanup path which
+    /// `deinit`. Useful for diagnostic + the cleanup path which
     /// recursively deletes upper to reclaim disk space.
     upper_path: []u8,
     /// Absolute path to the workdir. Freed by `deinit`.
@@ -211,8 +212,8 @@ pub fn mount(
 /// is poisoned on return regardless of success path.
 ///
 /// Recursive cleanup of `upper`/`work`/`merged` is the caller's job
-/// (T23 cleanup path) — keeping that here would conflate concerns when
-/// `--rm` is off.
+/// (run orchestrator's cleanup path) — keeping that here would
+/// conflate concerns when `--rm` is off.
 pub fn unmount(io: Io, mounted: *MountedOverlay) OverlayError!void {
     const rc1 = linux.umount2(mounted.merged_path.ptr, 0);
     switch (linux.errno(rc1)) {

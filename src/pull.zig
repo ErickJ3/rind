@@ -1,15 +1,14 @@
-//! Pull orchestrator (T09).
+//! Pull orchestrator.
 //!
 //! `pullImage(ref_text, store, client, options) → PullResult` glues
-//! T01 (ref parse), T05 (manifest GET), T06 (concurrent blob GET),
-//! T03 (image-layout store), and T07/T08 (layer extraction) into a
-//! single end-to-end image fetch.
+//! ref parse, manifest GET, concurrent blob GET, image-layout store,
+//! and layer extraction into a single end-to-end image fetch.
 //!
 //! Steps, in order:
 //!
 //!   1. Parse `ref_text`.
 //!   2. `Client.getManifest` → single-platform manifest (with index
-//!      dispatch handled by T05).
+//!      dispatch handled inside `registry/manifest.zig`).
 //!   3. Persist the manifest blob into the store via `Store.putBlob`.
 //!   4. Build a job table — config + each layer descriptor. Cached
 //!      blobs are skipped (warm-cache fast path); the rest are fetched
@@ -23,7 +22,7 @@
 //!   7. Tag `index.json` with the user-supplied reference text.
 //!
 //! Progress is reported through an optional callback. The callback
-//! may fire from a pool worker thread (T18: blob_done events fire as
+//! may fire from a pool worker thread (blob_done events fire as
 //! each download lands rather than being batched on the orchestrator
 //! thread), so the caller must serialize against shared state — see
 //! `cli/pull.zig`'s trampoline mutex. Live byte-level progress is
@@ -49,8 +48,8 @@ pub const Digest = digest_mod.Digest;
 pub const MediaType = manifest_mod.MediaType;
 
 /// Distinguishes the image config blob from layer blobs in progress
-/// events. The two are fetched the same way but consumers (T10's UI)
-/// often render them differently.
+/// events. The two are fetched the same way but consumers often
+/// render them differently.
 pub const BlobKind = enum { config, layer };
 
 /// Tagged union of orchestrator progress events. Emission order:
@@ -60,7 +59,7 @@ pub const BlobKind = enum { config, layer };
 /// first, then layers), `blob_done` for every cached slot in slot
 /// order (these are decided up-front), then `blob_done` for each
 /// non-cached slot as its worker thread finishes downloading +
-/// linking the blob (T18: completion order, not slot order — may
+/// linking the blob (completion order, not slot order — may
 /// interleave with `extracted`). `extracted` fires per layer as
 /// each extract worker finishes (also out-of-order). `done` last.
 pub const PullEvent = union(enum) {

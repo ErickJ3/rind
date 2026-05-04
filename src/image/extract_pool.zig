@@ -2,7 +2,8 @@
 //!
 //! Two execution modes share the same `Pool` type:
 //!
-//!   * Per-batch (`runAll`) — the original T06 contract. Spawns N
+//!   * Per-batch (`runAll`) — the original blob-pool-style contract.
+//!     Spawns N
 //!     worker threads that drain a fixed `[]ExtractJob` slice via a
 //!     mutex-guarded LIFO, joins on the way out. Used by tests and
 //!     by callers that have all jobs up front.

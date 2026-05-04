@@ -1,4 +1,4 @@
-//! `rind run <image> [cmd...]` subcommand (T24).
+//! `rind run <image> [cmd...]` subcommand.
 //!
 //! Argparse, validation, and orchestration glue for the run verb. The
 //! actual end-to-end run is delegated to `run_mod.runImage` via
@@ -57,8 +57,8 @@ pub const RunArgs = struct {
     env_file: ?[]const u8 = null,
     /// `-w/--workdir <dir>`. Working directory inside the container.
     workdir: ?[]const u8 = null,
-    /// `-u/--user <spec>`. UID, UID:GID, or username (numeric only in
-    /// M2; see `bundle.parseUser`).
+    /// `-u/--user <spec>`. UID, UID:GID, or username (numeric only;
+    /// see `bundle.parseUser`).
     user: ?[]const u8 = null,
     /// `--entrypoint <prog>`. Single-string override (matches Docker).
     /// Multi-arg entrypoints stay expressible by shifting args after

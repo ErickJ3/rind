@@ -1,4 +1,4 @@
-//! Manifest types, JSON parser, and platform dispatcher (T05).
+//! Manifest types, JSON parser, and platform dispatcher.
 //!
 //! Pure library: no I/O. Sits above the transport in `client.zig`,
 //! which calls `parseManifest` / `parseIndex` / `selectPlatform` to
@@ -7,7 +7,7 @@
 //! Re-exports `Descriptor`, `Platform`, and `Index` from
 //! `store/layout.zig` so the OCI JSON shapes have a single source of
 //! truth across the codebase. Adds `Manifest` (single-platform image
-//! manifest), `MediaType` (the four media types T05 accepts), and
+//! manifest), `MediaType` (the four accepted media types), and
 //! `ManifestResult` (caller-visible outcome of `Client.getManifest`).
 //!
 //! Endpoint quirks: `docker.io` is mapped to `registry-1.docker.io`
@@ -37,7 +37,7 @@ pub const Index = layout.Index;
 /// `image/digest.zig`.
 pub const Digest = digest_mod.Digest;
 
-/// Manifest media types accepted by T05. The two `*_index` variants
+/// Manifest media types accepted here. The two `*_index` variants
 /// trigger platform dispatch; the two single-manifest variants are
 /// the terminal result of `getManifest`.
 pub const MediaType = enum {
@@ -89,8 +89,8 @@ const oci_index_str = "application/vnd.oci.image.index.v1+json";
 const docker_manifest_str = "application/vnd.docker.distribution.manifest.v2+json";
 const docker_manifest_list_str = "application/vnd.docker.distribution.manifest.list.v2+json";
 
-/// Comma-joined `Accept` header value listing every media type T05
-/// understands. Sent with every manifest GET so the registry can
+/// Comma-joined `Accept` header value listing every media type this
+/// module understands. Sent with every manifest GET so the registry can
 /// content-negotiate (e.g. return an OCI index instead of Docker
 /// when both exist).
 pub const accept_header_value: []const u8 =
@@ -143,7 +143,7 @@ pub const ManifestResult = struct {
     /// variants by construction.
     media_type: MediaType,
     /// Verbatim response body the caller can hand directly to
-    /// `Store.putBlob` (T03) without re-fetching or re-hashing.
+    /// `Store.putBlob` without re-fetching or re-hashing.
     raw_bytes: []const u8,
     /// Backing arena for `manifest`, `raw_bytes`, and any nested
     /// strings.
@@ -169,7 +169,7 @@ pub const default_platform: Platform = .{
 
 /// Map a Zig `std.Target.Cpu.Arch` enum to the OCI architecture
 /// string. Returns `null` for archs that have no canonical OCI name.
-/// Public so callers (e.g. `--platform` CLI flag in T10) can build
+/// Public so callers (e.g. the `--platform` CLI flag) can build
 /// their own override `Platform` from a different arch.
 pub fn ociArchName(arch: std.Target.Cpu.Arch) ?[]const u8 {
     return switch (arch) {

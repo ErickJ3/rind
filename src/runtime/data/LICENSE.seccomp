@@ -13,7 +13,7 @@ arches, and minKernel). That shape is not directly accepted by the
 OCI runtime spec.
 
 This file is a one-time vendor-time *resolution* of that profile under
-rind's M2 default container environment:
+rind's default container environment:
 
   - capabilities = {} (rind drops every cap; the bounding set is the
     14-cap docker default applied at runtime via config.json, but the

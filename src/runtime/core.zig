@@ -1,14 +1,15 @@
 //! Foreground container run loop with signal forwarding.
 //!
-//! T22 deliverable. Wraps `libcrun.runSync` (T18) and forwards
-//! SIGINT/SIGTERM/SIGQUIT/SIGHUP to the container while it runs,
-//! restoring the prior handlers on return. Stdio is inherited
-//! verbatim from rind's process — no proxying, no shim.
+//! Wraps `libcrun.runSync` and forwards SIGINT/SIGTERM/SIGQUIT/SIGHUP
+//! to the container while it runs, restoring the prior handlers on
+//! return. Stdio is inherited verbatim from rind's process — no
+//! proxying, no shim.
 //!
-//! Scope (per docs/tasks.md T22):
-//!   - One synchronous foreground call. `-d` / detached supervision is M4.
-//!   - No pty / `--console-socket` (T25).
-//!   - No state-file lifecycle writes (T26).
+//! Scope:
+//!   - One synchronous foreground call; `-d` / detached supervision
+//!     is not yet implemented.
+//!   - No pty / `--console-socket`.
+//!   - No state-file lifecycle writes.
 //!
 //! Signal-handler discipline:
 //!   - libcrun's container_kill API takes the container id via a
@@ -49,8 +50,8 @@ const c = @cImport({
 pub const ExitStatus = libcrun.ExitStatus;
 
 /// Closed error set returned by `runForeground`. Composes
-/// `libcrun.RuntimeError` (T18) with `AlreadyRunning`, which fires when
-/// a second `runForeground` overlaps a first one in the same process.
+/// `libcrun.RuntimeError` with `AlreadyRunning`, which fires when a
+/// second `runForeground` overlaps a first one in the same process.
 pub const RuntimeError = libcrun.RuntimeError || error{AlreadyRunning};
 
 /// Inputs required to drive a single foreground container run.
@@ -58,7 +59,7 @@ pub const RuntimeError = libcrun.RuntimeError || error{AlreadyRunning};
 /// All slice fields are caller-owned; `runForeground` keeps internal
 /// NUL-terminated copies for the duration of the call.
 pub const RunRequest = struct {
-    /// Container id (e.g. 12-char short id from T19's state allocator).
+    /// Container id (e.g. 12-char short id from `runtime/state.zig`).
     id: []const u8,
     /// Per-container state-root parent — typically `<root>/containers/`.
     /// Mirrors libcrun's `--state-root`.
@@ -75,12 +76,12 @@ pub const RunRequest = struct {
 /// SIGINT/SIGTERM/SIGQUIT/SIGHUP to the container while it runs.
 ///
 /// Returns the decoded exit status. On a libcrun-level failure returns
-/// the typed `RuntimeError` from T18; diagnostics for failed runs are
-/// internal to the wrapper (no surface yet — T26 will plumb them out
-/// via the state file).
+/// the typed `RuntimeError`; diagnostics for failed runs are internal
+/// to the wrapper (no surface yet — state-file plumbing is not yet
+/// implemented).
 ///
 /// `io` is currently unused; reserved so the signature stays stable
-/// once T26 wires Io-mediated state transitions through here.
+/// once Io-mediated state transitions land here.
 pub fn runForeground(
     io: std.Io,
     gpa: Allocator,

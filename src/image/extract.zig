@@ -1,6 +1,6 @@
 //! Layer extraction: tar+gzip → directory tree.
 //!
-//! Implements T07 of the M1 plan: pipe a registry blob's bytes through
+//! Pipes a registry blob's bytes through
 //! `std.compress.flate` (gzip container) and a custom tar walker into
 //! `dest_dir`. Two non-negotiable hardening rules from the OCI image-spec
 //! layer doc are enforced inline:
@@ -23,7 +23,7 @@
 //!   2. **Whiteouts** — `.wh.<name>` removes a sibling and `.wh..wh..opq`
 //!      clears its parent directory's contents (preserving the directory
 //!      itself). Markers themselves are never written to disk. This
-//!      mutates `dest_dir`; the orchestrator (T09) chooses whether
+//!      mutates `dest_dir`; the pull orchestrator chooses whether
 //!      `dest_dir` is per-digest or per-image.
 //!
 //! Why a custom tar walker instead of `std.tar.Iterator`? The stdlib
@@ -192,10 +192,10 @@ pub fn ensureLayer(
 
 /// Sequentially extract every layer in `layer_digests`, indexed in
 /// lockstep with `layer_media_types`. Calls `ensureExtractedRoot` once
-/// before the loop. Used by the run orchestrator (M2) and the future
-/// builder (M3) where a synchronous walk over already-pulled blobs is
-/// sufficient — the parallel pool path lives in `pull.zig` because
-/// downloads and extracts overlap there.
+/// before the loop. Used by the run orchestrator and other call sites
+/// where a synchronous walk over already-pulled blobs is sufficient —
+/// the parallel pool path lives in `pull.zig` because downloads and
+/// extracts overlap there.
 pub fn ensureExtracted(
     io: Io,
     gpa: Allocator,
@@ -1262,7 +1262,7 @@ test "extractGzip rejects symlink target that escapes rootfs" {
 test "extractGzip preserves absolute symlink target verbatim (busybox-style)" {
     // Regression: Alpine 3.19 layer contains entries like
     // `bin/arch -> /bin/busybox`. Earlier sanitiser rejected every
-    // absolute target, blocking the canonical M1 smoke pull. The
+    // absolute target, blocking the canonical smoke pull. The
     // accepted policy is to store the verbatim string and defer the
     // runtime-side defence to the runner milestone.
     var tmp = testing.tmpDir(.{ .iterate = true });
@@ -1347,12 +1347,6 @@ test "extractGzip overwrites a previous-layer file with a new symlink" {
     const n = try tmp.dir.readLink(testing.io, "old", &link_buf);
     try testing.expectEqualStrings("elsewhere", link_buf[0..n]);
 }
-
-// ---------------------------------------------------------------------------
-// extractZstd: mirrored coverage of the gzip suite. Same TestEntry inputs,
-// same on-disk expectations — only the compression wrapper differs. Proves
-// the AC's "extracts identically to its .tar.gz twin" requirement.
-// ---------------------------------------------------------------------------
 
 test "extractZstd basic round-trip: dir + file + symlink" {
     var tmp = testing.tmpDir(.{ .iterate = true });

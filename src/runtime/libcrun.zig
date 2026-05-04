@@ -1,9 +1,9 @@
 //! Typed Zig surface over libcrun's container_run / load / kill / delete.
 //! Owns the `libcrun_error_t` release discipline; never leaks.
 //!
-//! T18 deliverable. Downstream tasks (T22 runtime core, T23 `rind run`
-//! orchestrator) consume this module — no other Zig code should `@cImport`
-//! libcrun headers directly.
+//! Downstream consumers (`runtime/core.zig`, `run.zig` orchestrator)
+//! depend on this module — no other Zig code should `@cImport` libcrun
+//! headers directly.
 //!
 //! Header layout deviation: the spec text in docs/tasks.md references
 //! `libcrun/container.h` but vendor reality is `vendor/crun-1.23/src/
@@ -86,15 +86,15 @@ pub const LastError = struct {
 /// the wrapper makes NUL-terminated copies for each call.
 pub const Context = struct {
     allocator: std.mem.Allocator,
-    /// Container id (e.g. 12-char hex from T19's state.zig).
+    /// Container id (e.g. 12-char hex from `runtime/state.zig`).
     id: []const u8,
     /// Directory rooting per-container state (e.g. ~/.rind/containers).
     state_root: []const u8,
     /// Bundle directory containing config.json + rootfs/.
     bundle: []const u8,
-    /// Optional console socket path for `--console-socket` (T25).
+    /// Optional console socket path for `--console-socket`.
     console_socket: ?[]const u8 = null,
-    /// Detached (background) run; foreground sync is the default for T18.
+    /// Detached (background) run; foreground sync is the default.
     detach: bool = false,
     /// File descriptors to keep open in the container; default 0.
     preserve_fds: c_int = 0,
@@ -419,7 +419,8 @@ test "Container.loadFromFile: malformed config.json returns InvalidConfig" {
 }
 
 // runSync /bin/true integration deferred: building a rootless bundle
-// (uid_map, no cgroup, static rootfs) is a fixture that lands with T19
-// (state) + T21 (bundle composer). T18 proves the wrapper compiles +
-// hits libcrun's error paths cleanly via the unit tests above; T22 will
-// add the live `/bin/true` exit-code test against a composed bundle.
+// (uid_map, no cgroup, static rootfs) is a fixture provided by
+// `state.zig` and the bundle composer. The unit tests above prove
+// the wrapper compiles + hits libcrun's error paths cleanly; the
+// live `/bin/true` exit-code test against a composed bundle lands
+// with `runtime/core.zig`.

@@ -25,7 +25,7 @@ const pull_cli = @import("pull.zig");
 const run_cli = @import("run.zig");
 const images_cli = @import("images.zig");
 const inspect_cli = @import("inspect.zig");
-const io_v4 = @import("../io_v4.zig");
+const IoV4 = @import("../IoV4.zig");
 
 /// Default storage root suffix appended to `$HOME` when `RIND_ROOT`
 /// is unset. Matches the layout described in `docs/rind.md`.
@@ -102,7 +102,11 @@ fn runPull(
     const args = try pull_cli.parseArgs(gpa, &iter, stderr);
     defer pull_cli.freeArgs(gpa, args);
 
-    const io = if (args.ipv4) io_v4.wrap(io_in) else io_in;
+    var v4_io: IoV4 = undefined;
+    const io = if (args.ipv4) blk: {
+        v4_io = IoV4.init(io_in);
+        break :blk v4_io.io();
+    } else io_in;
 
     const root_path = try resolveRoot(gpa, env_map);
     defer gpa.free(root_path);
@@ -118,8 +122,8 @@ fn runPull(
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
 
-    // TODO(M4): swap `Provider.anonymous` for the file-backed
-    // provider that reads `~/.rind/auth.json`.
+    // TODO: swap `Provider.anonymous` for the file-backed provider
+    // that reads `~/.rind/auth.json`.
     var client = client_mod.Client.init(gpa, io, &http_client, auth_mod.Provider.anonymous);
     defer client.deinit();
 

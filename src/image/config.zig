@@ -1,10 +1,10 @@
-//! OCI image config decoder for `rind images` (T11).
+//! OCI image config decoder for `rind images`.
 //!
 //! Parses the JSON document referenced by a manifest's `config`
-//! descriptor. The decoder is narrow: it surfaces only the fields T11
-//! consumes (`created`, plus the OCI-mandatory `architecture` / `os` /
-//! `rootfs` so torn or wrong-shape bodies still fail loudly) and lets
-//! `std.json` skip everything else.
+//! descriptor. The decoder is narrow: it surfaces only the fields
+//! `rind images` consumes (`created`, plus the OCI-mandatory
+//! `architecture` / `os` / `rootfs` so torn or wrong-shape bodies
+//! still fail loudly) and lets `std.json` skip everything else.
 //!
 //! Pure library: no I/O, no allocations beyond what `std.json` does
 //! into the caller-supplied arena.
@@ -19,10 +19,11 @@ pub const ConfigError = error{
     BadConfigJson,
 };
 
-/// Subset of an OCI image config that T11 cares about. Field names
-/// mirror the OCI JSON schema so `std.json` parses without rename
-/// hooks. `created` is optional because the spec marks it RECOMMENDED,
-/// not REQUIRED — older images may omit it.
+/// Subset of an OCI image config the `rind images` / `rind run`
+/// surface care about. Field names mirror the OCI JSON schema so
+/// `std.json` parses without rename hooks. `created` is optional
+/// because the spec marks it RECOMMENDED, not REQUIRED — older images
+/// may omit it.
 pub const ImageConfig = struct {
     /// e.g. `"amd64"`. OCI-required.
     architecture: []const u8,
@@ -33,8 +34,8 @@ pub const ImageConfig = struct {
     /// Rootfs descriptor. Required by OCI; demanding the field means a
     /// torn or wrong-shape config is rejected at parse time.
     rootfs: RootFs,
-    /// OCI image-config `config` object — runtime defaults T21 reads
-    /// when composing the bundle. Optional because the spec marks the
+    /// OCI image-config `config` object — runtime defaults the
+    /// bundle composer reads. Optional because the spec marks the
     /// whole object as not required, and many real configs omit it.
     config: ?Config = null,
 
@@ -49,8 +50,9 @@ pub const ImageConfig = struct {
     /// OCI image-config `config` object. Field names mirror the JSON
     /// schema's PascalCase so `std.json` maps keys without rename hooks.
     /// Every field is optional — image configs in the wild routinely
-    /// omit any subset. T21 (bundle composer) reads these to fill the
-    /// runtime spec's `process` defaults; T11/T12 ignore them.
+    /// omit any subset. The bundle composer reads these to fill the
+    /// runtime spec's `process` defaults; `rind images` /
+    /// `rind inspect` ignore them.
     pub const Config = struct {
         /// `KEY=VAL` strings forwarded into the container's environment.
         Env: ?[][]const u8 = null,

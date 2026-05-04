@@ -1,22 +1,22 @@
-//! `rind run` orchestrator (T23).
+//! `rind run` orchestrator.
 //!
-//! `runImage` glues the M2 runtime stack into a single foreground call:
+//! `runImage` glues the runtime stack into a single foreground call:
 //! ref parse → image lookup in `index.json` → ensure every layer is
 //! extracted (via `image/extract.zig:ensureExtracted`, the helper shared
-//! with `pull.zig`) → state allocation (T19) → overlay mount (T20) →
-//! bundle compose (T21) → libcrun runForeground (T22) → unmount → (when
-//! `--rm`) recursive removal of the container/bundle/overlay triplet.
+//! with `pull.zig`) → state allocation → overlay mount → bundle compose
+//! → libcrun runForeground → unmount → (when `--rm`) recursive removal
+//! of the container/bundle/overlay triplet.
 //!
-//! Excluded by spec, owned by later tasks:
-//!   - bind mounts / pty (T25),
-//!   - state-file dynamic writes during the run (T26),
-//!   - detached `-d` supervision (M4),
-//!   - auto-pull when image is absent (T28; the `RunOptions.pull` field
-//!     is shipped as a stub today and surfaces `ImageNotPresent` in M2
-//!     because `runImage` has no client argument by spec).
+//! Not yet implemented:
+//!   - bind mounts / pty,
+//!   - state-file dynamic writes during the run,
+//!   - detached `-d` supervision,
+//!   - auto-pull when image is absent (the `RunOptions.pull` field is
+//!     shipped as a stub today and surfaces `ImageNotPresent` because
+//!     `runImage` has no client argument by spec).
 //!
-//! Signature deviation (precedent: T21's bundle.compose). Spec text
-//! reads `runImage(io, gpa, store, ref_text, opts, progress_cb)`.
+//! Signature deviation. Spec text reads
+//! `runImage(io, gpa, store, ref_text, opts, progress_cb)`.
 //! Implementation adds:
 //!   - `env: Env` carrying `{root_dir, root_abspath, store_subpath}`,
 //!     because state.allocate needs the parent dir of the store and
@@ -64,10 +64,9 @@ pub const RunEvent = union(enum) {
     overlay_mounted,
     /// `config.json` has been written into the bundle directory.
     bundle_ready,
-    /// libcrun has been handed the bundle. `pid` is `0` in M2 because
+    /// libcrun has been handed the bundle. `pid` is `0` because
     /// `runForeground` is synchronous and does not surface the live
-    /// container PID; T26 will plumb it through the state-file
-    /// transition path.
+    /// container PID.
     started: struct { pid: u32 },
     /// libcrun returned. Exactly one of `code` / `signal` is non-zero
     /// for a clean run; both zero indicates `.exit = 0`.
@@ -76,7 +75,7 @@ pub const RunEvent = union(enum) {
     removed,
 };
 
-/// Progress callback. Invoked synchronously from `runImage`'s thread —
+/// Progress callback. Invoked synchronously from `runImage`'s thread,
 /// no worker-thread parallelism here, unlike pull. Implementations need
 /// not lock.
 pub const ProgressFn = *const fn (ctx: ?*anyopaque, event: RunEvent) void;
@@ -105,16 +104,15 @@ pub const RunOptions = struct {
     /// container/bundle/overlay triplet on every return path, success
     /// or failure, and emits `RunEvent.removed` on success.
     rm: bool = false,
-    /// Reserved for T28's auto-pull wiring. M2 ignores the value and
-    /// returns `error.ImageNotPresent` whenever the image is absent
-    /// from `index.json` (no `Client` is plumbed through the spec
-    /// signature).
+    /// Reserved for auto-pull wiring (not yet implemented). The
+    /// orchestrator returns `error.ImageNotPresent` whenever the image
+    /// is absent from `index.json` (no `Client` is plumbed through
+    /// the spec signature).
     pull: bool = false,
     /// CLI-flag overrides forwarded into `bundle.compose`. Default
     /// (`.{}`) leaves all image-config defaults intact.
     overrides: bundle_mod.RunOverrides = .{},
-    /// Optional `--name`. M2 always passes `null`; T24/M4 will surface
-    /// it through the CLI.
+    /// Optional `--name`. The CLI surface for it is not yet wired.
     name: ?[]const u8 = null,
     /// Opaque pointer threaded through to `progress_fn`.
     progress_ctx: ?*anyopaque = null,
@@ -185,8 +183,8 @@ pub const RunError =
     Allocator.Error ||
     error{
         /// `ref_text` did not match any descriptor in `index.json`.
-        /// In M2 this also fires when `opts.pull = true` because
-        /// auto-pull plumbing is deferred to T28.
+        /// Also fires when `opts.pull = true` because auto-pull is
+        /// not yet implemented.
         ImageNotPresent,
         /// `index.json` resolved a descriptor whose `mediaType` is
         /// not a single-platform manifest (image-index, unknown).
@@ -808,7 +806,7 @@ test "runImage returns ImageNotPresent when ref not in index" {
         },
     ));
 
-    // pull=true: same outcome in M2 (no client wired).
+    // pull=true: same outcome (no client wired).
     try testing.expectError(RunError.ImageNotPresent, runImage(
         testing.io,
         gpa,

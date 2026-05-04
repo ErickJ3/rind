@@ -107,9 +107,9 @@ pub const Digest = struct {
 };
 
 /// Streaming sha256 hasher. Construct with `init`, feed bytes through
-/// `update`, finalize with `final` to get a `Digest`. T03/T06 use this
-/// to hash blobs on the fly while writing them to disk, avoiding a
-/// double pass.
+/// `update`, finalize with `final` to get a `Digest`. The store and
+/// the blob pool use this to hash blobs on the fly while writing them
+/// to disk, avoiding a double pass.
 pub const Hasher = struct {
     inner: Sha256,
 

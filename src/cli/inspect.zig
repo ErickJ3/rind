@@ -1,4 +1,4 @@
-//! `rind inspect <image>` subcommand (T12).
+//! `rind inspect <image>` subcommand.
 //!
 //! Read-side counterpart to `rind pull` / `rind images`: dumps the OCI
 //! image config JSON for a single locally-stored image. Resolution
@@ -14,8 +14,8 @@
 //! the project's `ImageConfig` model does not enumerate are still
 //! emitted.
 //!
-//! Local-only: never touches the registry. Closes the M1 read path
-//! together with T10 (`pull`) and T11 (`images`).
+//! Local-only: never touches the registry. Pairs with `rind pull`
+//! and `rind images` on the read side.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -52,7 +52,7 @@ pub const InspectError = error{
     RefNotFound,
     /// The matching descriptor's mediaType is not a single-platform
     /// manifest (e.g. it's an image-index). Inspect only resolves
-    /// single-manifest references in M1.
+    /// single-manifest references.
     UnsupportedMediaType,
 };
 

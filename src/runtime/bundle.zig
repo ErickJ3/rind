@@ -1,10 +1,10 @@
 //! OCI runtime bundle composer.
 //!
-//! T21 deliverable. `compose` writes `<bundle_dir>/config.json` per the
-//! OCI runtime spec v1.0.2. Defaults flow from the image-config (`Env`,
+//! `compose` writes `<bundle_dir>/config.json` per the OCI runtime
+//! spec v1.0.2. Defaults flow from the image-config (`Env`,
 //! `Entrypoint`, `Cmd`, `WorkingDir`, `User`); CLI overrides layer on
-//! top via the `RunOverrides` struct (T24 populates it; T22/T23 hand it
-//! through unchanged).
+//! top via the `RunOverrides` struct, populated by `cli/run.zig` and
+//! threaded through unchanged by the run orchestrator.
 //!
 //! The composed document is built as a Zig struct tree and rendered by
 //! `std.json.Stringify.value`. Field-order stability — required for the
@@ -17,10 +17,10 @@
 //! half-written config never lands on disk.
 //!
 //! Out of scope here:
-//!   - bind-mount overrides (T25),
-//!   - pty / `process.terminal=true` (T25),
-//!   - AppArmor / SELinux labels (M4),
-//!   - `--read-only` rootfs flag (v0.2 polish).
+//!   - bind-mount overrides,
+//!   - pty / `process.terminal=true`,
+//!   - AppArmor / SELinux labels,
+//!   - `--read-only` rootfs flag.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -40,9 +40,10 @@ pub const config_filename: []const u8 = "config.json";
 /// roadmap pins; v1.1+ fields are not emitted.
 pub const oci_version: []const u8 = "1.0.2";
 
-/// CLI-layered overrides. T24 (`rind run` arg parser) populates this;
-/// T22/T23 hand it through. Slice ownership: caller-borrowed for the
-/// duration of `compose` — no field is duped or freed by this module.
+/// CLI-layered overrides. `cli/run.zig` populates this; the run
+/// orchestrator hands it through. Slice ownership: caller-borrowed
+/// for the duration of `compose` — no field is duped or freed by
+/// this module.
 pub const RunOverrides = struct {
     /// Replaces `image_config.config.Entrypoint` when non-null.
     /// `&.{}` (length-zero non-null slice) means `--entrypoint ""` —
@@ -66,9 +67,8 @@ pub const RunOverrides = struct {
 /// uid/gid mapping path can surface `UserLookupFailed`,
 /// `SubidNotConfigured`, or `SubidMalformed` with their canonical
 /// names. Note: `compose` itself swallows these and falls back to a
-/// 1-entry mapping (preserves the M2 fallback path); the variants
-/// remain reachable when callers wire a custom `IdSource` that
-/// returns them on purpose.
+/// 1-entry mapping; the variants remain reachable when callers wire
+/// a custom `IdSource` that returns them on purpose.
 pub const BundleError = error{
     /// Neither image config nor overrides supplied any args. libcrun
     /// would reject the bundle later with `EINVAL`; we surface it now
@@ -76,8 +76,8 @@ pub const BundleError = error{
     /// message.
     EmptyArgs,
     /// `User` field couldn't be parsed as `""`, `<uid>`, or
-    /// `<uid>:<gid>` with both numeric. M2 doesn't resolve textual
-    /// usernames against the rootfs's `/etc/passwd`.
+    /// `<uid>:<gid>` with both numeric. Textual usernames against
+    /// the rootfs's `/etc/passwd` are not yet resolved.
     UnsupportedUserFormat,
     /// Env entry missing `=` or with an empty key. OCI spec mandates
     /// `KEY=VAL` and KEY non-empty.
@@ -124,7 +124,7 @@ pub const default_id_source: IdSource = .{
 /// Compose `<bundle_dir>/config.json` per OCI runtime spec v1.0.2.
 ///
 /// `bundle_dir` is an open `Io.Dir` handle to `<root>/bundles/<id>/`,
-/// which T19 (`state.allocate`) already created. `compose` writes
+/// which `state.allocate` already created. `compose` writes
 /// atomically (`createFileAtomic` + `link`) so partial writes never
 /// land on disk.
 pub fn compose(
@@ -381,15 +381,15 @@ fn parseUser(text: []const u8) BundleError!struct { uid: u32, gid: u32 } {
 /// `data/LICENSE.seccomp`.
 const seccomp_default_bytes: []const u8 = @embedFile("data/seccomp_default.json");
 
-/// Container env passed to the moby→OCI seccomp resolver. M2 runs
-/// every container with no extra caps (the bounding set is the
+/// Container env passed to the moby→OCI seccomp resolver. Today
+/// every container runs with no extra caps (the bounding set is the
 /// 14-cap docker default applied separately via
 /// `process.capabilities`); the resolver treats `caps_held` as the
 /// set of capabilities a `caps:` filter is allowed to require — empty
 /// here means cap-gated allows are dropped, which is the correct
-/// rootless behaviour. v0.2 will widen this when `--cap-add` lands.
+/// rootless behaviour. `--cap-add` plumbing is not yet implemented.
 const SeccompEnv = struct {
-    /// Effective cap set. Empty in M2.
+    /// Effective cap set. Currently empty (no `--cap-add` plumbing).
     caps_held: []const []const u8,
     /// Architecture family the container's processes execute under.
     /// Drives `archMap` lookup and per-syscall `arches` filters.
@@ -442,7 +442,7 @@ const MobyFilter = struct {
 ///   - otherwise the syscall ships through (with `args`/`errnoRet`).
 ///
 /// `minKernel` filters are intentionally treated as always-satisfied:
-/// rind's M2 runtime floor is Linux 5.11 (rootless overlayfs) which is
+/// rind's runtime floor is Linux 5.11 (rootless overlayfs) which is
 /// already past every minKernel value the upstream profile carries.
 fn resolveSeccomp(aa: Allocator, env: SeccompEnv) BundleError!Seccomp {
     const opts: std.json.ParseOptions = .{

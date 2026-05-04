@@ -1,4 +1,4 @@
-//! T06 — concurrent blob downloader.
+//! Concurrent blob downloader.
 //!
 //! Wraps a single `registry.Client` with a small worker pool so a
 //! caller can fetch N layers in parallel while sharing the underlying
@@ -9,11 +9,12 @@
 //! configuration.
 //!
 //! Zig 0.16.0 does not ship `std.Thread.Pool`; this module fills
-//! that gap with the minimal shape T06 needs and nothing more.
+//! that gap with the minimal shape this codebase needs and nothing
+//! more.
 //!
 //! `BlobJob` carries a pre-built absolute URL + auth scope rather
-//! than an `ImageRef`. T09 (or the test) is responsible for URL
-//! construction; the pool's only job is concurrency + result
+//! than an `ImageRef`. The orchestrator (or the test) is responsible
+//! for URL construction; the pool's only job is concurrency + result
 //! accounting.
 
 const std = @import("std");

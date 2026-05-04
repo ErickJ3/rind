@@ -72,8 +72,8 @@ pub const Credentials = struct {
 };
 
 /// Pluggable credentials source. Shaped like `std.mem.Allocator`'s
-/// vtable so a file-backed (`auth.json`, M4) provider can be dropped
-/// in with no API change.
+/// vtable so a file-backed (`auth.json`) provider can be dropped in
+/// with no API change.
 pub const Provider = struct {
     /// Opaque user data passed to `lookup_fn`. May be null for the
     /// `anonymous` provider.
@@ -102,8 +102,8 @@ fn anonymousLookup(_: ?*anyopaque, _: []const u8) ?Credentials {
 
 /// In-memory `Provider` backed by a hashmap from hostname to
 /// `Credentials`. Intended for tests and as a reference
-/// implementation; M4 will add a file-backed provider that reads
-/// `auth.json`.
+/// implementation; a file-backed provider that reads `auth.json` is
+/// not yet implemented.
 pub const StaticProvider = struct {
     map: std.StringHashMapUnmanaged(Credentials) = .empty,
 

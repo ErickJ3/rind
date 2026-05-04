@@ -9,13 +9,14 @@
 //!   4. Retry the original request with `Authorization: Bearer <tok>`.
 //!
 //! Tokens are cached per `(realm, service, scope)` in a thread-safe
-//! map so that T06's concurrent layer downloads share a single token
-//! per scope. The challenge parser, credentials provider, and
-//! `Authorization: Basic` helper live in `auth.zig`.
+//! map so concurrent layer downloads share a single token per scope.
+//! The challenge parser, credentials provider, and `Authorization:
+//! Basic` helper live in `auth.zig`.
 //!
-//! T04 owns transport only — manifest parsing is T05, blob streaming
-//! and concurrency live in T06. The mock-server tests in this file
-//! exercise only the auth machinery.
+//! This module owns transport only — manifest parsing lives in
+//! `manifest.zig`, blob streaming and concurrency in `blob_pool.zig`.
+//! The mock-server tests in this file exercise only the auth
+//! machinery.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -58,8 +59,8 @@ pub const RegistryError = error{
     BadTokenResponse,
     /// Any 4xx not specifically classified above.
     UnexpectedStatus,
-    /// 5xx response from the registry. T06 retries on this with
-    /// bounded backoff; other callers may treat it as terminal.
+    /// 5xx response from the registry. The blob pool retries on this
+    /// with bounded backoff; other callers may treat it as terminal.
     ServerError,
     /// Bearer challenge from the registry but the configured
     /// `Provider` returned no credentials. Distinct from
@@ -88,12 +89,12 @@ pub const FetchError =
 
 /// Single high-level request as input to `Client.fetch`.
 pub const Request = struct {
-    /// HTTP method (defaults to GET — the only one T04/T05/T06 use).
+    /// HTTP method (defaults to GET — the only verb used here).
     method: http.Method = .GET,
     /// Full URL (`http://...` or `https://...`).
     url: []const u8,
     /// Optional `Accept` header value, e.g. the comma-separated list
-    /// of manifest media types in T05.
+    /// of accepted manifest media types.
     accept: ?[]const u8 = null,
     /// Caller-owned headers added verbatim on every attempt.
     extra_headers: []const http.Header = &.{},
@@ -465,7 +466,7 @@ pub const Client = struct {
         while (true) {
             // Build the extra-headers slice on the stack. Cap at 8 —
             // we never compose more than user_agent + accept + auth +
-            // caller's extras (T05's Accept list is one header value).
+            // caller's extras (manifest's Accept list is one header value).
             var headers_buf: [8]http.Header = undefined;
             var n: usize = 0;
             headers_buf[n] = .{ .name = "user-agent", .value = self.user_agent };
@@ -709,8 +710,8 @@ pub const Client = struct {
             /// but the server replied 200 (full body) instead of 206.
             /// The caller's writer now contains a prefix from a prior
             /// attempt followed by a fresh full body — corrupt. The
-            /// caller (T09) is expected to truncate its sink and retry
-            /// from offset 0.
+            /// caller (the pull orchestrator) is expected to truncate
+            /// its sink and retry from offset 0.
             ResumeRangeRejected,
             /// All retries exhausted on transient errors.
             TooManyRetries,
@@ -992,9 +993,9 @@ fn writeUrlEncoded(w: *Io.Writer, text: []const u8) Io.Writer.Error!void {
     }
 }
 
-/// Thread-safe `(realm, service, scope)` → token map. T06 will hit
-/// this from N concurrent layer-download threads sharing a single
-/// `Client`; the mutex serialises all accesses.
+/// Thread-safe `(realm, service, scope)` → token map. The blob pool
+/// hits this from N concurrent layer-download threads sharing a
+/// single `Client`; the mutex serialises all accesses.
 const TokenCache = struct {
     mutex: Io.Mutex = .init,
     entries: std.StringHashMapUnmanaged(Entry) = .empty,
@@ -1229,7 +1230,7 @@ const ScriptStep = struct {
     /// no `authorization` was sent).
     head_not_contains: ?[]const u8 = null,
     /// Optional Range-header assertion: the request head must contain
-    /// `bytes=<N>-`. Used by T06 resume tests.
+    /// `bytes=<N>-`. Used by the resume tests.
     head_must_contain_range_start: ?u64 = null,
     status: http.Status = .ok,
     /// Extra headers to send back. Lifetimes managed by the test.
@@ -1246,8 +1247,8 @@ const ScriptStep = struct {
     /// with `truncate_at_bytes` or the digest-mismatch tests.
     content_length_override: ?u64 = null,
     /// Sleep this many milliseconds after parsing the request and
-    /// before responding. Used by T06's pool-concurrency test to
-    /// keep multiple requests "in flight" simultaneously.
+    /// before responding. Used by the pool-concurrency test to keep
+    /// multiple requests "in flight" simultaneously.
     before_respond_sleep_ms: u32 = 0,
 };
 
@@ -2230,8 +2231,6 @@ test "getManifest — MediaTypeMismatch when body mediaType disagrees with heade
     thread.join();
     if (ms.err) |e| return e;
 }
-
-// --- T06: blob GET tests --------------------------------------------------
 
 /// Generate a deterministic, non-trivial test blob: 4096 bytes whose
 /// content depends on the offset, so any truncation or substitution is

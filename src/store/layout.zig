@@ -18,7 +18,7 @@
 //! given store at a time. `createFileAtomic` is crash-safe but not
 //! linearizable for read-modify-write; two concurrent `tag` calls will
 //! both read index v1 and last-write-wins. Cross-process locking is
-//! deferred to M4.
+//! a future enhancement (not yet implemented).
 
 const std = @import("std");
 const Io = std.Io;
@@ -37,9 +37,9 @@ pub const Hasher = digest_mod.Hasher;
 pub const blobs_subpath: []const u8 = "blobs/sha256";
 
 /// Subpath, relative to the store root, under which extracted layer
-/// trees live (one subdirectory per layer digest). Owned by T07; the
-/// store itself does not create or manage this path — `Store.init`
-/// leaves it to the pull orchestrator (T09) to materialize on demand.
+/// trees live (one subdirectory per layer digest). The store itself
+/// does not create or manage this path — `Store.init` leaves it to
+/// the pull orchestrator to materialize on demand.
 pub const extracted_subpath: []const u8 = "extracted";
 
 /// `imageLayoutVersion` value the store writes and the only one it
@@ -426,7 +426,8 @@ pub const Store = struct {
 
     /// Remove the manifest entry whose
     /// `org.opencontainers.image.ref.name` matches `ref_name`. The
-    /// underlying blob is *not* deleted (garbage collection is M4).
+    /// underlying blob is *not* deleted (garbage collection is not
+    /// yet implemented).
     /// A missing ref is not an error.
     pub fn untag(
         self: *Store,

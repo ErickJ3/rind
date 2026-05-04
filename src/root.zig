@@ -4,7 +4,7 @@ const Io = std.Io;
 
 /// Image-layer modules: reference parsing, digest helpers, layer
 /// extraction, image-config decoding.
-pub const image = struct {
+pub const Image = struct {
     pub const ref = @import("image/ref.zig");
     pub const digest = @import("image/digest.zig");
     pub const extract = @import("image/extract.zig");
@@ -13,30 +13,30 @@ pub const image = struct {
 };
 
 /// On-disk store modules: OCI image layout, blob ingestion, indexing.
-pub const store = struct {
+pub const Store = struct {
     pub const layout = @import("store/layout.zig");
 };
 
 /// Registry client modules: HTTP transport with Bearer auth, manifest
-/// fetch (T05), blob fetch (T06).
-pub const registry = struct {
+/// fetch, blob fetch.
+pub const Registry = struct {
     pub const auth = @import("registry/auth.zig");
     pub const client = @import("registry/client.zig");
     pub const manifest = @import("registry/manifest.zig");
     pub const blob_pool = @import("registry/blob_pool.zig");
 };
 
-/// Pull orchestrator (T09): glue that wires ref → manifest → blob
-/// pool → extract → tag.
+/// Pull orchestrator: glue that wires ref → manifest → blob pool →
+/// extract → tag.
 pub const pull = @import("pull.zig");
 
-/// Run orchestrator (T23): glue that wires ref → store lookup →
-/// extract → state alloc → overlay mount → bundle compose → libcrun.
+/// Run orchestrator: glue that wires ref → store lookup → extract →
+/// state alloc → overlay mount → bundle compose → libcrun.
 pub const run = @import("run.zig");
 
-/// OCI runtime modules: typed Zig surface over libcrun (T18) and
-/// downstream container lifecycle helpers (T19+).
-pub const runtime = struct {
+/// OCI runtime modules: typed Zig surface over libcrun and downstream
+/// container lifecycle helpers.
+pub const Runtime = struct {
     pub const libcrun = @import("runtime/libcrun.zig");
     pub const state = @import("runtime/state.zig");
     pub const overlay = @import("runtime/overlay.zig");
@@ -61,22 +61,22 @@ test "basic add functionality" {
 }
 
 test {
-    _ = image.ref;
-    _ = image.digest;
-    _ = image.extract;
-    _ = image.extract_pool;
-    _ = image.config;
-    _ = store.layout;
-    _ = registry.auth;
-    _ = registry.client;
-    _ = registry.manifest;
-    _ = registry.blob_pool;
+    _ = Image.ref;
+    _ = Image.digest;
+    _ = Image.extract;
+    _ = Image.extract_pool;
+    _ = Image.config;
+    _ = Store.layout;
+    _ = Registry.auth;
+    _ = Registry.client;
+    _ = Registry.manifest;
+    _ = Registry.blob_pool;
     _ = pull;
     _ = run;
-    _ = runtime.libcrun;
-    _ = runtime.state;
-    _ = runtime.overlay;
-    _ = runtime.bundle;
-    _ = runtime.core;
-    _ = runtime.subid;
+    _ = Runtime.libcrun;
+    _ = Runtime.state;
+    _ = Runtime.overlay;
+    _ = Runtime.bundle;
+    _ = Runtime.core;
+    _ = Runtime.subid;
 }

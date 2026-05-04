@@ -2,10 +2,10 @@
 //!
 //! Owns ID generation, the per-container directory triplet under
 //! `~/.rind/{containers,bundles,overlays}/<id>/`, and the initial
-//! `state.json`. T26 grows `state.json` with `pid` / status
-//! transitions; this module only fills the M2-static fields
+//! `state.json`. This module only fills the static fields
 //! (`id`, `id_full`, optional `name`, `image_ref`, `image_digest`,
-//! `status: "created"`, `started_at`).
+//! `status: "created"`, `started_at`); `pid` / status transitions
+//! are not yet implemented.
 //!
 //! ID derivation: `sha256(realtime_ns_be ‖ 16 random bytes)` →
 //! lowercase hex; first 12 chars are the Docker-style short ID,
@@ -93,8 +93,8 @@ pub const Container = struct {
     id: [id_short_length]u8,
     /// 64-char full hex ID. Recorded inside `state.json`.
     id_full: [id_full_length]u8,
-    /// Optional human name. M2 always passes `null`; M4 will wire
-    /// `--name` and enforce uniqueness.
+    /// Optional human name. Currently always `null`; `--name` and
+    /// uniqueness enforcement are not yet wired.
     name: ?[]const u8 = null,
     /// Image ref string the container was allocated for
     /// (e.g. `alpine:3.19`).
@@ -117,23 +117,23 @@ pub const Container = struct {
 };
 
 /// Persisted shape of `state.json`. Field names are the canonical
-/// snake_case wire form. T26 will grow this with `pid`,
-/// `exit_code`, `signal`; `allocate` only fills the M2-static
-/// subset below, which is the only shape readers should expect on
-/// disk during M2.
+/// snake_case wire form. Future fields (`pid`, `exit_code`,
+/// `signal`) are not yet implemented; `allocate` only fills the
+/// static subset below, which is the only shape readers should
+/// expect on disk today.
 pub const StatePersisted = struct {
     /// Short 12-char ID.
     id: []const u8,
     /// Full 64-char hex ID.
     id_full: []const u8,
-    /// Human name (null in M2).
+    /// Human name (currently always null).
     name: ?[]const u8 = null,
     /// Image ref string.
     image_ref: []const u8,
     /// Image manifest digest (`sha256:<hex>`).
     image_digest: []const u8,
-    /// Lifecycle status. Initialised to `"created"` here; T26 walks
-    /// it through `"running"` / `"exited"`.
+    /// Lifecycle status. Initialised to `"created"` here; the
+    /// `"running"` / `"exited"` walk is not yet implemented.
     status: []const u8 = initial_status,
     /// Allocation timestamp (RFC 3339 UTC).
     started_at: []const u8,
@@ -155,7 +155,7 @@ pub const AllocateError =
 ///
 /// On success, three sibling directories exist on disk under
 /// `root` (`containers/<id>`, `bundles/<id>`, `overlays/<id>`),
-/// and `<root>/containers/<id>/state.json` carries the M2-static
+/// and `<root>/containers/<id>/state.json` carries the static
 /// fields. `image_ref`, `image_digest`, and `name` (if any) are
 /// heap-duped onto `gpa`; the caller frees via `Container.deinit`.
 ///

@@ -22,13 +22,13 @@ const digest_mod = @import("../image/digest.zig");
 /// Stable JSON event-stream version. Bumping this is a contract
 /// break; any consumer (miru) keys behavior off it.
 ///
-/// v2 (T14): introduced the `pull_started` event and rearranged
+/// v2: introduced the `pull_started` event and rearranged
 /// `blob_done` emission so non-cached slots fire as each blob lands
 /// rather than after the whole pool joins. Cached slots fire
 /// `blob_done` before the pool runs. Field shapes for existing
 /// events are unchanged.
 ///
-/// v3 (T18): non-cached `blob_done` and `extracted` are now emitted
+/// v3: non-cached `blob_done` and `extracted` are now emitted
 /// from worker threads (download / extract pools) in completion
 /// order rather than slot order. The two event kinds may also
 /// interleave because layer extraction now runs in parallel with
@@ -68,9 +68,9 @@ pub const Renderer = struct {
     on_event: *const fn (?*anyopaque, pull_mod.PullEvent) Io.Writer.Error!void,
     /// Called once after the pull orchestrator returns successfully.
     on_summary: *const fn (?*anyopaque, SummaryInput) Io.Writer.Error!void,
-    /// Called once per `RunEvent` in orchestrator-order. T24.
+    /// Called once per `RunEvent` in orchestrator-order.
     on_run_event: *const fn (?*anyopaque, run_mod.RunEvent) Io.Writer.Error!void,
-    /// Called once after the run orchestrator returns successfully. T24.
+    /// Called once after the run orchestrator returns successfully.
     on_run_summary: *const fn (?*anyopaque, RunSummaryInput) Io.Writer.Error!void,
     /// Called when the handler is about to return a non-zero exit
     /// code. `msg` is a short user-facing description; renderers may

@@ -63,66 +63,93 @@ pub const ImageRef = struct {
 /// rules. The returned `ImageRef` owns its strings via `allocator`.
 pub fn parse(allocator: Allocator, text: []const u8) ParseError!ImageRef {
     if (text.len == 0) return ParseError.Empty;
+    const ds = try splitDigest(text);
+    const ts = try splitTag(ds.head);
+    const rs = try splitRegistry(ts.name);
+    return materialize(allocator, .{
+        .registry = rs.registry,
+        .repository = rs.repo,
+        .tag = ts.tag,
+        .digest = ds.digest,
+    });
+}
 
-    // 1. Split off optional digest at the last `@`.
-    var digest_view: ?[]const u8 = null;
-    var head: []const u8 = text;
+const DigestSplit = struct { head: []const u8, digest: ?[]const u8 };
+const TagSplit = struct { name: []const u8, tag: ?[]const u8 };
+const RegistrySplit = struct { registry: []const u8, repo: []const u8 };
+const Views = struct {
+    registry: []const u8,
+    repository: []const u8,
+    tag: ?[]const u8,
+    digest: ?[]const u8,
+};
+
+fn splitDigest(text: []const u8) ParseError!DigestSplit {
     if (std.mem.lastIndexOfScalar(u8, text, '@')) |at| {
-        digest_view = text[at + 1 ..];
-        head = text[0..at];
-        try validateDigest(digest_view.?);
+        const digest = text[at + 1 ..];
+        try validateDigest(digest);
+        const head = text[0..at];
+        if (head.len == 0) return ParseError.InvalidRepository;
+        return .{ .head = head, .digest = digest };
     }
-    if (head.len == 0) return ParseError.InvalidRepository;
+    return .{ .head = text, .digest = null };
+}
 
-    // 2. Split off optional tag. Tag separator is the last `:` that
-    // appears after the last `/` (or anywhere, if there is no `/`).
-    var tag_view: ?[]const u8 = null;
-    var name_part: []const u8 = head;
+fn splitTag(head: []const u8) ParseError!TagSplit {
+    // Tag separator is the last `:` that appears after the last `/`
+    // (or anywhere, if there is no `/`).
     if (std.mem.lastIndexOfScalar(u8, head, ':')) |colon| {
         const last_slash = std.mem.lastIndexOfScalar(u8, head, '/');
         const colon_is_tag = if (last_slash) |s| colon > s else true;
         if (colon_is_tag) {
-            tag_view = head[colon + 1 ..];
-            name_part = head[0..colon];
-            try validateTag(tag_view.?);
+            const tag = head[colon + 1 ..];
+            try validateTag(tag);
+            const name = head[0..colon];
+            if (name.len == 0) return ParseError.InvalidRepository;
+            return .{ .name = name, .tag = tag };
         }
     }
-    if (name_part.len == 0) return ParseError.InvalidRepository;
+    if (head.len == 0) return ParseError.InvalidRepository;
+    return .{ .name = head, .tag = null };
+}
 
-    // 3. Split off optional registry. Heuristic: the head segment of a
-    // `head/tail` split is the registry iff it contains `.` or `:`, or
-    // it equals `localhost`.
-    var registry_view: []const u8 = default_registry;
-    var repo_view: []const u8 = name_part;
-    if (std.mem.indexOfScalar(u8, name_part, '/')) |slash| {
-        const candidate = name_part[0..slash];
+fn splitRegistry(name: []const u8) ParseError!RegistrySplit {
+    // Heuristic: the head segment of a `head/tail` split is the registry
+    // iff it contains `.` or `:`, or it equals `localhost`.
+    var registry: []const u8 = default_registry;
+    var repo: []const u8 = name;
+    if (std.mem.indexOfScalar(u8, name, '/')) |slash| {
+        const candidate = name[0..slash];
         if (looksLikeRegistry(candidate)) {
-            registry_view = candidate;
-            repo_view = name_part[slash + 1 ..];
+            registry = candidate;
+            repo = name[slash + 1 ..];
         }
     }
-    try validateRegistry(registry_view);
-    if (repo_view.len == 0) return ParseError.InvalidRepository;
-    try validateRepository(repo_view);
+    try validateRegistry(registry);
+    if (repo.len == 0) return ParseError.InvalidRepository;
+    try validateRepository(repo);
+    return .{ .registry = registry, .repo = repo };
+}
 
-    // 4. Materialize. Library expansion only applies on `docker.io`
-    // when the repository has no `/` separator.
-    const needs_library = std.mem.eql(u8, registry_view, default_registry) and
-        std.mem.indexOfScalar(u8, repo_view, '/') == null;
+fn materialize(allocator: Allocator, v: Views) ParseError!ImageRef {
+    // Library expansion only applies on `docker.io` when the repository
+    // has no `/` separator.
+    const needs_library = std.mem.eql(u8, v.registry, default_registry) and
+        std.mem.indexOfScalar(u8, v.repository, '/') == null;
 
-    const registry_owned = try allocator.dupe(u8, registry_view);
+    const registry_owned = try allocator.dupe(u8, v.registry);
     errdefer allocator.free(registry_owned);
 
     const repository_owned = if (needs_library)
-        try std.fmt.allocPrint(allocator, "{s}/{s}", .{ library_namespace, repo_view })
+        try std.fmt.allocPrint(allocator, "{s}/{s}", .{ library_namespace, v.repository })
     else
-        try allocator.dupe(u8, repo_view);
+        try allocator.dupe(u8, v.repository);
     errdefer allocator.free(repository_owned);
 
-    const tag_owned: ?[]const u8 = if (tag_view) |t| try allocator.dupe(u8, t) else null;
+    const tag_owned: ?[]const u8 = if (v.tag) |t| try allocator.dupe(u8, t) else null;
     errdefer if (tag_owned) |t| allocator.free(t);
 
-    const digest_owned: ?[]const u8 = if (digest_view) |d| try allocator.dupe(u8, d) else null;
+    const digest_owned: ?[]const u8 = if (v.digest) |d| try allocator.dupe(u8, d) else null;
 
     return ImageRef{
         .registry = registry_owned,
