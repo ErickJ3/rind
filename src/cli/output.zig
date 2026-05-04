@@ -204,28 +204,32 @@ pub const Human = struct {
     }
 
     fn onRunEvent(ctx: ?*anyopaque, ev: run_mod.RunEvent) Io.Writer.Error!void {
-        const self: *Human = @ptrCast(@alignCast(ctx.?));
-        if (self.quiet) return;
+        _ = ctx;
+        // Default human output for `rind run` matches Docker: only the
+        // container's own stdout/stderr lands on stdout. Per-step
+        // progress drops to debug logs on stderr (gated by
+        // `RIND_LOG=rind=debug` via `main.rindLogFn`), so pipelines
+        // (`rind run … | wc -l`) stay clean and the renderer doesn't
+        // shout over short-lived containers like `echo hi`. The JSON
+        // renderer below keeps the full event stream — that's the
+        // machine-readable contract miru consumes.
         switch (ev) {
-            .run_started => |r| {
-                try self.writer.print("Running {s} (id {s})\n", .{ r.ref, r.id[0..] });
-            },
-            .overlay_mounted => try self.writer.writeAll("overlay mounted\n"),
-            .bundle_ready => try self.writer.writeAll("bundle ready\n"),
-            .started => |s| try self.writer.print("started (pid {d})\n", .{s.pid}),
-            .exited => |e| try self.writer.print("exited code={d} signal={d}\n", .{ e.code, e.signal }),
-            .removed => try self.writer.writeAll("removed\n"),
+            .run_started => |r| std.log.debug("run_started ref={s} id={s}", .{ r.ref, r.id[0..] }),
+            .overlay_mounted => std.log.debug("overlay_mounted", .{}),
+            .bundle_ready => std.log.debug("bundle_ready", .{}),
+            .started => |s| std.log.debug("started pid={d}", .{s.pid}),
+            .exited => |e| std.log.debug("exited code={d} signal={d}", .{ e.code, e.signal }),
+            .removed => std.log.debug("removed", .{}),
         }
-        try self.writer.flush();
     }
 
     fn onRunSummary(ctx: ?*anyopaque, sum: RunSummaryInput) Io.Writer.Error!void {
-        const self: *Human = @ptrCast(@alignCast(ctx.?));
-        try self.writer.print(
-            "Container {s} exited (code={d}, signal={d})\n",
-            .{ sum.result.container_id[0..], sum.result.exit_code, sum.result.signal },
-        );
-        try self.writer.flush();
+        _ = ctx;
+        std.log.debug("run_summary id={s} code={d} signal={d}", .{
+            sum.result.container_id[0..],
+            sum.result.exit_code,
+            sum.result.signal,
+        });
     }
 };
 
@@ -632,7 +636,7 @@ test "writeRunEvent JSON snapshot — full sequence" {
     try testing.expectEqualStrings(expected, buf.written());
 }
 
-test "human renderer formats run events terse" {
+test "human renderer is silent on run events (Docker parity)" {
     const gpa = testing.allocator;
     var out: Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -650,15 +654,12 @@ test "human renderer formats run events terse" {
     try r.on_run_event(r.ctx, .{ .exited = .{ .code = 0, .signal = 0 } });
     try r.on_run_event(r.ctx, .removed);
 
-    try testing.expect(std.mem.indexOf(u8, out.written(), "Running alpine:3.19 (id abc123def456)") != null);
-    try testing.expect(std.mem.indexOf(u8, out.written(), "overlay mounted") != null);
-    try testing.expect(std.mem.indexOf(u8, out.written(), "bundle ready") != null);
-    try testing.expect(std.mem.indexOf(u8, out.written(), "started (pid 0)") != null);
-    try testing.expect(std.mem.indexOf(u8, out.written(), "exited code=0 signal=0") != null);
-    try testing.expect(std.mem.indexOf(u8, out.written(), "removed") != null);
+    // Default human writes nothing — progress lives in std.log.debug,
+    // gated on `RIND_LOG=rind=debug` by `main.rindLogFn`.
+    try testing.expectEqual(@as(usize, 0), out.written().len);
 }
 
-test "human renderer run summary line" {
+test "human renderer is silent on run summary (Docker parity)" {
     const gpa = testing.allocator;
     var out: Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -676,7 +677,7 @@ test "human renderer run summary line" {
         .removed = true,
     };
     try r.on_run_summary(r.ctx, .{ .ref = "alpine:3.19", .result = &result });
-    try testing.expect(std.mem.indexOf(u8, out.written(), "Container abc123def456 exited (code=0, signal=0)") != null);
+    try testing.expectEqual(@as(usize, 0), out.written().len);
 }
 
 test "writeJsonString escapes the small set we care about" {

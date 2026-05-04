@@ -722,8 +722,10 @@ test "run drives renderer and reports success — human" {
     );
 
     try testing.expectEqual(@as(u8, 0), code);
-    try testing.expect(std.mem.indexOf(u8, out_buf.written(), "Running alpine:3.19") != null);
-    try testing.expect(std.mem.indexOf(u8, out_buf.written(), "Container abc123def456 exited (code=0, signal=0)") != null);
+    // Default human renderer is silent — container stdout is the only
+    // thing rind itself writes (none here, the stub doesn't simulate
+    // it). Run progress lives behind `RIND_LOG=rind=debug`.
+    try testing.expectEqual(@as(usize, 0), out_buf.written().len);
 }
 
 test "run drives renderer and reports success — JSON snapshot" {
@@ -896,7 +898,9 @@ test "run --rm emits removed event and reports removed=true in summary" {
         &r,
         .{ .run_fn = stubRunSuccess },
     );
-    try testing.expect(std.mem.indexOf(u8, out_buf.written(), "removed") != null);
+    // Default human is silent. The `removed` event still flows through
+    // the JSON renderer (verified in the JSON snapshot test above).
+    try testing.expectEqual(@as(usize, 0), out_buf.written().len);
 }
 
 test "run forwards orchestrator errors and maps to exit codes" {
