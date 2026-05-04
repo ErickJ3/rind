@@ -1,6 +1,6 @@
 docs/
 .zig-cache/
-.rtk
+.rtk/
 zig-out/
 .claude
 zig-pkg/
