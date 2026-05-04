@@ -40,6 +40,11 @@ const Allocator = std.mem.Allocator;
 const linux = std.os.linux;
 const posix = std.posix;
 
+const subid_mod = @import("subid.zig");
+/// Re-export so `runtime/bundle.zig` and the overlay code path agree on
+/// the same type without each importing `subid.zig` separately.
+pub const SubidRange = subid_mod.Range;
+
 /// Maximum length of the overlay options string the kernel will accept
 /// in a single `mount(2)` call. The kernel page-bounds the `data`
 /// argument; 4096 is the conservative documented limit and the value
@@ -91,13 +96,6 @@ pub const OverlayError = error{
     /// Parent process could not `setns(2)` into the helper's user or
     /// mount namespace (typically `EPERM` if the helper exited early).
     SetnsFailed,
-    /// `/etc/subuid` or `/etc/subgid` has no entry for the calling
-    /// user. Configure with `usermod --add-subuids` (or distro-specific
-    /// equivalent) or run as root.
-    SubidNotConfigured,
-    /// `/etc/sub{u,g}id` line for the calling user is malformed
-    /// (missing `:` separators or non-numeric ranges).
-    SubidMalformed,
     /// `newuidmap` / `newgidmap` not on `PATH` (or unreadable). On most
     /// distros these ship with the `shadow-utils` / `uidmap` package
     /// and need to be suid root.
@@ -106,16 +104,10 @@ pub const OverlayError = error{
     /// suid bit missing, `/etc/sub{u,g}id` range smaller than what we
     /// asked to map, or a mismatched username argument.
     NewuidmapFailed,
-    /// `/etc/passwd` has no line whose `uid` field matches `geteuid()`.
-    /// Indicates a hostile or stripped passwd database; not expected in
-    /// normal deployments.
-    UserLookupFailed,
     /// Sync read/write between parent and helper child failed (the
     /// socketpair was closed unexpectedly, child died, etc.).
     ChildSyncFailed,
-    /// Allocator failure while building options or owned paths.
-    OutOfMemory,
-};
+} || subid_mod.SubidError;
 
 /// Live overlay handle returned by `mount`. The mount is held in the
 /// process's mount namespace (which, in the rootless flow, is a fresh
@@ -133,9 +125,21 @@ pub const MountedOverlay = struct {
     /// Absolute path to the workdir. Freed by `deinit`.
     work_path: []u8,
     /// `true` when `mount` joined a fresh user+mount namespace as part
-    /// of the rootless flow. Diagnostic only; `unmount` is identical
-    /// regardless.
+    /// of the rootless flow. Bundle composer keys mapping shape off
+    /// this — joined_userns means we view the host id space through
+    /// `newuidmap`'s mapping, so OCI `linux.uidMappings.hostID` values
+    /// are joined-userns ids (0 + 1..1+sub_uid.count), not the
+    /// original host ids.
     joined_userns: bool,
+    /// Subuid range from `/etc/subuid` matched against the calling
+    /// user, captured before the namespace dance. `null` on the
+    /// privileged path. Bundle uses `.count` to emit a second
+    /// `linux.uidMappings` entry whose `hostID` is `1` (the offset
+    /// inside the joined userns where `newuidmap` mapped it).
+    host_sub_uid: ?subid_mod.Range,
+    /// Subgid range from `/etc/subgid`. Same conventions as
+    /// `host_sub_uid`; `null` on the privileged path.
+    host_sub_gid: ?subid_mod.Range,
 
     /// Frees the owned path slices. Safe to call exactly once.
     pub fn deinit(self: *MountedOverlay) void {
@@ -185,16 +189,20 @@ pub fn mount(
             .upper_path = upper_path,
             .work_path = work_path,
             .joined_userns = false,
+            .host_sub_uid = null,
+            .host_sub_gid = null,
         };
     }
 
-    try mountRootless(gpa, io, merged_path, opts);
+    const captured = try mountRootless(gpa, io, merged_path, opts);
     return .{
         .allocator = gpa,
         .merged_path = merged_path,
         .upper_path = upper_path,
         .work_path = work_path,
         .joined_userns = true,
+        .host_sub_uid = captured.sub_uid,
+        .host_sub_gid = captured.sub_gid,
     };
 }
 
@@ -289,7 +297,7 @@ fn mountRootless(
     io: Io,
     merged_path: [:0]const u8,
     opts: [:0]const u8,
-) OverlayError!void {
+) OverlayError!struct { sub_uid: SubidRange, sub_gid: SubidRange } {
     // Resolve the calling user's name and subuid/subgid ranges before
     // forking. Failure modes here are pure user-config errors.
     const euid = linux.geteuid();
@@ -337,6 +345,8 @@ fn mountRootless(
         _ = linux.waitpid(child_pid, &status, 0);
         return err;
     };
+
+    return .{ .sub_uid = sub_uid, .sub_gid = sub_gid };
 }
 
 fn parentDance(
@@ -444,91 +454,12 @@ fn openProcNs(path_z: [:0]const u8) ?i32 {
     };
 }
 
-/// Parsed range from a single `/etc/sub{u,g}id` line.
-const SubidRange = struct {
-    start: u32,
-    count: u32,
-};
-
-fn lookupUsernameAlloc(
-    io: Io,
-    gpa: Allocator,
-    passwd_path: []const u8,
-    target_uid: linux.uid_t,
-) OverlayError![]u8 {
-    const bytes = Io.Dir.cwd().readFileAlloc(io, passwd_path, gpa, .limited(1 << 20)) catch
-        return OverlayError.UserLookupFailed;
-    defer gpa.free(bytes);
-
-    return parsePasswdForUser(gpa, bytes, target_uid);
-}
-
-fn parsePasswdForUser(
-    gpa: Allocator,
-    passwd: []const u8,
-    target_uid: linux.uid_t,
-) OverlayError![]u8 {
-    var lines = std.mem.splitScalar(u8, passwd, '\n');
-    while (lines.next()) |line| {
-        if (line.len == 0 or line[0] == '#') continue;
-
-        // Format: name:passwd:uid:gid:gecos:home:shell
-        var fields = std.mem.splitScalar(u8, line, ':');
-        const name = fields.next() orelse continue;
-        _ = fields.next() orelse continue; // passwd
-        const uid_str = fields.next() orelse continue;
-
-        const uid = std.fmt.parseInt(u32, uid_str, 10) catch continue;
-        if (uid == target_uid) {
-            return gpa.dupe(u8, name) catch return OverlayError.OutOfMemory;
-        }
-    }
-    return OverlayError.UserLookupFailed;
-}
-
-fn lookupSubidAlloc(
-    io: Io,
-    gpa: Allocator,
-    path: []const u8,
-    username: []const u8,
-    numeric_id: u32,
-) OverlayError!SubidRange {
-    const bytes = Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20)) catch
-        return OverlayError.SubidNotConfigured;
-    defer gpa.free(bytes);
-    return parseSubid(bytes, username, numeric_id);
-}
-
-fn parseSubid(
-    subid: []const u8,
-    username: []const u8,
-    numeric_id: u32,
-) OverlayError!SubidRange {
-    var lines = std.mem.splitScalar(u8, subid, '\n');
-    while (lines.next()) |line| {
-        if (line.len == 0 or line[0] == '#') continue;
-
-        // Format: <name-or-uid>:<start>:<count>
-        var fields = std.mem.splitScalar(u8, line, ':');
-        const owner = fields.next() orelse continue;
-        const start_str = fields.next() orelse return OverlayError.SubidMalformed;
-        const count_str = fields.next() orelse return OverlayError.SubidMalformed;
-
-        const matches_name = std.mem.eql(u8, owner, username);
-        const matches_id = blk: {
-            const parsed = std.fmt.parseInt(u32, owner, 10) catch break :blk false;
-            break :blk parsed == numeric_id;
-        };
-        if (!(matches_name or matches_id)) continue;
-
-        const start = std.fmt.parseInt(u32, start_str, 10) catch
-            return OverlayError.SubidMalformed;
-        const count = std.fmt.parseInt(u32, count_str, 10) catch
-            return OverlayError.SubidMalformed;
-        return .{ .start = start, .count = count };
-    }
-    return OverlayError.SubidNotConfigured;
-}
+// `SubidRange`, `parsePasswd`, `parseSubid`, `lookupUsernameAlloc`, and
+// `lookupSubidAlloc` live in `subid.zig` so the bundle composer can
+// reuse them when emitting multi-line OCI `linux.uidMappings`. Local
+// aliases keep the call sites below short.
+const lookupUsernameAlloc = subid_mod.lookupUsernameAlloc;
+const lookupSubidAlloc = subid_mod.lookupSubidAlloc;
 
 // Helper-existence pre-flight: cheaper to defer to `std.process.run`,
 // which surfaces `error.FileNotFound` from the OS exec when the binary
@@ -685,67 +616,8 @@ test "buildOptions: rejects payloads exceeding max_options_bytes" {
     try testing.expectError(OverlayError.LowerdirsTooLong, result);
 }
 
-test "parsePasswdForUser: matches the calling uid line" {
-    const passwd =
-        \\root:x:0:0:root:/root:/bin/bash
-        \\bin:x:1:1:bin:/bin:/usr/sbin/nologin
-        \\alice:x:1000:1000:Alice:/home/alice:/bin/bash
-        \\
-    ;
-    const name = try parsePasswdForUser(testing.allocator, passwd, 1000);
-    defer testing.allocator.free(name);
-    try testing.expectEqualStrings("alice", name);
-}
-
-test "parsePasswdForUser: returns UserLookupFailed when uid absent" {
-    const passwd = "root:x:0:0::/root:/bin/sh\n";
-    const result = parsePasswdForUser(testing.allocator, passwd, 4242);
-    try testing.expectError(OverlayError.UserLookupFailed, result);
-}
-
-test "parsePasswdForUser: ignores comments and blank lines" {
-    const passwd =
-        \\# system users
-        \\
-        \\bob:x:1001:1001::/home/bob:/bin/sh
-        \\
-    ;
-    const name = try parsePasswdForUser(testing.allocator, passwd, 1001);
-    defer testing.allocator.free(name);
-    try testing.expectEqualStrings("bob", name);
-}
-
-test "parseSubid: matches by username" {
-    const subid = "alice:100000:65536\nbob:165536:65536\n";
-    const r = try parseSubid(subid, "alice", 1000);
-    try testing.expectEqual(@as(u32, 100000), r.start);
-    try testing.expectEqual(@as(u32, 65536), r.count);
-}
-
-test "parseSubid: matches by numeric uid" {
-    const subid = "1000:200000:65536\n";
-    const r = try parseSubid(subid, "anyone", 1000);
-    try testing.expectEqual(@as(u32, 200000), r.start);
-    try testing.expectEqual(@as(u32, 65536), r.count);
-}
-
-test "parseSubid: SubidNotConfigured when nothing matches" {
-    const subid = "carol:1000000:65536\n";
-    const result = parseSubid(subid, "alice", 1000);
-    try testing.expectError(OverlayError.SubidNotConfigured, result);
-}
-
-test "parseSubid: SubidMalformed on missing range fields" {
-    const subid = "alice:100000\n";
-    const result = parseSubid(subid, "alice", 1000);
-    try testing.expectError(OverlayError.SubidMalformed, result);
-}
-
-test "parseSubid: SubidMalformed on non-numeric range" {
-    const subid = "alice:NaN:65536\n";
-    const result = parseSubid(subid, "alice", 1000);
-    try testing.expectError(OverlayError.SubidMalformed, result);
-}
+// Subid + passwd parser tests live in `runtime/subid.zig` alongside
+// the parser definitions. Reach them through that module's test block.
 
 test "parseKernelMinAtLeast: 5.11 trims trailing newline" {
     try testing.expect(parseKernelMinAtLeast("5.11.0-generic\n", 5, 11));

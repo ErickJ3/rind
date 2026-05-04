@@ -587,6 +587,8 @@ const StubOverlay = struct {
             .upper_path = upper,
             .work_path = work,
             .joined_userns = false,
+            .host_sub_uid = null,
+            .host_sub_gid = null,
         };
     }
     fn unmount(io: Io, mounted: *overlay_mod.MountedOverlay) overlay_mod.OverlayError!void {

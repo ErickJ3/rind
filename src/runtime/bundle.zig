@@ -19,7 +19,6 @@
 //! Out of scope here:
 //!   - bind-mount overrides (T25),
 //!   - pty / `process.terminal=true` (T25),
-//!   - subuid/subgid range mapping beyond a single 1:1 line (M4),
 //!   - AppArmor / SELinux labels (M4),
 //!   - `--read-only` rootfs flag (v0.2 polish).
 
@@ -31,6 +30,7 @@ const Allocator = std.mem.Allocator;
 const image_config = @import("../image/config.zig");
 const state_mod = @import("state.zig");
 const overlay_mod = @import("overlay.zig");
+const subid_mod = @import("subid.zig");
 
 /// File name written under `bundle_dir`. The OCI runtime spec mandates
 /// this exact name; libcrun looks for it by string literal.
@@ -61,6 +61,14 @@ pub const RunOverrides = struct {
 
 /// Closed semantic error set composed at the public entry. Filesystem
 /// and JSON-encoding errors propagate through the same return type.
+///
+/// `subid_mod.SubidError` is folded in so the optional 2-entry
+/// uid/gid mapping path can surface `UserLookupFailed`,
+/// `SubidNotConfigured`, or `SubidMalformed` with their canonical
+/// names. Note: `compose` itself swallows these and falls back to a
+/// 1-entry mapping (preserves the M2 fallback path); the variants
+/// remain reachable when callers wire a custom `IdSource` that
+/// returns them on purpose.
 pub const BundleError = error{
     /// Neither image config nor overrides supplied any args. libcrun
     /// would reject the bundle later with `EINVAL`; we surface it now
@@ -78,31 +86,39 @@ pub const BundleError = error{
     /// build-time mistake (file replaced with a non-OCI shape).
     InvalidSeccompProfile,
 } ||
+    subid_mod.SubidError ||
     Allocator.Error ||
     Io.Dir.CreateFileAtomicError ||
     Io.File.Atomic.LinkError ||
     Io.File.Writer.Error ||
     std.json.Stringify.Error;
 
-/// Hook for resolving the host euid that lands in the single
-/// `uidMappings`/`gidMappings` line. Default reads `posix.geteuid()`;
-/// tests inject a fixed value so the snapshot fixture is deterministic.
-pub const EuidSource = struct {
-    fetch: *const fn (ctx: ?*anyopaque) u32,
+/// Hook for resolving the uid/gid that lands in the 1-entry mapping
+/// line. Test seam — production reads `geteuid` / `getegid` directly.
+/// Subuid/subgid ranges come off the `MountedOverlay` parameter (the
+/// rootless mount path captures them before joining the user
+/// namespace); see `resolveIdMappings` for shape rules.
+pub const IdSource = struct {
+    fetchUid: *const fn (ctx: ?*anyopaque) u32,
+    fetchGid: *const fn (ctx: ?*anyopaque) u32,
     ctx: ?*anyopaque = null,
 };
 
-fn defaultEuidFetch(ctx: ?*anyopaque) u32 {
+fn defaultUidFetch(ctx: ?*anyopaque) u32 {
     _ = ctx;
-    // `std.posix.geteuid` is not surfaced in Zig 0.16; the linux
-    // syscall wrapper is the canonical source. Matches `overlay.zig`.
     return @intCast(std.os.linux.geteuid());
 }
 
-/// Default resolver for `euid_source`. Reads the live host euid.
-pub const default_euid_source: EuidSource = .{
-    .fetch = defaultEuidFetch,
-    .ctx = null,
+fn defaultGidFetch(ctx: ?*anyopaque) u32 {
+    _ = ctx;
+    return @intCast(std.os.linux.getegid());
+}
+
+/// Default resolver. Reads the live host uid/gid via the linux syscall
+/// wrappers (matches `runtime/overlay.zig`).
+pub const default_id_source: IdSource = .{
+    .fetchUid = defaultUidFetch,
+    .fetchGid = defaultGidFetch,
 };
 
 /// Compose `<bundle_dir>/config.json` per OCI runtime spec v1.0.2.
@@ -120,12 +136,13 @@ pub fn compose(
     overrides: RunOverrides,
     overlay: overlay_mod.MountedOverlay,
 ) BundleError!void {
-    return composeWithEuid(io, gpa, bundle_dir, container, img_cfg, overrides, overlay, default_euid_source);
+    return composeWithIds(io, gpa, bundle_dir, container, img_cfg, overrides, overlay, default_id_source);
 }
 
-/// Test-friendly variant: caller-supplied `euid_source` replaces the
-/// `posix.geteuid()` lookup. Production code calls `compose` instead.
-pub fn composeWithEuid(
+/// Test-friendly variant: caller-supplied `id_source` replaces the
+/// `geteuid` / `getegid` / `/etc/sub{u,g}id` lookups. Production code
+/// calls `compose` instead.
+pub fn composeWithIds(
     io: Io,
     gpa: Allocator,
     bundle_dir: Io.Dir,
@@ -133,7 +150,7 @@ pub fn composeWithEuid(
     img_cfg: image_config.ImageConfig,
     overrides: RunOverrides,
     overlay: overlay_mod.MountedOverlay,
-    euid_source: EuidSource,
+    id_source: IdSource,
 ) BundleError!void {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -158,7 +175,10 @@ pub fn composeWithEuid(
         .image_arch = imageArchToSeccomp(img_cfg.architecture),
     });
 
-    const euid: u32 = euid_source.fetch(euid_source.ctx);
+    const euid: u32 = id_source.fetchUid(id_source.ctx);
+    const egid: u32 = id_source.fetchGid(id_source.ctx);
+
+    const id_maps = try resolveIdMappings(aa, overlay, euid, egid);
 
     var cgroups_buf: [96]u8 = undefined;
     const cgroups_path = std.fmt.bufPrint(
@@ -188,8 +208,8 @@ pub fn composeWithEuid(
         .hostname = hostname_buf[0..],
         .mounts = &default_mounts,
         .linux = .{
-            .uidMappings = &[_]IdMapping{.{ .containerID = 0, .hostID = euid, .size = 1 }},
-            .gidMappings = &[_]IdMapping{.{ .containerID = 0, .hostID = euid, .size = 1 }},
+            .uidMappings = id_maps.uid,
+            .gidMappings = id_maps.gid,
             .namespaces = &default_namespaces,
             .maskedPaths = default_masked_paths,
             .readonlyPaths = default_readonly_paths,
@@ -287,6 +307,60 @@ fn replaceOrAppendEnv(
         }
     }
     try list.append(aa, entry);
+}
+
+/// Build the OCI `linux.uidMappings` / `gidMappings` arrays based on
+/// the privilege model the overlay mount used.
+///
+/// **Rootless (`overlay.joined_userns == true`)**: bundle.compose runs
+/// inside the namespace `newuidmap`/`newgidmap` already populated. The
+/// calling process appears as uid 0 of that namespace; the host
+/// subuid range is mapped to ids `1..1+sub.count`. So the OCI mapping
+/// must use joined-userns ids, not original host ids:
+///   `{containerID:0, hostID:0, size:1}` plus, when a sub range was
+///   captured pre-join, `{containerID:1, hostID:1, size:sub.count}`.
+///
+/// **Privileged (`overlay.joined_userns == false`)**: no namespace
+/// transition has happened; `euid`/`egid` are the real host ids. Emit
+/// a single `{containerID:0, hostID:euid|egid, size:1}` line.
+fn resolveIdMappings(
+    aa: Allocator,
+    overlay: overlay_mod.MountedOverlay,
+    euid: u32,
+    egid: u32,
+) Allocator.Error!struct { uid: []const IdMapping, gid: []const IdMapping } {
+    if (overlay.joined_userns) {
+        const uid = try buildJoinedMaps(aa, overlay.host_sub_uid);
+        const gid = try buildJoinedMaps(aa, overlay.host_sub_gid);
+        return .{ .uid = uid, .gid = gid };
+    }
+    return .{
+        .uid = try singleMap(aa, euid),
+        .gid = try singleMap(aa, egid),
+    };
+}
+
+fn buildJoinedMaps(aa: Allocator, sub: ?subid_mod.Range) Allocator.Error![]const IdMapping {
+    if (sub) |s| {
+        const out = try aa.alloc(IdMapping, 2);
+        out[0] = .{ .containerID = 0, .hostID = 0, .size = 1 };
+        // hostID `1` is correct here: inside the joined userns,
+        // newuidmap mapped `host_sub.start` → `1` (and the next
+        // `sub.count` ids in lockstep). Using `s.start` would point
+        // back into the original host id space which the joined
+        // userns can't see.
+        out[1] = .{ .containerID = 1, .hostID = 1, .size = s.count };
+        return out;
+    }
+    const out = try aa.alloc(IdMapping, 1);
+    out[0] = .{ .containerID = 0, .hostID = 0, .size = 1 };
+    return out;
+}
+
+fn singleMap(aa: Allocator, host_id: u32) Allocator.Error![]const IdMapping {
+    const out = try aa.alloc(IdMapping, 1);
+    out[0] = .{ .containerID = 0, .hostID = host_id, .size = 1 };
+    return out;
 }
 
 fn parseUser(text: []const u8) BundleError!struct { uid: u32, gid: u32 } {
@@ -676,7 +750,15 @@ fn fixedEuid(ctx: ?*anyopaque) u32 {
     return 1000;
 }
 
-const fixed_euid_source: EuidSource = .{ .fetch = fixedEuid, .ctx = null };
+fn fixedEgid(ctx: ?*anyopaque) u32 {
+    _ = ctx;
+    return 1000;
+}
+
+const fixed_id_source: IdSource = .{
+    .fetchUid = fixedEuid,
+    .fetchGid = fixedEgid,
+};
 
 fn fakeContainer() state_mod.Container {
     var id: [state_mod.id_short_length]u8 = undefined;
@@ -705,7 +787,21 @@ fn fakeOverlay(allocator: Allocator) !overlay_mod.MountedOverlay {
         .upper_path = upper,
         .work_path = work,
         .joined_userns = false,
+        .host_sub_uid = null,
+        .host_sub_gid = null,
     };
+}
+
+fn fakeRootlessOverlay(
+    allocator: Allocator,
+    sub_uid: ?subid_mod.Range,
+    sub_gid: ?subid_mod.Range,
+) !overlay_mod.MountedOverlay {
+    var ov = try fakeOverlay(allocator);
+    ov.joined_userns = true;
+    ov.host_sub_uid = sub_uid;
+    ov.host_sub_gid = sub_gid;
+    return ov;
 }
 
 const alpine_fixture = @embedFile("../image/testdata/alpine_3_19_config.json");
@@ -732,7 +828,7 @@ fn composeIntoTmp(
 
     const c = fakeContainer();
 
-    try composeWithEuid(testing.io, aa, io_bundle_dir, c, img_cfg, overrides, ovl, fixed_euid_source);
+    try composeWithIds(testing.io, aa, io_bundle_dir, c, img_cfg, overrides, ovl, fixed_id_source);
 
     const bytes = try io_bundle_dir.readFileAlloc(testing.io, config_filename, aa, .limited(256 * 1024));
     return .{ .bytes = bytes, .tmp = tmp };
@@ -911,7 +1007,7 @@ test "compose: EmptyArgs error when nothing supplies args" {
     defer ovl.deinit();
     const c = fakeContainer();
 
-    try testing.expectError(BundleError.EmptyArgs, composeWithEuid(testing.io, aa, io_bundle_dir, c, img_cfg, overrides, ovl, fixed_euid_source));
+    try testing.expectError(BundleError.EmptyArgs, composeWithIds(testing.io, aa, io_bundle_dir, c, img_cfg, overrides, ovl, fixed_id_source));
 }
 
 test "compose: InvalidEnv on missing equals sign" {
@@ -942,7 +1038,7 @@ test "compose: InvalidEnv on missing equals sign" {
     defer ovl.deinit();
     const c = fakeContainer();
 
-    try testing.expectError(BundleError.InvalidEnv, composeWithEuid(testing.io, aa, io_bundle_dir, c, img_cfg, overrides, ovl, fixed_euid_source));
+    try testing.expectError(BundleError.InvalidEnv, composeWithIds(testing.io, aa, io_bundle_dir, c, img_cfg, overrides, ovl, fixed_id_source));
 }
 
 test "compose: UnsupportedUserFormat on textual user" {
@@ -972,7 +1068,7 @@ test "compose: UnsupportedUserFormat on textual user" {
     defer ovl.deinit();
     const c = fakeContainer();
 
-    try testing.expectError(BundleError.UnsupportedUserFormat, composeWithEuid(testing.io, aa, io_bundle_dir, c, img_cfg, overrides, ovl, fixed_euid_source));
+    try testing.expectError(BundleError.UnsupportedUserFormat, composeWithIds(testing.io, aa, io_bundle_dir, c, img_cfg, overrides, ovl, fixed_id_source));
 }
 
 test "parseUser accepts uid, uid:gid, empty" {
@@ -984,4 +1080,97 @@ test "parseUser accepts uid, uid:gid, empty" {
     try testing.expectEqual(@as(u32, 2000), (try parseUser("1000:2000")).gid);
     try testing.expectError(BundleError.UnsupportedUserFormat, parseUser("memcache"));
     try testing.expectError(BundleError.UnsupportedUserFormat, parseUser("1000:groupname"));
+}
+
+test "resolveIdMappings: privileged path emits 1-entry with egid (not euid)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var ovl = try fakeOverlay(aa); // joined_userns=false
+    defer ovl.deinit();
+
+    // euid=1000, egid=42 — distinct so a regression that copies euid
+    // into gidMappings is caught by the assertion below.
+    const maps = try resolveIdMappings(aa, ovl, 1000, 42);
+    try testing.expectEqual(@as(usize, 1), maps.uid.len);
+    try testing.expectEqual(@as(usize, 1), maps.gid.len);
+    try testing.expectEqual(@as(u32, 1000), maps.uid[0].hostID);
+    try testing.expectEqual(@as(u32, 42), maps.gid[0].hostID);
+}
+
+test "resolveIdMappings: rootless without sub ranges falls back to 1-entry" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var ovl = try fakeRootlessOverlay(aa, null, null);
+    defer ovl.deinit();
+
+    const maps = try resolveIdMappings(aa, ovl, 1000, 42);
+    try testing.expectEqual(@as(usize, 1), maps.uid.len);
+    // Joined userns: hostID is the joined-userns root (always 0), not
+    // the original host euid.
+    try testing.expectEqual(@as(u32, 0), maps.uid[0].hostID);
+    try testing.expectEqual(@as(u32, 0), maps.gid[0].hostID);
+}
+
+test "resolveIdMappings: rootless + sub ranges emits 2-entry with hostID=1" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var ovl = try fakeRootlessOverlay(
+        aa,
+        .{ .start = 100000, .count = 65536 },
+        .{ .start = 200000, .count = 32768 },
+    );
+    defer ovl.deinit();
+
+    const maps = try resolveIdMappings(aa, ovl, 1000, 1000);
+    try testing.expectEqual(@as(usize, 2), maps.uid.len);
+    try testing.expectEqual(@as(u32, 0), maps.uid[0].hostID);
+    try testing.expectEqual(@as(u32, 1), maps.uid[1].containerID);
+    // Critical: hostID is `1` (the joined-userns offset newuidmap
+    // mapped the subuid range into), NOT the original `start` value
+    // 100000 — that's invisible inside the joined namespace.
+    try testing.expectEqual(@as(u32, 1), maps.uid[1].hostID);
+    try testing.expectEqual(@as(u32, 65536), maps.uid[1].size);
+
+    try testing.expectEqual(@as(usize, 2), maps.gid.len);
+    try testing.expectEqual(@as(u32, 1), maps.gid[1].hostID);
+    try testing.expectEqual(@as(u32, 32768), maps.gid[1].size);
+}
+
+test "compose rootless+subid emits 2-entry mappings in config.json" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const img_cfg = try parseAlpine(&arena);
+    const cmd_overrides = [_][]const u8{ "echo", "hi" };
+    const overrides: RunOverrides = .{ .cmd = &cmd_overrides };
+
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var io_bundle_dir = try tmp.dir.createDirPathOpen(testing.io, "bundle", .{
+        .open_options = .{ .iterate = true },
+    });
+    defer io_bundle_dir.close(testing.io);
+
+    var ovl = try fakeRootlessOverlay(
+        aa,
+        .{ .start = 100000, .count = 65536 },
+        .{ .start = 200000, .count = 65536 },
+    );
+    defer ovl.deinit();
+    const c = fakeContainer();
+
+    try composeWithIds(testing.io, aa, io_bundle_dir, c, img_cfg, overrides, ovl, fixed_id_source);
+
+    const bytes = try io_bundle_dir.readFileAlloc(testing.io, config_filename, aa, .limited(256 * 1024));
+    // Two-entry shape lands as a JSON array of length 2 — the
+    // `containerID:1` literal never appears in the 1-entry fallback.
+    try testing.expect(std.mem.indexOf(u8, bytes, "\"containerID\": 1") != null);
+    try testing.expect(std.mem.indexOf(u8, bytes, "\"size\": 65536") != null);
 }
