@@ -79,6 +79,11 @@ pub const RunRequest = struct {
     /// AF_UNIX path for the pty console socket. Required when `tty`
     /// is true; ignored otherwise.
     console_socket_path: ?[]const u8 = null,
+    /// Path libcrun writes the init pid into. The orchestrator
+    /// (`run.zig`) reads it from a watcher thread to surface the
+    /// running pid in `state.json`. Caller-owned slice; passed
+    /// through unchanged to the libcrun context.
+    pid_file_path: ?[]const u8 = null,
 };
 
 /// Runs the bundle at `req.bundle` to completion, forwarding
@@ -107,6 +112,7 @@ pub fn runForeground(
         .state_root = req.state_root,
         .bundle = req.bundle,
         .force_no_cgroup = req.force_no_cgroup,
+        .pid_file = req.pid_file_path,
     };
     defer ctx.deinit();
 

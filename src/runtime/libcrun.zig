@@ -107,6 +107,10 @@ pub const Context = struct {
     preserve_fds: c_int = 0,
     /// Optional sd_notify socket path.
     notify_socket: ?[]const u8 = null,
+    /// Optional path libcrun writes the init pid into after fork.
+    /// Read by the rind orchestrator from a watcher thread to surface
+    /// the live container pid in `state.json`.
+    pid_file: ?[]const u8 = null,
     /// Disables cgroup setup. Useful for rootless test bundles.
     force_no_cgroup: bool = false,
     /// Most-recent libcrun failure diagnostic. Cleared on success of any
@@ -255,6 +259,7 @@ const CContextStrings = struct {
     bundle_z: [:0]u8,
     console_socket_z: ?[:0]u8,
     notify_socket_z: ?[:0]u8,
+    pid_file_z: ?[:0]u8,
 
     fn build(ctx: *const Context, out: *c.libcrun_context_t) RuntimeError!CContextStrings {
         const a = ctx.allocator;
@@ -277,11 +282,18 @@ const CContextStrings = struct {
         }
         errdefer if (notify_z) |s| a.free(s);
 
+        var pid_file_z: ?[:0]u8 = null;
+        if (ctx.pid_file) |s| {
+            pid_file_z = a.dupeZ(u8, s) catch return error.OutOfMemory;
+        }
+        errdefer if (pid_file_z) |s| a.free(s);
+
         out.id = id_z.ptr;
         out.state_root = state_root_z.ptr;
         out.bundle = bundle_z.ptr;
         out.console_socket = if (console_z) |s| s.ptr else null;
         out.notify_socket = if (notify_z) |s| s.ptr else null;
+        out.pid_file = if (pid_file_z) |s| s.ptr else null;
 
         return .{
             .id_z = id_z,
@@ -289,6 +301,7 @@ const CContextStrings = struct {
             .bundle_z = bundle_z,
             .console_socket_z = console_z,
             .notify_socket_z = notify_z,
+            .pid_file_z = pid_file_z,
         };
     }
 
@@ -298,6 +311,7 @@ const CContextStrings = struct {
         a.free(self.bundle_z);
         if (self.console_socket_z) |s| a.free(s);
         if (self.notify_socket_z) |s| a.free(s);
+        if (self.pid_file_z) |s| a.free(s);
     }
 };
 

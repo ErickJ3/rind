@@ -319,17 +319,53 @@ pub fn runImage(
     else
         null;
 
+    const pid_file_path = try std.fmt.allocPrint(aa, "{s}/pid", .{bundle_abs});
+
+    var watcher = PidWatcher{
+        .io = io,
+        .gpa = gpa,
+        .root_dir = env.root_dir,
+        .container_id = container.id,
+        .pid_file_path = pid_file_path,
+    };
+    const watcher_thread_opt: ?std.Thread = std.Thread.spawn(
+        .{},
+        PidWatcher.run,
+        .{&watcher},
+    ) catch |err| spawn_blk: {
+        std.log.debug("rind: pid watcher spawn failed: {s}", .{@errorName(err)});
+        break :spawn_blk null;
+    };
+    var watcher_joined = false;
+    defer if (!watcher_joined) {
+        watcher.done.store(true, .release);
+        if (watcher_thread_opt) |t| t.join();
+    };
+
     const status = try deps.run_fn(io, gpa, .{
         .id = container.id[0..],
         .state_root = state_root_abs,
         .bundle = bundle_abs,
         .tty = opts.overrides.tty,
         .console_socket_path = console_socket_path,
+        .pid_file_path = pid_file_path,
     });
+
+    watcher.done.store(true, .release);
+    if (watcher_thread_opt) |t| t.join();
+    watcher_joined = true;
 
     const exit_code: u8, const signal: u8 = switch (status) {
         .exit => |c| .{ c, 0 },
         .signal => |s| .{ 0, s },
+    };
+
+    state_mod.transition(io, gpa, env.root_dir, container.id[0..], .{
+        .status = .exited,
+        .exit_code = @intCast(exit_code),
+        .signal = @intCast(signal),
+    }) catch |err| {
+        std.log.debug("rind: state transition exited failed: {s}", .{@errorName(err)});
     };
 
     emit(opts, .{ .exited = .{ .code = exit_code, .signal = signal } });
@@ -436,6 +472,66 @@ fn deleteOne(
     var buf: [128]u8 = undefined;
     const path = std.fmt.bufPrint(&buf, "{s}/{s}", .{ parent_subpath, id[0..] }) catch unreachable;
     try root_dir.deleteTree(io, path);
+}
+
+const pid_watcher_max_attempts: u32 = 500;
+const pid_watcher_poll_interval_ns: i64 = 20 * std.time.ns_per_ms;
+
+/// Polls libcrun's pid_file while a foreground run is in flight. On
+/// the first successful read, transitions `state.json` to `.running`
+/// and exits. Bounded by `pid_watcher_max_attempts` (~10s wall) and
+/// short-circuited via `done` once the orchestrator returns from
+/// `run_fn`. All transition failures are best-effort: a watcher that
+/// cannot persist `.running` doesn't break the run; the subsequent
+/// `.exited` transition will still record exit_code/signal.
+const PidWatcher = struct {
+    io: Io,
+    gpa: Allocator,
+    root_dir: Io.Dir,
+    container_id: [state_mod.id_short_length]u8,
+    pid_file_path: []const u8,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *PidWatcher) void {
+        var attempts: u32 = 0;
+        while (attempts < pid_watcher_max_attempts) : (attempts += 1) {
+            if (readPidFile(self.pid_file_path)) |pid| {
+                state_mod.transition(self.io, self.gpa, self.root_dir, self.container_id[0..], .{
+                    .status = .running,
+                    .pid = pid,
+                }) catch |err| {
+                    std.log.debug("rind: state transition running failed: {s}", .{@errorName(err)});
+                };
+                return;
+            } else |_| {}
+
+            if (self.done.load(.acquire)) return;
+
+            const ts: std.os.linux.timespec = .{ .sec = 0, .nsec = pid_watcher_poll_interval_ns };
+            _ = std.os.linux.nanosleep(&ts, null);
+        }
+    }
+};
+
+fn readPidFile(path: []const u8) !i32 {
+    var path_buf: [256:0]u8 = undefined;
+    const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{path}) catch return error.PathTooLong;
+
+    const fd = try std.posix.openatZ(
+        std.posix.AT.FDCWD,
+        path_z.ptr,
+        .{ .ACCMODE = .RDONLY },
+        0,
+    );
+    defer _ = std.os.linux.close(fd);
+
+    var buf: [32]u8 = undefined;
+    const n = try std.posix.read(fd, &buf);
+    if (n == 0) return error.EmptyPidFile;
+
+    const trimmed = std.mem.trim(u8, buf[0..n], &std.ascii.whitespace);
+    if (trimmed.len == 0) return error.EmptyPidFile;
+    return std.fmt.parseInt(i32, trimmed, 10);
 }
 
 const testing = std.testing;
@@ -861,4 +957,72 @@ test "runImage signal exit surfaces signal in result" {
 
     try testing.expectEqual(@as(u8, 0), result.exit_code);
     try testing.expectEqual(@as(u8, 2), result.signal);
+}
+
+const StubExitWritesPidFile = struct {
+    const recorded_pid: i32 = 12345;
+
+    fn run(io: Io, gpa: Allocator, req: core.RunRequest) core.RuntimeError!core.ExitStatus {
+        _ = io;
+        _ = gpa;
+        const pid_file_path = req.pid_file_path orelse return .{ .exit = 0 };
+
+        var path_buf: [256:0]u8 = undefined;
+        const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{pid_file_path}) catch
+            return .{ .exit = 0 };
+
+        const fd = std.posix.openatZ(
+            std.posix.AT.FDCWD,
+            path_z.ptr,
+            .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true },
+            0o600,
+        ) catch return .{ .exit = 0 };
+        defer _ = std.os.linux.close(fd);
+
+        var contents_buf: [16]u8 = undefined;
+        const contents = std.fmt.bufPrint(&contents_buf, "{d}\n", .{recorded_pid}) catch
+            return .{ .exit = 0 };
+        _ = std.os.linux.write(fd, contents.ptr, contents.len);
+
+        const ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 60 * std.time.ns_per_ms };
+        _ = std.os.linux.nanosleep(&ts, null);
+
+        return .{ .exit = 0 };
+    }
+};
+
+test "runImage walks state.json from created -> running -> exited" {
+    const gpa = testing.allocator;
+    var root = try TestRoot.init(gpa);
+    defer root.deinit(gpa);
+
+    var store = try layout.Store.init(testing.io, root.dir, "store");
+    defer store.close(testing.io);
+
+    _ = try seedFixtureImage(testing.io, gpa, &store, "alpine:test");
+
+    const result = try runImage(
+        testing.io,
+        gpa,
+        &store,
+        .{ .root_dir = root.dir, .root_abspath = root.abs },
+        "alpine:test",
+        .{},
+        .{
+            .run_fn = StubExitWritesPidFile.run,
+            .mount_fn = StubOverlay.mount,
+            .unmount_fn = StubOverlay.unmount,
+        },
+    );
+
+    try testing.expectEqual(@as(u8, 0), result.exit_code);
+    try testing.expectEqual(@as(u8, 0), result.signal);
+
+    var parsed = try state_mod.read(testing.io, gpa, root.dir, result.container_id[0..]);
+    defer parsed.deinit();
+
+    try testing.expectEqual(state_mod.Status.exited, parsed.value.status);
+    try testing.expectEqual(@as(?i32, 0), parsed.value.exit_code);
+    try testing.expectEqual(@as(?i32, 0), parsed.value.signal);
+    try testing.expectEqual(@as(?i32, StubExitWritesPidFile.recorded_pid), parsed.value.pid);
 }

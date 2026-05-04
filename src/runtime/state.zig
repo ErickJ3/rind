@@ -1,11 +1,13 @@
-//! Container state allocation.
+//! Container state allocation, lifecycle transitions, and `/proc` liveness.
 //!
 //! Owns ID generation, the per-container directory triplet under
-//! `~/.rind/{containers,bundles,overlays}/<id>/`, and the initial
-//! `state.json`. This module only fills the static fields
-//! (`id`, `id_full`, optional `name`, `image_ref`, `image_digest`,
-//! `status: "created"`, `started_at`); `pid` / status transitions
-//! are not yet implemented.
+//! `~/.rind/{containers,bundles,overlays}/<id>/`, and the
+//! `state.json` lifecycle. `allocate` writes the initial document
+//! (`status = .created`); `transition` advances it to `.running`
+//! (with init pid) and `.exited` (with exit_code or signal) using
+//! atomic temp+rename so concurrent readers never see a partial
+//! file. `liveness` consults `/proc/<pid>/status` to detect stale
+//! `.running` records (init reaped externally, etc.).
 //!
 //! ID derivation: `sha256(realtime_ns_be ‖ 16 random bytes)` →
 //! lowercase hex; first 12 chars are the Docker-style short ID,
@@ -19,8 +21,12 @@
 //! unlikely (sha256 over real-time + 128 bits of entropy); the
 //! retry budget is defence in depth against a corrupted root.
 //!
-//! `state.json` is written via `createFileAtomic` with `replace =
-//! false` (first write); same idiom as `Store.writeIndex`.
+//! `state.json` is written via `createFileAtomic` — `link` for the
+//! first write (`allocate`), `replace` for subsequent transitions.
+//! Atomicity comes from the underlying `rename(2)`, which is atomic
+//! within a single filesystem on Linux (ext4/btrfs/xfs); concurrent
+//! `read` callers see either the prior or the new document, never
+//! a half-written one.
 //!
 //! Naming note: `runtime/libcrun.zig` already exports `Container`
 //! as the opaque libcrun handle. The `Container` type below is the
@@ -67,11 +73,18 @@ pub const runtime_subpath: []const u8 = "runtime";
 /// state document.
 pub const state_filename: []const u8 = "state.json";
 
-/// Initial value of the `status` field in a freshly-allocated
-/// `state.json`.
-pub const initial_status: []const u8 = "created";
+/// Lifecycle status persisted in `state.json`. Serialises to JSON as
+/// the lowercase variant name (`"created"`, `"running"`, `"exited"`).
+pub const Status = enum {
+    /// Triplet allocated, libcrun not yet invoked.
+    created,
+    /// libcrun has the container; init pid recorded in `pid`.
+    running,
+    /// Container returned. Exactly one of `exit_code` / `signal` set.
+    exited,
+};
 
-/// Closed semantic error set for state allocation. Returned in
+/// Closed semantic error set for state operations. Returned in
 /// addition to the underlying filesystem and JSON-encoding error
 /// sets (composed at each public function's signature).
 pub const StateError = error{
@@ -80,6 +93,12 @@ pub const StateError = error{
     /// normal conditions; signals a corrupted or maliciously
     /// pre-populated root.
     IdCollisionExhausted,
+    /// `read`/`transition` could not open `state.json` (container
+    /// directory missing or stripped by an external `--rm`).
+    StateFileNotFound,
+    /// `read` parsed `state.json` but it did not match the persisted
+    /// schema (corrupted on-disk document or schema-version skew).
+    StateFileCorrupt,
 };
 
 /// Snapshot of an allocated container. The three directories
@@ -117,10 +136,8 @@ pub const Container = struct {
 };
 
 /// Persisted shape of `state.json`. Field names are the canonical
-/// snake_case wire form. Future fields (`pid`, `exit_code`,
-/// `signal`) are not yet implemented; `allocate` only fills the
-/// static subset below, which is the only shape readers should
-/// expect on disk today.
+/// snake_case wire form. `pid` is set on `.running`, `exit_code` /
+/// `signal` on `.exited` (exactly one of the latter pair).
 pub const StatePersisted = struct {
     /// Short 12-char ID.
     id: []const u8,
@@ -132,11 +149,43 @@ pub const StatePersisted = struct {
     image_ref: []const u8,
     /// Image manifest digest (`sha256:<hex>`).
     image_digest: []const u8,
-    /// Lifecycle status. Initialised to `"created"` here; the
-    /// `"running"` / `"exited"` walk is not yet implemented.
-    status: []const u8 = initial_status,
+    /// Lifecycle status.
+    status: Status = .created,
     /// Allocation timestamp (RFC 3339 UTC).
     started_at: []const u8,
+    /// libcrun init pid; set when status reaches `.running`.
+    pid: ?i32 = null,
+    /// Normal-exit code (0..255); set when status is `.exited` and
+    /// the container was not terminated by signal.
+    exit_code: ?i32 = null,
+    /// Terminating signal number; set when status is `.exited` and
+    /// the container was killed by signal.
+    signal: ?i32 = null,
+};
+
+/// Selective field updates for `transition`. The new `status` is
+/// always set; the optional fields default to `null`, which means
+/// "preserve the prior persisted value". To advance from `.running`
+/// to `.exited` while keeping the recorded pid, the caller passes
+/// `pid = null` (preserve) and the new `exit_code` / `signal`.
+pub const TransitionFields = struct {
+    status: Status,
+    pid: ?i32 = null,
+    exit_code: ?i32 = null,
+    signal: ?i32 = null,
+};
+
+/// Outcome of querying `/proc/<pid>/status`. `.zombie` indicates the
+/// init process has exited but is still waiting to be reaped — for
+/// rind this means a `--rm`-less run whose orchestrator died before
+/// recording the exit code.
+pub const Liveness = enum {
+    /// Process exists and is in any non-zombie state.
+    alive,
+    /// `/proc/<pid>/status` is gone (ESRCH / FileNotFound).
+    exited,
+    /// Process exists but its `State:` line begins with `Z`.
+    zombie,
 };
 
 /// Composed error set returned by `allocate`.
@@ -329,6 +378,151 @@ fn writeStateJson(
     try atomic.link(io);
 }
 
+/// Composed error set returned by `transition`.
+pub const TransitionError =
+    StateError ||
+    Io.Dir.ReadFileAllocError ||
+    Io.Dir.CreateFileAtomicError ||
+    Io.File.Atomic.ReplaceError ||
+    Io.File.Writer.Error ||
+    std.json.Stringify.Error;
+
+/// Composed error set returned by `read`.
+pub const ReadError =
+    StateError ||
+    Io.Dir.ReadFileAllocError;
+
+const state_doc_max_bytes: usize = 64 * 1024;
+
+/// Atomically rewrite `containers/<container_id>/state.json` with
+/// `fields` merged onto the existing document. Static fields (`id`,
+/// `id_full`, `image_*`, `started_at`, `name`) are preserved; only
+/// the lifecycle pair (`status`, `pid`, `exit_code`, `signal`) is
+/// updated.
+///
+/// Atomic via temp+rename: concurrent `read` callers see either the
+/// pre-transition document or the post-transition document, never a
+/// partial write. The caller must serialise concurrent `transition`
+/// calls on the same `container_id` — last writer wins, prior
+/// transitions can be overwritten.
+pub fn transition(
+    io: Io,
+    gpa: Allocator,
+    root_dir: Io.Dir,
+    container_id: []const u8,
+    fields: TransitionFields,
+) TransitionError!void {
+    var path_buf: [192]u8 = undefined;
+    const containers_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{
+        containers_subpath, container_id,
+    }) catch unreachable;
+
+    var file_path_buf: [192]u8 = undefined;
+    const file_path = std.fmt.bufPrint(&file_path_buf, "{s}/{s}", .{
+        containers_path, state_filename,
+    }) catch unreachable;
+
+    const bytes = root_dir.readFileAlloc(io, file_path, gpa, .limited(state_doc_max_bytes)) catch |err| switch (err) {
+        error.FileNotFound => return StateError.StateFileNotFound,
+        else => |e| return e,
+    };
+    defer gpa.free(bytes);
+
+    var parsed = std.json.parseFromSlice(StatePersisted, gpa, bytes, .{
+        .ignore_unknown_fields = true,
+    }) catch return StateError.StateFileCorrupt;
+    defer parsed.deinit();
+
+    const updated: StatePersisted = .{
+        .id = parsed.value.id,
+        .id_full = parsed.value.id_full,
+        .name = parsed.value.name,
+        .image_ref = parsed.value.image_ref,
+        .image_digest = parsed.value.image_digest,
+        .status = fields.status,
+        .started_at = parsed.value.started_at,
+        .pid = fields.pid orelse parsed.value.pid,
+        .exit_code = fields.exit_code orelse parsed.value.exit_code,
+        .signal = fields.signal orelse parsed.value.signal,
+    };
+
+    var atomic = try root_dir.createFileAtomic(io, file_path, .{ .replace = true });
+    defer atomic.deinit(io);
+
+    var write_buf: [4096]u8 = undefined;
+    var fw = atomic.file.writer(io, &write_buf);
+    std.json.Stringify.value(updated, stringify_options, &fw.interface) catch |err| switch (err) {
+        error.WriteFailed => return fw.err.?,
+    };
+    fw.interface.flush() catch return fw.err.?;
+
+    try atomic.replace(io);
+}
+
+/// Read the persisted `state.json` for `container_id`. Returns a
+/// parsed document that owns its own backing allocations; caller
+/// must invoke `parsed.deinit()`.
+pub fn read(
+    io: Io,
+    gpa: Allocator,
+    root_dir: Io.Dir,
+    container_id: []const u8,
+) ReadError!std.json.Parsed(StatePersisted) {
+    var path_buf: [192]u8 = undefined;
+    const file_path = std.fmt.bufPrint(&path_buf, "{s}/{s}/{s}", .{
+        containers_subpath, container_id, state_filename,
+    }) catch unreachable;
+
+    const bytes = root_dir.readFileAlloc(io, file_path, gpa, .limited(state_doc_max_bytes)) catch |err| switch (err) {
+        error.FileNotFound => return StateError.StateFileNotFound,
+        else => |e| return e,
+    };
+    defer gpa.free(bytes);
+
+    return std.json.parseFromSlice(StatePersisted, gpa, bytes, .{
+        .ignore_unknown_fields = true,
+    }) catch return StateError.StateFileCorrupt;
+}
+
+/// Read `/proc/<pid>/status` and classify the process. ESRCH (the
+/// file went missing between open and read or never existed) maps
+/// to `.exited`. A `State:` line starting with `Z` maps to `.zombie`.
+/// Any other state — including an unparseable file — is reported as
+/// `.alive`, since failure to classify shouldn't cause the caller to
+/// declare a process dead.
+pub fn liveness(io: Io, pid: i32) Liveness {
+    _ = io;
+    if (pid <= 0) return .exited;
+
+    var path_buf: [64:0]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/status", .{pid}) catch return .exited;
+
+    const fd = std.posix.openatZ(
+        std.posix.AT.FDCWD,
+        path.ptr,
+        .{ .ACCMODE = .RDONLY },
+        0,
+    ) catch |err| switch (err) {
+        error.FileNotFound => return .exited,
+        else => return .alive,
+    };
+    defer _ = std.os.linux.close(fd);
+
+    var buf: [4096]u8 = undefined;
+    const n = std.posix.read(fd, &buf) catch return .alive;
+    if (n == 0) return .alive;
+
+    var it = std.mem.splitScalar(u8, buf[0..n], '\n');
+    while (it.next()) |line| {
+        const prefix: []const u8 = "State:";
+        if (!std.mem.startsWith(u8, line, prefix)) continue;
+        const rest = std.mem.trimStart(u8, line[prefix.len..], " \t");
+        if (rest.len == 0) return .alive;
+        return if (rest[0] == 'Z') .zombie else .alive;
+    }
+    return .alive;
+}
+
 fn formatStartedAt(io: Io, buf: *[32]u8) []const u8 {
     const ts = Io.Clock.now(.real, io);
     const ns: i96 = ts.nanoseconds;
@@ -417,8 +611,11 @@ test "allocate creates the three dirs and a parseable state.json" {
     try testing.expect(parsed.value.name == null);
     try testing.expectEqualStrings("alpine:3.19", parsed.value.image_ref);
     try testing.expectEqualStrings("sha256:0000000000000000000000000000000000000000000000000000000000000000", parsed.value.image_digest);
-    try testing.expectEqualStrings(initial_status, parsed.value.status);
+    try testing.expectEqual(Status.created, parsed.value.status);
     try testing.expect(parsed.value.started_at.len > 0);
+    try testing.expectEqual(@as(?i32, null), parsed.value.pid);
+    try testing.expectEqual(@as(?i32, null), parsed.value.exit_code);
+    try testing.expectEqual(@as(?i32, null), parsed.value.signal);
 }
 
 test "consecutive allocations produce unique IDs and both triplets exist" {
@@ -618,6 +815,208 @@ test "StatePersisted round-trips through std.json" {
     try testing.expect(parsed.value.name == null);
     try testing.expectEqualStrings(original.image_ref, parsed.value.image_ref);
     try testing.expectEqualStrings(original.image_digest, parsed.value.image_digest);
-    try testing.expectEqualStrings(initial_status, parsed.value.status);
+    try testing.expectEqual(Status.created, parsed.value.status);
     try testing.expectEqualStrings(original.started_at, parsed.value.started_at);
+}
+
+test "transition: created -> running -> exited preserves prior pid" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var root = try tmp.dir.createDirPathOpen(testing.io, "rind", .{
+        .open_options = .{ .iterate = true },
+    });
+    defer root.close(testing.io);
+
+    var c = try allocate(
+        testing.io,
+        testing.allocator,
+        root,
+        "alpine:3.19",
+        "sha256:00",
+        null,
+    );
+    defer c.deinit(testing.allocator);
+
+    {
+        var parsed = try read(testing.io, testing.allocator, root, c.id[0..]);
+        defer parsed.deinit();
+        try testing.expectEqual(Status.created, parsed.value.status);
+        try testing.expectEqual(@as(?i32, null), parsed.value.pid);
+    }
+
+    try transition(testing.io, testing.allocator, root, c.id[0..], .{
+        .status = .running,
+        .pid = 4242,
+    });
+
+    {
+        var parsed = try read(testing.io, testing.allocator, root, c.id[0..]);
+        defer parsed.deinit();
+        try testing.expectEqual(Status.running, parsed.value.status);
+        try testing.expectEqual(@as(?i32, 4242), parsed.value.pid);
+        try testing.expectEqual(@as(?i32, null), parsed.value.exit_code);
+    }
+
+    try transition(testing.io, testing.allocator, root, c.id[0..], .{
+        .status = .exited,
+        .exit_code = 0,
+        .signal = 0,
+    });
+
+    {
+        var parsed = try read(testing.io, testing.allocator, root, c.id[0..]);
+        defer parsed.deinit();
+        try testing.expectEqual(Status.exited, parsed.value.status);
+        try testing.expectEqual(@as(?i32, 4242), parsed.value.pid);
+        try testing.expectEqual(@as(?i32, 0), parsed.value.exit_code);
+        try testing.expectEqual(@as(?i32, 0), parsed.value.signal);
+    }
+}
+
+test "transition: missing state file surfaces StateFileNotFound" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var root = try tmp.dir.createDirPathOpen(testing.io, "rind", .{
+        .open_options = .{ .iterate = true },
+    });
+    defer root.close(testing.io);
+
+    try root.createDirPath(testing.io, containers_subpath);
+
+    try testing.expectError(StateError.StateFileNotFound, transition(
+        testing.io,
+        testing.allocator,
+        root,
+        "ffffffffffff",
+        .{ .status = .running, .pid = 1 },
+    ));
+}
+
+test "read: missing state file surfaces StateFileNotFound" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var root = try tmp.dir.createDirPathOpen(testing.io, "rind", .{
+        .open_options = .{ .iterate = true },
+    });
+    defer root.close(testing.io);
+
+    try testing.expectError(StateError.StateFileNotFound, read(
+        testing.io,
+        testing.allocator,
+        root,
+        "ffffffffffff",
+    ));
+}
+
+const ConcurrentReader = struct {
+    root: Io.Dir,
+    container_id: [id_short_length]u8,
+    iterations: u32,
+    stop: *std.atomic.Value(bool),
+    saw_corrupt: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *ConcurrentReader) void {
+        var i: u32 = 0;
+        while (i < self.iterations and !self.stop.load(.acquire)) : (i += 1) {
+            var parsed = read(testing.io, testing.allocator, self.root, self.container_id[0..]) catch |err| switch (err) {
+                StateError.StateFileCorrupt => {
+                    self.saw_corrupt.store(true, .release);
+                    return;
+                },
+                else => continue,
+            };
+            parsed.deinit();
+        }
+    }
+};
+
+test "transition is atomic under concurrent readers" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var root = try tmp.dir.createDirPathOpen(testing.io, "rind", .{
+        .open_options = .{ .iterate = true },
+    });
+    defer root.close(testing.io);
+
+    var c = try allocate(
+        testing.io,
+        testing.allocator,
+        root,
+        "alpine:3.19",
+        "sha256:11",
+        null,
+    );
+    defer c.deinit(testing.allocator);
+
+    var stop: std.atomic.Value(bool) = .init(false);
+
+    const reader_count = 4;
+    const reader_iters: u32 = 200;
+    var readers: [reader_count]ConcurrentReader = undefined;
+    var threads: [reader_count]std.Thread = undefined;
+    for (&readers, &threads) |*r, *t| {
+        r.* = .{
+            .root = root,
+            .container_id = c.id,
+            .iterations = reader_iters,
+            .stop = &stop,
+        };
+        t.* = try std.Thread.spawn(.{}, ConcurrentReader.run, .{r});
+    }
+
+    var w: u32 = 0;
+    while (w < 200) : (w += 1) {
+        const fields: TransitionFields = if (w % 2 == 0)
+            .{ .status = .running, .pid = @as(i32, @intCast(w + 1)) }
+        else
+            .{ .status = .exited, .exit_code = @as(i32, @intCast(w & 0xFF)) };
+        try transition(testing.io, testing.allocator, root, c.id[0..], fields);
+    }
+
+    stop.store(true, .release);
+    for (&threads) |t| t.join();
+
+    for (&readers) |*r| {
+        try testing.expect(!r.saw_corrupt.load(.acquire));
+    }
+}
+
+test "liveness: self pid is alive" {
+    const self_pid: i32 = @intCast(std.os.linux.getpid());
+    try testing.expectEqual(Liveness.alive, liveness(testing.io, self_pid));
+}
+
+test "liveness: invalid pids report exited" {
+    try testing.expectEqual(Liveness.exited, liveness(testing.io, 0));
+    try testing.expectEqual(Liveness.exited, liveness(testing.io, -1));
+    try testing.expectEqual(Liveness.exited, liveness(testing.io, std.math.maxInt(i32)));
+}
+
+test "liveness: zombie process reports zombie" {
+    const fork_ret = std.os.linux.fork();
+    const fork_signed: isize = @bitCast(fork_ret);
+    if (fork_signed < 0) return error.ForkFailed;
+
+    if (fork_ret == 0) {
+        std.os.linux.exit(0);
+    }
+
+    const child_pid: i32 = @intCast(fork_ret);
+    defer {
+        var status: u32 = 0;
+        _ = std.os.linux.waitpid(child_pid, &status, 0);
+    }
+
+    var attempts: u32 = 0;
+    while (attempts < 100) : (attempts += 1) {
+        const result = liveness(testing.io, child_pid);
+        if (result == .zombie) return;
+        const ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 5 * std.time.ns_per_ms };
+        _ = std.os.linux.nanosleep(&ts, null);
+    }
+    return error.ZombieNotObserved;
 }
