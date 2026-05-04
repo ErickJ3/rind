@@ -91,18 +91,42 @@ fn defaultSleep(io: Io, ns: u64) void {
 /// partial prior attempt is a no-op. Pass `id_full = null` when the
 /// caller doesn't have it (`state.json` was missing); the libcrun
 /// runtime dir lives under the full ID so the cleanup is skipped.
+///
+/// `containers/<id>` is removed last so a partial failure leaves
+/// `state.json` on disk for `rind rm <id>` to retry.
 pub fn removeTriplet(
     io: Io,
     root_dir: Io.Dir,
     id_short: []const u8,
     id_full: ?[]const u8,
 ) Io.Dir.DeleteTreeError!void {
-    try deleteIfExists(io, root_dir, state_mod.containers_subpath, id_short);
-    try deleteIfExists(io, root_dir, state_mod.bundles_subpath, id_short);
+    chmodOverlayWorkDir(io, root_dir, id_short);
     try deleteIfExists(io, root_dir, state_mod.overlays_subpath, id_short);
+    try deleteIfExists(io, root_dir, state_mod.bundles_subpath, id_short);
     if (id_full) |full| {
         try deleteIfExists(io, root_dir, state_mod.runtime_subpath, full);
     }
+    try deleteIfExists(io, root_dir, state_mod.containers_subpath, id_short);
+}
+
+/// overlayfs creates `<overlay>/work/work` with mode 000 to keep
+/// userspace out of its private state. After unmount the directory
+/// stays on disk and `deleteTree` cannot enumerate it (EACCES on
+/// `openat(O_RDONLY)`). chmod 0700 best-effort so the recursive
+/// delete that follows can read it.
+fn chmodOverlayWorkDir(io: Io, root_dir: Io.Dir, id_short: []const u8) void {
+    var buf: [256]u8 = undefined;
+    const path = std.fmt.bufPrint(
+        &buf,
+        "{s}/{s}/work/work",
+        .{ state_mod.overlays_subpath, id_short },
+    ) catch return;
+    root_dir.setFilePermissions(
+        io,
+        path,
+        @enumFromInt(@as(std.posix.mode_t, 0o700)),
+        .{ .follow_symlinks = true },
+    ) catch {};
 }
 
 fn deleteIfExists(
