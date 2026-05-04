@@ -242,6 +242,37 @@ fn shortDigest(s: []const u8) []const u8 {
     return s[0 .. prefix_len + short_hex];
 }
 
+/// Truncate `s` for fixed-width column output, appending an ellipsis
+/// when the source overflows `max`. When `s` opens with `'` or `"` and
+/// the truncation would chop the string before the matching close
+/// quote, the trailing quote is preserved before the ellipsis (so
+/// `"sh -c 'long…'"` reads better than `"sh -c 'lon…"`).
+///
+/// Writes into `buf`, returning a slice over the populated bytes. The
+/// caller owns `buf`; ellipsis is the single byte `0xE2 0x80 0xA6`
+/// (UTF-8 `…`) so callers must size `buf` for `max + 3`.
+pub fn truncateEllipsis(buf: []u8, s: []const u8, max: usize) []u8 {
+    if (s.len <= max) {
+        @memcpy(buf[0..s.len], s);
+        return buf[0..s.len];
+    }
+    const open: u8 = s[0];
+    const has_quote = (open == '\'' or open == '"') and
+        std.mem.indexOfScalarPos(u8, s, 1, open) != null and
+        std.mem.indexOfScalarPos(u8, s, 1, open).? >= max;
+    const ellipsis = "\u{2026}";
+    if (has_quote) {
+        const head_len = max - 1;
+        @memcpy(buf[0..head_len], s[0..head_len]);
+        @memcpy(buf[head_len .. head_len + ellipsis.len], ellipsis);
+        buf[head_len + ellipsis.len] = open;
+        return buf[0 .. head_len + ellipsis.len + 1];
+    }
+    @memcpy(buf[0..max], s[0..max]);
+    @memcpy(buf[max .. max + ellipsis.len], ellipsis);
+    return buf[0 .. max + ellipsis.len];
+}
+
 /// JSON-format renderer. Emits NDJSON (one event per line). Field
 /// order is fixed by hand — `std.json.Stringify` is avoided here
 /// because the wire format is a stable contract and reordering
@@ -678,6 +709,24 @@ test "human renderer is silent on run summary (Docker parity)" {
     };
     try r.on_run_summary(r.ctx, .{ .ref = "alpine:3.19", .result = &result });
     try testing.expectEqual(@as(usize, 0), out.written().len);
+}
+
+test "truncateEllipsis: short input is copied verbatim" {
+    var buf: [32]u8 = undefined;
+    const out = truncateEllipsis(&buf, "echo hi", 20);
+    try testing.expectEqualStrings("echo hi", out);
+}
+
+test "truncateEllipsis: overflow appends UTF-8 ellipsis" {
+    var buf: [32]u8 = undefined;
+    const out = truncateEllipsis(&buf, "/usr/local/bin/longprog", 10);
+    try testing.expectEqualStrings("/usr/local\u{2026}", out);
+}
+
+test "truncateEllipsis: trailing quote preserved on quoted strings" {
+    var buf: [32]u8 = undefined;
+    const out = truncateEllipsis(&buf, "'sh -c long_command'", 10);
+    try testing.expectEqualStrings("'sh -c lo\u{2026}'", out);
 }
 
 test "writeJsonString escapes the small set we care about" {

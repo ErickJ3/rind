@@ -1,0 +1,24 @@
+[
+  {
+    "id": "abc123def456",
+    "image": "alpine:3.19",
+    "command": "/bin/sh -c echo",
+    "created_at": "2026-05-04T12:30:00Z",
+    "status": "running",
+    "pid": 4242,
+    "exit_code": null,
+    "signal": null,
+    "name": "web"
+  },
+  {
+    "id": "fed654cba321",
+    "image": "ghcr.io/foo/bar:v2",
+    "command": "redis /etc/redis.conf",
+    "created_at": "2026-05-04T11:30:00Z",
+    "status": "exited",
+    "pid": 5151,
+    "exit_code": 0,
+    "signal": 0,
+    "name": null
+  }
+]

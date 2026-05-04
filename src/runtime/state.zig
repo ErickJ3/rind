@@ -120,6 +120,10 @@ pub const Container = struct {
     image_ref: []const u8,
     /// Image manifest digest in canonical `sha256:<hex>` form.
     image_digest: []const u8,
+    /// Resolved `process.args` joined with single spaces (Docker
+    /// convention for the COMMAND column in `ps`). `null` when the
+    /// caller could not resolve the argv at allocation time.
+    command: ?[]const u8 = null,
     /// Wall-clock allocation time in RFC 3339 / ISO 8601
     /// (`YYYY-MM-DDTHH:MM:SSZ`, UTC).
     started_at: []const u8,
@@ -131,6 +135,7 @@ pub const Container = struct {
         gpa.free(self.image_digest);
         gpa.free(self.started_at);
         if (self.name) |n| gpa.free(n);
+        if (self.command) |c| gpa.free(c);
         self.* = undefined;
     }
 };
@@ -149,6 +154,9 @@ pub const StatePersisted = struct {
     image_ref: []const u8,
     /// Image manifest digest (`sha256:<hex>`).
     image_digest: []const u8,
+    /// Resolved `process.args` joined with single spaces. Omitted from
+    /// the on-disk JSON when null (`emit_null_optional_fields = false`).
+    command: ?[]const u8 = null,
     /// Lifecycle status.
     status: Status = .created,
     /// Allocation timestamp (RFC 3339 UTC).
@@ -219,9 +227,10 @@ pub fn allocate(
     image_ref: []const u8,
     image_digest: []const u8,
     name: ?[]const u8,
+    command: ?[]const u8,
 ) AllocateError!Container {
     const default_source: IdSource = .{ .fill_fn = defaultIdFill, .ctx = null };
-    return allocateWithIdSource(io, gpa, root, image_ref, image_digest, name, default_source);
+    return allocateWithIdSource(io, gpa, root, image_ref, image_digest, name, command, default_source);
 }
 
 const stringify_options: std.json.Stringify.Options = .{
@@ -257,6 +266,7 @@ fn allocateWithIdSource(
     image_ref: []const u8,
     image_digest: []const u8,
     name: ?[]const u8,
+    command: ?[]const u8,
     id_source: IdSource,
 ) AllocateError!Container {
     try root.createDirPath(io, containers_subpath);
@@ -326,6 +336,8 @@ fn allocateWithIdSource(
         errdefer gpa.free(started_owned);
         const name_owned: ?[]const u8 = if (name) |n| try gpa.dupe(u8, n) else null;
         errdefer if (name_owned) |n| gpa.free(n);
+        const command_owned: ?[]const u8 = if (command) |c| try gpa.dupe(u8, c) else null;
+        errdefer if (command_owned) |c| gpa.free(c);
 
         const persisted: StatePersisted = .{
             .id = short[0..],
@@ -333,6 +345,7 @@ fn allocateWithIdSource(
             .name = name_owned,
             .image_ref = ref_owned,
             .image_digest = digest_owned,
+            .command = command_owned,
             .started_at = started_owned,
         };
 
@@ -344,6 +357,7 @@ fn allocateWithIdSource(
             .name = name_owned,
             .image_ref = ref_owned,
             .image_digest = digest_owned,
+            .command = command_owned,
             .started_at = started_owned,
         };
     }
@@ -430,6 +444,7 @@ pub fn transition(
 
     var parsed = std.json.parseFromSlice(StatePersisted, gpa, bytes, .{
         .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
     }) catch return StateError.StateFileCorrupt;
     defer parsed.deinit();
 
@@ -439,6 +454,7 @@ pub fn transition(
         .name = parsed.value.name,
         .image_ref = parsed.value.image_ref,
         .image_digest = parsed.value.image_digest,
+        .command = parsed.value.command,
         .status = fields.status,
         .started_at = parsed.value.started_at,
         .pid = fields.pid orelse parsed.value.pid,
@@ -481,6 +497,7 @@ pub fn read(
 
     return std.json.parseFromSlice(StatePersisted, gpa, bytes, .{
         .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
     }) catch return StateError.StateFileCorrupt;
 }
 
@@ -571,6 +588,7 @@ test "allocate creates the three dirs and a parseable state.json" {
         "alpine:3.19",
         "sha256:0000000000000000000000000000000000000000000000000000000000000000",
         null,
+        null,
     );
     defer c.deinit(testing.allocator);
 
@@ -627,9 +645,9 @@ test "consecutive allocations produce unique IDs and both triplets exist" {
     });
     defer root.close(testing.io);
 
-    var c1 = try allocate(testing.io, testing.allocator, root, "alpine:3.19", "sha256:aa", null);
+    var c1 = try allocate(testing.io, testing.allocator, root, "alpine:3.19", "sha256:aa", null, null);
     defer c1.deinit(testing.allocator);
-    var c2 = try allocate(testing.io, testing.allocator, root, "alpine:3.19", "sha256:bb", null);
+    var c2 = try allocate(testing.io, testing.allocator, root, "alpine:3.19", "sha256:bb", null, null);
     defer c2.deinit(testing.allocator);
 
     try testing.expect(!std.mem.eql(u8, c1.id[0..], c2.id[0..]));
@@ -652,7 +670,7 @@ test "allocate carries a name through to state.json when supplied" {
     });
     defer root.close(testing.io);
 
-    var c = try allocate(testing.io, testing.allocator, root, "alpine:3.19", "sha256:cc", "web");
+    var c = try allocate(testing.io, testing.allocator, root, "alpine:3.19", "sha256:cc", "web", "/bin/sh -c hi");
     defer c.deinit(testing.allocator);
 
     try testing.expectEqualStrings("web", c.name.?);
@@ -669,6 +687,7 @@ test "allocate carries a name through to state.json when supplied" {
     });
     defer parsed.deinit();
     try testing.expectEqualStrings("web", parsed.value.name.?);
+    try testing.expectEqualStrings("/bin/sh -c hi", parsed.value.command.?);
 }
 
 const RetrySeq = struct {
@@ -709,6 +728,7 @@ test "allocate retries past a pre-existing containers/<id> collision" {
         "alpine:3.19",
         "sha256:dd",
         null,
+        null,
         .{ .fill_fn = RetrySeq.fill, .ctx = &seq },
     );
     defer c.deinit(testing.allocator);
@@ -742,6 +762,7 @@ test "allocate rolls back containers/<id> when bundles/<id> collides" {
         root,
         "alpine:3.19",
         "sha256:ee",
+        null,
         null,
         .{ .fill_fn = RetrySeq.fill, .ctx = &seq },
     );
@@ -786,6 +807,7 @@ test "allocate surfaces IdCollisionExhausted after the retry budget" {
         root,
         "alpine:3.19",
         "sha256:ff",
+        null,
         null,
         .{ .fill_fn = RetrySeq.fill, .ctx = &seq },
     ));
@@ -835,6 +857,7 @@ test "transition: created -> running -> exited preserves prior pid" {
         "alpine:3.19",
         "sha256:00",
         null,
+        "/bin/sh",
     );
     defer c.deinit(testing.allocator);
 
@@ -843,6 +866,7 @@ test "transition: created -> running -> exited preserves prior pid" {
         defer parsed.deinit();
         try testing.expectEqual(Status.created, parsed.value.status);
         try testing.expectEqual(@as(?i32, null), parsed.value.pid);
+        try testing.expectEqualStrings("/bin/sh", parsed.value.command.?);
     }
 
     try transition(testing.io, testing.allocator, root, c.id[0..], .{
@@ -871,6 +895,7 @@ test "transition: created -> running -> exited preserves prior pid" {
         try testing.expectEqual(@as(?i32, 4242), parsed.value.pid);
         try testing.expectEqual(@as(?i32, 0), parsed.value.exit_code);
         try testing.expectEqual(@as(?i32, 0), parsed.value.signal);
+        try testing.expectEqualStrings("/bin/sh", parsed.value.command.?);
     }
 }
 
@@ -948,6 +973,7 @@ test "transition is atomic under concurrent readers" {
         root,
         "alpine:3.19",
         "sha256:11",
+        null,
         null,
     );
     defer c.deinit(testing.allocator);

@@ -299,7 +299,13 @@ fn buildMounts(
     return out;
 }
 
-fn resolveArgs(
+/// Resolve OCI `process.args` by combining the image config's
+/// Entrypoint and Cmd with the caller's overrides. Caller-borrowed
+/// slices on `aa`. Returns an empty slice when nothing resolves —
+/// `compose` surfaces that as `BundleError.EmptyArgs` so it never
+/// reaches libcrun. Exposed so the run orchestrator can persist the
+/// resolved command into `state.json` before bundle composition.
+pub fn resolveArgs(
     aa: Allocator,
     img: ?image_config.ImageConfig.Config,
     overrides: RunOverrides,

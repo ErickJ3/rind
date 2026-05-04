@@ -25,6 +25,7 @@ const pull_cli = @import("pull.zig");
 const run_cli = @import("run.zig");
 const images_cli = @import("images.zig");
 const inspect_cli = @import("inspect.zig");
+const ps_cli = @import("ps.zig");
 const IoV4 = @import("../IoV4.zig");
 
 /// Default storage root suffix appended to `$HOME` when `RIND_ROOT`
@@ -34,7 +35,7 @@ pub const default_root_suffix: []const u8 = ".rind";
 pub const store_subpath: []const u8 = "store";
 
 /// One-line usage banner for the top-level CLI.
-pub const usage_line: []const u8 = "Usage: rind <command> [args...]\nCommands:\n  pull     Pull an image into the local store\n  run      Run a command in a new container\n  images   List images in the local store\n  inspect  Dump the image config JSON for a local image\n  help     Show this message";
+pub const usage_line: []const u8 = "Usage: rind <command> [args...]\nCommands:\n  pull     Pull an image into the local store\n  run      Run a command in a new container\n  ps       List containers\n  images   List images in the local store\n  inspect  Dump the image config JSON for a local image\n  help     Show this message";
 
 /// Resolve the rind state-root directory. Precedence:
 /// 1. `RIND_ROOT` env var (used as-is).
@@ -85,6 +86,9 @@ pub fn dispatch(
     }
     if (std.mem.eql(u8, cmd, "inspect")) {
         return runInspect(io, gpa, argv[2..], env_map, stdout, stderr);
+    }
+    if (std.mem.eql(u8, cmd, "ps")) {
+        return runPs(io, gpa, argv[2..], env_map, stdout, stderr);
     }
     try stderr.print("rind: unknown command '{s}'\n{s}\n", .{ cmd, usage_line });
     return error.Usage;
@@ -281,6 +285,34 @@ fn runInspect(
     defer store.close(io);
 
     try inspect_cli.run(io, gpa, &store, args, stdout, stderr);
+    return 0;
+}
+
+fn runPs(
+    io: Io,
+    gpa: Allocator,
+    sub_argv: []const []const u8,
+    env_map: *const Environ.Map,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+) !u8 {
+    var iter: SliceIter = .{ .items = sub_argv };
+    const args = try ps_cli.parseArgs(gpa, &iter, stderr);
+    defer ps_cli.freeArgs(gpa, args);
+
+    const root_path = try resolveRoot(gpa, env_map);
+    defer gpa.free(root_path);
+
+    var root_dir = try Io.Dir.cwd().createDirPathOpen(io, root_path, .{
+        .open_options = .{ .iterate = true },
+    });
+    defer root_dir.close(io);
+
+    const ts = Io.Clock.now(.real, io);
+    const ns: i96 = ts.nanoseconds;
+    const now_unix: i64 = @intCast(@divTrunc(ns, std.time.ns_per_s));
+
+    try ps_cli.run(io, gpa, root_dir, args, now_unix, stdout, stderr);
     return 0;
 }
 

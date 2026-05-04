@@ -249,6 +249,12 @@ pub fn runImage(
     var m_digest_buf: [digest_mod.string_length]u8 = undefined;
     const manifest_digest_str = m_digest.toString(&m_digest_buf);
 
+    const resolved_argv = try bundle_mod.resolveArgs(aa, img_cfg.config, opts.overrides);
+    const command_str: ?[]const u8 = if (resolved_argv.len == 0)
+        null
+    else
+        try std.mem.join(aa, " ", resolved_argv);
+
     var container = try state_mod.allocate(
         io,
         gpa,
@@ -256,6 +262,7 @@ pub fn runImage(
         ref_text,
         manifest_digest_str,
         opts.name,
+        command_str,
     );
     var container_owned = true;
     errdefer if (container_owned) container.deinit(gpa);
