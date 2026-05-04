@@ -227,30 +227,22 @@ pub fn unmountPath(merged_abspath: []const u8) OverlayError!void {
     }
 }
 
-/// Unmount the overlay. Tries `umount2(0)` first; on `EBUSY` sleeps 50ms
-/// and retries with `MNT_DETACH`. Frees `mounted` on success; the struct
-/// is poisoned on return regardless of success path.
+/// Lazy unmount of the overlay via `MNT_DETACH`. Frees `mounted` on
+/// success; the struct is poisoned on return regardless of success path.
+/// Mirrors `unmountPath` — sync `umount2(0)` blocks for tens of ms on
+/// post-libcrun overlays and the caller never reads the merged tree
+/// again (run orchestrator deletes `upper`/`work` only).
 ///
 /// Recursive cleanup of `upper`/`work`/`merged` is the caller's job
 /// (run orchestrator's cleanup path) — keeping that here would
 /// conflate concerns when `--rm` is off.
 pub fn unmount(io: Io, mounted: *MountedOverlay) OverlayError!void {
-    const rc1 = linux.umount2(mounted.merged_path.ptr, 0);
-    switch (linux.errno(rc1)) {
-        .SUCCESS => {
+    _ = io;
+    const rc = linux.umount2(mounted.merged_path.ptr, linux.MNT.DETACH);
+    switch (linux.errno(rc)) {
+        .SUCCESS, .INVAL, .NOENT, .NOTDIR, .PERM => {
             mounted.deinit();
             return;
-        },
-        .BUSY => {
-            Io.sleep(io, Io.Duration.fromMilliseconds(50), .awake) catch {};
-            const rc2 = linux.umount2(mounted.merged_path.ptr, linux.MNT.DETACH);
-            switch (linux.errno(rc2)) {
-                .SUCCESS => {
-                    mounted.deinit();
-                    return;
-                },
-                else => return OverlayError.OverlayBusy,
-            }
         },
         else => return OverlayError.OverlayBusy,
     }
