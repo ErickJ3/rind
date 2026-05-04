@@ -89,5 +89,7 @@ test {
     _ = @import("cli/pull.zig");
     _ = @import("cli/run.zig");
     _ = @import("cli/images.zig");
+    _ = @import("cli/ps.zig");
+    _ = @import("cli/rm.zig");
     _ = @import("cli/root.zig");
 }

@@ -43,6 +43,7 @@ pub const Runtime = struct {
     pub const bundle = @import("runtime/bundle.zig");
     pub const core = @import("runtime/core.zig");
     pub const subid = @import("runtime/subid.zig");
+    pub const teardown = @import("runtime/teardown.zig");
 };
 
 /// This is a documentation comment to explain the `printAnotherMessage` function below.
@@ -79,4 +80,5 @@ test {
     _ = Runtime.bundle;
     _ = Runtime.core;
     _ = Runtime.subid;
+    _ = Runtime.teardown;
 }

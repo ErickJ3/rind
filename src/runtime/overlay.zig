@@ -207,6 +207,26 @@ pub fn mount(
     };
 }
 
+/// Best-effort unmount of an overlay merged tree by absolute path.
+/// Idempotent: returns success when nothing is mounted at `merged_abspath`
+/// (`EINVAL`/`ENOENT`/`ENOTDIR`). Used by `rind rm` for cold-start cleanup,
+/// where the original orchestrator process is gone so no `MountedOverlay`
+/// handle is in scope. Uses `MNT_DETACH` directly, there's no live caller
+/// to surprise with a still-busy mount.
+pub fn unmountPath(merged_abspath: []const u8) OverlayError!void {
+    var buf: [4096:0]u8 = undefined;
+    const path_z = std.fmt.bufPrintZ(&buf, "{s}", .{merged_abspath}) catch
+        return OverlayError.OverlayBusy;
+    const rc = linux.umount2(path_z.ptr, linux.MNT.DETACH);
+    switch (linux.errno(rc)) {
+        // EPERM: rootless caller without CAP_SYS_ADMIN over the mount NS.
+        // The original mount lived in a sibling NS that has since gone
+        // away; the kernel auto-unmounted it. Nothing actionable here.
+        .SUCCESS, .INVAL, .NOENT, .NOTDIR, .PERM => return,
+        else => return OverlayError.OverlayBusy,
+    }
+}
+
 /// Unmount the overlay. Tries `umount2(0)` first; on `EBUSY` sleeps 50ms
 /// and retries with `MNT_DETACH`. Frees `mounted` on success; the struct
 /// is poisoned on return regardless of success path.
@@ -619,6 +639,27 @@ test "buildOptions: rejects payloads exceeding max_options_bytes" {
 
 // Subid + passwd parser tests live in `runtime/subid.zig` alongside
 // the parser definitions. Reach them through that module's test block.
+
+test "unmountPath: idempotent on a path that is not a mountpoint" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "merged");
+
+    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
+    defer testing.allocator.free(cwd);
+    const merged_abs = try std.fs.path.join(testing.allocator, &.{
+        cwd, ".zig-cache", "tmp", &tmp.sub_path, "merged",
+    });
+    defer testing.allocator.free(merged_abs);
+
+    try unmountPath(merged_abs);
+
+    const ghost = try std.fs.path.join(testing.allocator, &.{ merged_abs, "does-not-exist" });
+    defer testing.allocator.free(ghost);
+    try unmountPath(ghost);
+}
 
 test "parseKernelMinAtLeast: 5.11 trims trailing newline" {
     try testing.expect(parseKernelMinAtLeast("5.11.0-generic\n", 5, 11));

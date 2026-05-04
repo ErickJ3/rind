@@ -26,6 +26,7 @@ const run_cli = @import("run.zig");
 const images_cli = @import("images.zig");
 const inspect_cli = @import("inspect.zig");
 const ps_cli = @import("ps.zig");
+const rm_cli = @import("rm.zig");
 const IoV4 = @import("../IoV4.zig");
 
 /// Default storage root suffix appended to `$HOME` when `RIND_ROOT`
@@ -35,7 +36,7 @@ pub const default_root_suffix: []const u8 = ".rind";
 pub const store_subpath: []const u8 = "store";
 
 /// One-line usage banner for the top-level CLI.
-pub const usage_line: []const u8 = "Usage: rind <command> [args...]\nCommands:\n  pull     Pull an image into the local store\n  run      Run a command in a new container\n  ps       List containers\n  images   List images in the local store\n  inspect  Dump the image config JSON for a local image\n  help     Show this message";
+pub const usage_line: []const u8 = "Usage: rind <command> [args...]\nCommands:\n  pull     Pull an image into the local store\n  run      Run a command in a new container\n  ps       List containers\n  rm       Remove one or more containers\n  images   List images in the local store\n  inspect  Dump the image config JSON for a local image\n  help     Show this message";
 
 /// Resolve the rind state-root directory. Precedence:
 /// 1. `RIND_ROOT` env var (used as-is).
@@ -89,6 +90,9 @@ pub fn dispatch(
     }
     if (std.mem.eql(u8, cmd, "ps")) {
         return runPs(io, gpa, argv[2..], env_map, stdout, stderr);
+    }
+    if (std.mem.eql(u8, cmd, "rm")) {
+        return runRm(io, gpa, argv[2..], env_map, stdout, stderr);
     }
     try stderr.print("rind: unknown command '{s}'\n{s}\n", .{ cmd, usage_line });
     return error.Usage;
@@ -316,6 +320,30 @@ fn runPs(
     return 0;
 }
 
+fn runRm(
+    io: Io,
+    gpa: Allocator,
+    sub_argv: []const []const u8,
+    env_map: *const Environ.Map,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+) !u8 {
+    var iter: SliceIter = .{ .items = sub_argv };
+    const args = try rm_cli.parseArgs(gpa, &iter, stderr);
+    defer rm_cli.freeArgs(gpa, args);
+
+    const root_path = try resolveRoot(gpa, env_map);
+    defer gpa.free(root_path);
+
+    var root_dir = try Io.Dir.cwd().createDirPathOpen(io, root_path, .{
+        .open_options = .{ .iterate = true },
+    });
+    defer root_dir.close(io);
+
+    try rm_cli.run(io, gpa, root_dir, root_path, args, stdout, stderr, .{});
+    return 0;
+}
+
 const SliceIter = struct {
     items: []const []const u8,
     idx: usize = 0,
@@ -407,4 +435,75 @@ test "resolveRoot returns HomeNotFound when neither is set" {
     var env_map = Environ.Map.init(gpa);
     defer env_map.deinit();
     try testing.expectError(error.HomeNotFound, resolveRoot(gpa, &env_map));
+}
+
+const state_mod = @import("../runtime/state.zig");
+
+test "dispatch rm: scenario 1 — name already removed surfaces RmAggregate" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd);
+    const rind_root = try std.fs.path.join(gpa, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "rind" });
+    defer gpa.free(rind_root);
+    var make_root = try Io.Dir.cwd().createDirPathOpen(io, rind_root, .{});
+    make_root.close(io);
+
+    var env_map = Environ.Map.init(gpa);
+    defer env_map.deinit();
+    try env_map.put("RIND_ROOT", rind_root);
+
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var err_buf: Io.Writer.Allocating = .init(gpa);
+    defer err_buf.deinit();
+
+    try testing.expectError(
+        error.RmAggregate,
+        dispatch(io, gpa, &.{ "rind", "rm", "foo" }, &env_map, &out.writer, &err_buf.writer),
+    );
+    try testing.expect(std.mem.indexOf(u8, err_buf.written(), "no such container: foo") != null);
+}
+
+test "dispatch rm: removes a stopped container end-to-end" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd);
+    const rind_root = try std.fs.path.join(gpa, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "rind2" });
+    defer gpa.free(rind_root);
+
+    var root_dir = try Io.Dir.cwd().createDirPathOpen(io, rind_root, .{
+        .open_options = .{ .iterate = true },
+    });
+
+    var c = try state_mod.allocate(io, gpa, root_dir, "alpine:3.19", "sha256:aa", "myc", null);
+    defer c.deinit(gpa);
+    try state_mod.transition(io, gpa, root_dir, c.id[0..], .{ .status = .exited, .exit_code = 0 });
+    root_dir.close(io);
+
+    var env_map = Environ.Map.init(gpa);
+    defer env_map.deinit();
+    try env_map.put("RIND_ROOT", rind_root);
+
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var err_buf: Io.Writer.Allocating = .init(gpa);
+    defer err_buf.deinit();
+
+    const code = try dispatch(io, gpa, &.{ "rind", "rm", "myc" }, &env_map, &out.writer, &err_buf.writer);
+    try testing.expectEqual(@as(u8, 0), code);
+    try testing.expect(std.mem.indexOf(u8, out.written(), c.id[0..]) != null);
+
+    var verify_root = try Io.Dir.cwd().openDir(io, rind_root, .{});
+    defer verify_root.close(io);
+    var path_buf: [128]u8 = undefined;
+    const cont_path = try std.fmt.bufPrint(&path_buf, "containers/{s}", .{c.id[0..]});
+    try testing.expectError(error.FileNotFound, verify_root.statFile(io, cont_path, .{}));
 }

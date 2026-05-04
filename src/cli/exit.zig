@@ -74,6 +74,10 @@ pub fn mapErrorToExitCode(err: anyerror) Code {
         error.InvalidVolumeSpec,
         error.VolumeSourceNotAbsolute,
         error.VolumeSourceUnreadable,
+        error.ContainerRunning,
+        error.AmbiguousId,
+        error.ContainerNotFound,
+        error.PrefixTooShort,
         => .usage,
         error.DigestMismatch,
         error.MediaTypeMismatch,
@@ -111,6 +115,12 @@ test "mapErrorToExitCode classifies common cases" {
     try testing.expectEqual(Code.usage, mapErrorToExitCode(error.Usage));
     try testing.expectEqual(Code.usage, mapErrorToExitCode(error.InvalidRepository));
     try testing.expectEqual(Code.usage, mapErrorToExitCode(error.UnsupportedPlatform));
+    try testing.expectEqual(Code.usage, mapErrorToExitCode(error.ContainerRunning));
+    try testing.expectEqual(Code.usage, mapErrorToExitCode(error.AmbiguousId));
+    try testing.expectEqual(Code.usage, mapErrorToExitCode(error.ContainerNotFound));
+    try testing.expectEqual(Code.usage, mapErrorToExitCode(error.PrefixTooShort));
+    try testing.expectEqual(Code.generic, mapErrorToExitCode(error.KillTimeout));
+    try testing.expectEqual(Code.generic, mapErrorToExitCode(error.RmAggregate));
     try testing.expectEqual(Code.verification, mapErrorToExitCode(error.DigestMismatch));
     try testing.expectEqual(Code.verification, mapErrorToExitCode(error.MediaTypeMismatch));
     try testing.expectEqual(Code.network, mapErrorToExitCode(error.ConnectionRefused));

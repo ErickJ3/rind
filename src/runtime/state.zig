@@ -21,7 +21,7 @@
 //! unlikely (sha256 over real-time + 128 bits of entropy); the
 //! retry budget is defence in depth against a corrupted root.
 //!
-//! `state.json` is written via `createFileAtomic` — `link` for the
+//! `state.json` is written via `createFileAtomic` - `link` for the
 //! first write (`allocate`), `replace` for subsequent transitions.
 //! Atomicity comes from the underlying `rename(2)`, which is atomic
 //! within a single filesystem on Linux (ext4/btrfs/xfs); concurrent
@@ -45,6 +45,11 @@ pub const id_short_length: usize = 12;
 
 /// Length of the full hex ID stored inside `state.json`.
 pub const id_full_length: usize = 64;
+
+/// Minimum prefix length the resolver accepts for id-prefix matching.
+/// Below this we refuse the lookup (`PrefixTooShort`), too easy to
+/// match an unintended container otherwise. Docker uses the same floor.
+pub const id_prefix_min: usize = 4;
 
 /// Number of times `allocate` will retry on a directory-collision
 /// before surfacing `IdCollisionExhausted`. With sha256 over
@@ -99,6 +104,25 @@ pub const StateError = error{
     /// `read` parsed `state.json` but it did not match the persisted
     /// schema (corrupted on-disk document or schema-version skew).
     StateFileCorrupt,
+};
+
+/// Closed semantic error set for `resolveTarget`. Disjoint from
+/// `StateError` so callers can pattern-match on the lookup outcome
+/// without conflating it with read/parse failures of any individual
+/// `state.json`.
+pub const ResolveError = error{
+    /// No container's `name` field matched exactly and no short ID
+    /// began with the supplied prefix.
+    ContainerNotFound,
+    /// Two or more short IDs share the supplied prefix. Caller can
+    /// re-walk via `collectPrefixMatches` to render the offending
+    /// IDs into a diagnostic.
+    AmbiguousId,
+    /// Supplied needle is shorter than `id_prefix_min` and didn't
+    /// match any name. Refusing to match such a short prefix avoids
+    /// silent surprises when only one container happens to begin with
+    /// the two letters the user typed today.
+    PrefixTooShort,
 };
 
 /// Snapshot of an allocated container. The three directories
@@ -238,10 +262,11 @@ const stringify_options: std.json.Stringify.Options = .{
     .emit_null_optional_fields = false,
 };
 
-/// Function-pointer hook for ID generation. The default impl
-/// hashes wall-clock + 16 random bytes; tests inject deterministic
-/// sequences to exercise the collision-retry path.
-const IdSource = struct {
+/// Function-pointer hook for ID generation. The default impl hashes
+/// wall-clock + 16 random bytes; tests inject deterministic sequences
+/// to exercise the collision-retry path or to build fixtures with
+/// chosen prefixes (`runtime/state_test_seams.zig`-style usage).
+pub const IdSource = struct {
     fill_fn: *const fn (io: Io, ctx: ?*anyopaque, out: *[id_full_length]u8) void,
     ctx: ?*anyopaque,
 };
@@ -259,7 +284,9 @@ fn defaultIdFill(io: Io, ctx: ?*anyopaque, out: *[id_full_length]u8) void {
     out.* = std.fmt.bytesToHex(hash, .lower);
 }
 
-fn allocateWithIdSource(
+/// Test-only seam exposed for fixtures that need a chosen ID. Callers
+/// outside the test suite should use `allocate`.
+pub fn allocateWithIdSource(
     io: Io,
     gpa: Allocator,
     root: Io.Dir,
@@ -538,6 +565,108 @@ pub fn liveness(io: Io, pid: i32) Liveness {
         return if (rest[0] == 'Z') .zombie else .alive;
     }
     return .alive;
+}
+
+/// Composed error set returned by `resolveTarget`. Folds in the
+/// filesystem and JSON failures that may surface while walking the
+/// `containers/` directory.
+pub const ResolveTargetError =
+    ResolveError ||
+    Io.Dir.OpenError ||
+    Io.Dir.Iterator.Error ||
+    Allocator.Error;
+
+/// exact name, full short ID, or short-ID
+/// prefix `>= id_prefix_min` to a 12-char short ID. Walks
+/// `<root_dir>/containers/`. A name match short-circuits the walk and
+/// always wins over an ID-prefix match.
+///
+/// Per-container `state.json` open/parse failures are skipped silently
+/// (debug-logged); a single corrupt record never aborts resolution.
+pub fn resolveTarget(
+    io: Io,
+    gpa: Allocator,
+    root_dir: Io.Dir,
+    needle: []const u8,
+) ResolveTargetError![id_short_length]u8 {
+    if (needle.len == 0) return ResolveError.ContainerNotFound;
+
+    var containers_dir = root_dir.openDir(io, containers_subpath, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return ResolveError.ContainerNotFound,
+        else => |e| return e,
+    };
+    defer containers_dir.close(io);
+
+    var matches: usize = 0;
+    var first_match: [id_short_length]u8 = undefined;
+
+    var it = containers_dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .directory) continue;
+        if (entry.name.len != id_short_length) continue;
+
+        var parsed = read(io, gpa, root_dir, entry.name) catch |err| {
+            std.log.debug("rind: resolveTarget: skip {s}: {s}", .{ entry.name, @errorName(err) });
+            continue;
+        };
+        defer parsed.deinit();
+
+        if (parsed.value.name) |n| {
+            if (std.mem.eql(u8, n, needle)) {
+                var out: [id_short_length]u8 = undefined;
+                @memcpy(&out, entry.name[0..id_short_length]);
+                return out;
+            }
+        }
+
+        if (needle.len < id_prefix_min) continue;
+        if (needle.len > id_short_length) continue;
+        if (!std.mem.startsWith(u8, entry.name, needle)) continue;
+
+        if (matches == 0) {
+            @memcpy(&first_match, entry.name[0..id_short_length]);
+        }
+        matches += 1;
+    }
+
+    if (matches == 1) return first_match;
+    if (matches > 1) return ResolveError.AmbiguousId;
+
+    if (needle.len < id_prefix_min) return ResolveError.PrefixTooShort;
+    return ResolveError.ContainerNotFound;
+}
+
+/// Collect up to `out.len` short IDs whose `containers/<id>/` directory
+/// name starts with `needle`. Used by `cli/rm.zig` on the `AmbiguousId`
+/// error path to render the offending IDs into a diagnostic. Returns the
+/// number of IDs written; caller passes a small fixed-size buffer
+pub fn collectPrefixMatches(
+    io: Io,
+    root_dir: Io.Dir,
+    needle: []const u8,
+    out: [][id_short_length]u8,
+) Io.Dir.OpenError!usize {
+    if (out.len == 0) return 0;
+    if (needle.len < id_prefix_min) return 0;
+    if (needle.len > id_short_length) return 0;
+
+    var containers_dir = root_dir.openDir(io, containers_subpath, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return 0,
+        else => |e| return e,
+    };
+    defer containers_dir.close(io);
+
+    var n: usize = 0;
+    var it = containers_dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        if (entry.name.len != id_short_length) continue;
+        if (!std.mem.startsWith(u8, entry.name, needle)) continue;
+        @memcpy(&out[n], entry.name[0..id_short_length]);
+        n += 1;
+        if (n == out.len) break;
+    }
+    return n;
 }
 
 fn formatStartedAt(io: Io, buf: *[32]u8) []const u8 {
@@ -1045,4 +1174,265 @@ test "liveness: zombie process reports zombie" {
         _ = std.os.linux.nanosleep(&ts, null);
     }
     return error.ZombieNotObserved;
+}
+
+fn allocFixedId(
+    io: Io,
+    gpa: Allocator,
+    root: Io.Dir,
+    full_id: [id_full_length]u8,
+    image_ref: []const u8,
+    image_digest: []const u8,
+    name: ?[]const u8,
+) !Container {
+    var seq = RetrySeq{ .ids = &[_][id_full_length]u8{full_id} };
+    return allocateWithIdSource(io, gpa, root, image_ref, image_digest, name, null, .{
+        .fill_fn = RetrySeq.fill,
+        .ctx = &seq,
+    });
+}
+
+test "resolveTarget: missing containers/ returns ContainerNotFound" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root = try tmp.dir.createDirPathOpen(testing.io, "rind", .{
+        .open_options = .{ .iterate = true },
+    });
+    defer root.close(testing.io);
+
+    try testing.expectError(
+        ResolveError.ContainerNotFound,
+        resolveTarget(testing.io, testing.allocator, root, "abcd"),
+    );
+}
+
+test "resolveTarget: empty needle is ContainerNotFound" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root = try tmp.dir.createDirPathOpen(testing.io, "rind", .{
+        .open_options = .{ .iterate = true },
+    });
+    defer root.close(testing.io);
+
+    try testing.expectError(
+        ResolveError.ContainerNotFound,
+        resolveTarget(testing.io, testing.allocator, root, ""),
+    );
+}
+
+test "resolveTarget: exact name match returns id" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root = try tmp.dir.createDirPathOpen(testing.io, "rind", .{
+        .open_options = .{ .iterate = true },
+    });
+    defer root.close(testing.io);
+
+    var c = try allocFixedId(
+        testing.io,
+        gpa,
+        root,
+        ("a" ** id_full_length).*,
+        "alpine:3.19",
+        "sha256:aa",
+        "web",
+    );
+    defer c.deinit(gpa);
+
+    const got = try resolveTarget(testing.io, gpa, root, "web");
+    try testing.expectEqualStrings(c.id[0..], got[0..]);
+}
+
+test "resolveTarget: full short id resolves" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root = try tmp.dir.createDirPathOpen(testing.io, "rind", .{
+        .open_options = .{ .iterate = true },
+    });
+    defer root.close(testing.io);
+
+    var c = try allocFixedId(
+        testing.io,
+        gpa,
+        root,
+        ("b" ** id_full_length).*,
+        "alpine:3.19",
+        "sha256:bb",
+        null,
+    );
+    defer c.deinit(gpa);
+
+    const got = try resolveTarget(testing.io, gpa, root, c.id[0..]);
+    try testing.expectEqualStrings(c.id[0..], got[0..]);
+}
+
+test "resolveTarget: 4-char prefix unambiguous" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root = try tmp.dir.createDirPathOpen(testing.io, "rind", .{
+        .open_options = .{ .iterate = true },
+    });
+    defer root.close(testing.io);
+
+    var c = try allocFixedId(
+        testing.io,
+        gpa,
+        root,
+        ("c" ** id_full_length).*,
+        "alpine:3.19",
+        "sha256:cc",
+        null,
+    );
+    defer c.deinit(gpa);
+
+    const got = try resolveTarget(testing.io, gpa, root, "cccc");
+    try testing.expectEqualStrings(c.id[0..], got[0..]);
+}
+
+test "resolveTarget: 3-char prefix is too short when no name match" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root = try tmp.dir.createDirPathOpen(testing.io, "rind", .{
+        .open_options = .{ .iterate = true },
+    });
+    defer root.close(testing.io);
+
+    var c = try allocFixedId(
+        testing.io,
+        gpa,
+        root,
+        ("d" ** id_full_length).*,
+        "alpine:3.19",
+        "sha256:dd",
+        null,
+    );
+    defer c.deinit(gpa);
+
+    try testing.expectError(
+        ResolveError.PrefixTooShort,
+        resolveTarget(testing.io, gpa, root, "ddd"),
+    );
+}
+
+test "resolveTarget: ambiguous prefix returns AmbiguousId" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root = try tmp.dir.createDirPathOpen(testing.io, "rind", .{
+        .open_options = .{ .iterate = true },
+    });
+    defer root.close(testing.io);
+
+    var id1: [id_full_length]u8 = undefined;
+    var id2: [id_full_length]u8 = undefined;
+    @memcpy(id1[0..6], "ababab");
+    @memset(id1[6..], 'a');
+    @memcpy(id2[0..6], "ababab");
+    @memset(id2[6..], 'b');
+
+    var c1 = try allocFixedId(testing.io, gpa, root, id1, "alpine:3.19", "sha256:01", null);
+    defer c1.deinit(gpa);
+    var c2 = try allocFixedId(testing.io, gpa, root, id2, "alpine:3.19", "sha256:02", null);
+    defer c2.deinit(gpa);
+
+    try testing.expectError(
+        ResolveError.AmbiguousId,
+        resolveTarget(testing.io, gpa, root, "abab"),
+    );
+}
+
+test "resolveTarget: name match wins over conflicting id-prefix" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root = try tmp.dir.createDirPathOpen(testing.io, "rind", .{
+        .open_options = .{ .iterate = true },
+    });
+    defer root.close(testing.io);
+
+    var named = try allocFixedId(
+        testing.io,
+        gpa,
+        root,
+        ("e" ** id_full_length).*,
+        "alpine:3.19",
+        "sha256:e1",
+        "feed",
+    );
+    defer named.deinit(gpa);
+
+    var prefix_owner = try allocFixedId(
+        testing.io,
+        gpa,
+        root,
+        ("f" ** 4 ++ "e" ** (id_full_length - 4)).*,
+        "alpine:3.19",
+        "sha256:e2",
+        null,
+    );
+    defer prefix_owner.deinit(gpa);
+
+    const got = try resolveTarget(testing.io, gpa, root, "feed");
+    try testing.expectEqualStrings(named.id[0..], got[0..]);
+}
+
+test "resolveTarget: no match returns ContainerNotFound" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root = try tmp.dir.createDirPathOpen(testing.io, "rind", .{
+        .open_options = .{ .iterate = true },
+    });
+    defer root.close(testing.io);
+
+    var c = try allocFixedId(
+        testing.io,
+        gpa,
+        root,
+        ("9" ** id_full_length).*,
+        "alpine:3.19",
+        "sha256:99",
+        "live",
+    );
+    defer c.deinit(gpa);
+
+    try testing.expectError(
+        ResolveError.ContainerNotFound,
+        resolveTarget(testing.io, gpa, root, "ghostly"),
+    );
+}
+
+test "collectPrefixMatches: returns up to two ambiguous ids" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root = try tmp.dir.createDirPathOpen(testing.io, "rind", .{
+        .open_options = .{ .iterate = true },
+    });
+    defer root.close(testing.io);
+
+    var id1: [id_full_length]u8 = undefined;
+    var id2: [id_full_length]u8 = undefined;
+    @memcpy(id1[0..6], "cdcdcd");
+    @memset(id1[6..], '1');
+    @memcpy(id2[0..6], "cdcdcd");
+    @memset(id2[6..], '2');
+
+    var c1 = try allocFixedId(testing.io, gpa, root, id1, "alpine:3.19", "sha256:01", null);
+    defer c1.deinit(gpa);
+    var c2 = try allocFixedId(testing.io, gpa, root, id2, "alpine:3.19", "sha256:02", null);
+    defer c2.deinit(gpa);
+
+    var out: [2][id_short_length]u8 = undefined;
+    const n = try collectPrefixMatches(testing.io, root, "cdcd", out[0..]);
+    try testing.expectEqual(@as(usize, 2), n);
+    const got1 = out[0][0..];
+    const got2 = out[1][0..];
+    const both = std.mem.eql(u8, got1, c1.id[0..]) or std.mem.eql(u8, got1, c2.id[0..]);
+    try testing.expect(both);
+    try testing.expect(!std.mem.eql(u8, got1, got2));
 }

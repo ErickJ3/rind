@@ -46,6 +46,7 @@ const state_mod = @import("runtime/state.zig");
 const overlay_mod = @import("runtime/overlay.zig");
 const bundle_mod = @import("runtime/bundle.zig");
 const core = @import("runtime/core.zig");
+const teardown_mod = @import("runtime/teardown.zig");
 
 /// Re-exported so callers don't double-import `runtime/bundle.zig`
 /// just to construct overrides.
@@ -273,7 +274,9 @@ pub fn runImage(
     //              after the explicit success-path cleanup so the
     //              errdefer becomes a no-op when control returns.
     var keep_dirs = !opts.rm;
-    errdefer if (!keep_dirs) cleanupTriplet(io, env.root_dir, container.id);
+    errdefer if (!keep_dirs) {
+        teardown_mod.removeTriplet(io, env.root_dir, container.id[0..], container.id_full[0..]) catch {};
+    };
 
     emit(opts, .{ .run_started = .{ .ref = ref_text, .id = container.id } });
 
@@ -382,7 +385,7 @@ pub fn runImage(
 
     var removed = false;
     if (opts.rm) {
-        try strictCleanupTriplet(io, env.root_dir, container.id);
+        try teardown_mod.removeTriplet(io, env.root_dir, container.id[0..], container.id_full[0..]);
         keep_dirs = true;
         emit(opts, .removed);
         removed = true;
@@ -442,43 +445,6 @@ fn findDescriptor(
         }
     }
     return null;
-}
-
-/// Best-effort triplet teardown for the errdefer cleanup path. Errors
-/// are swallowed because errdefer cannot return them; the success
-/// path uses `strictCleanupTriplet` instead.
-fn cleanupTriplet(
-    io: Io,
-    root_dir: Io.Dir,
-    id: [state_mod.id_short_length]u8,
-) void {
-    deleteOne(io, root_dir, state_mod.containers_subpath, id) catch {};
-    deleteOne(io, root_dir, state_mod.bundles_subpath, id) catch {};
-    deleteOne(io, root_dir, state_mod.overlays_subpath, id) catch {};
-}
-
-/// Same as `cleanupTriplet` but propagates the first error. Used on
-/// the success path with `--rm` so the caller sees real failures
-/// (e.g. EBUSY because the overlay never unmounted).
-fn strictCleanupTriplet(
-    io: Io,
-    root_dir: Io.Dir,
-    id: [state_mod.id_short_length]u8,
-) Io.Dir.DeleteTreeError!void {
-    try deleteOne(io, root_dir, state_mod.containers_subpath, id);
-    try deleteOne(io, root_dir, state_mod.bundles_subpath, id);
-    try deleteOne(io, root_dir, state_mod.overlays_subpath, id);
-}
-
-fn deleteOne(
-    io: Io,
-    root_dir: Io.Dir,
-    parent_subpath: []const u8,
-    id: [state_mod.id_short_length]u8,
-) Io.Dir.DeleteTreeError!void {
-    var buf: [128]u8 = undefined;
-    const path = std.fmt.bufPrint(&buf, "{s}/{s}", .{ parent_subpath, id[0..] }) catch unreachable;
-    try root_dir.deleteTree(io, path);
 }
 
 const pid_watcher_max_attempts: u32 = 500;
