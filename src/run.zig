@@ -331,6 +331,12 @@ pub fn runImage(
 
     const pid_file_path = try std.fmt.allocPrint(aa, "{s}/pid", .{bundle_abs});
 
+    // Skip the pid watcher on `--rm` runs: the container is ephemeral so
+    // no `rind ps` consumer will see `.running` mid-flight, and dropping
+    // the thread also drops the SIGCHLD-routing race that motivated the
+    // sigprocmask block (libcrun's signalfd owns the signal on the only
+    // remaining thread). For non-`--rm` runs we keep the watcher so
+    // inspectable state.json carries the live pid.
     var watcher = PidWatcher{
         .io = io,
         .gpa = gpa,
@@ -338,30 +344,33 @@ pub fn runImage(
         .container_id = container.id,
         .pid_file_path = pid_file_path,
     };
-
-    // Block SIGCHLD on this thread for the duration of the spawn so the
-    // watcher inherits it blocked. libcrun's `wait_for_process` uses a
-    // signalfd to consume SIGCHLD on the main thread; if SIGCHLD is
-    // unblocked on the watcher, the kernel can route the container's
-    // death-time SIGCHLD there (default disposition: ignore) and
-    // libcrun's signalfd never fires `runSync` then hangs in
-    // epoll_wait forever. Mirrors `runtime/Pty.zig:start`.
-    var prev_set: std.posix.sigset_t = undefined;
-    {
-        var block_set: std.posix.sigset_t = std.posix.sigemptyset();
-        std.posix.sigaddset(&block_set, .CHLD);
-        std.posix.sigprocmask(std.posix.SIG.BLOCK, &block_set, &prev_set);
+    var watcher_thread_opt: ?std.Thread = null;
+    var watcher_joined = true;
+    if (!opts.rm) {
+        // Block SIGCHLD on this thread for the duration of the spawn so the
+        // watcher inherits it blocked. libcrun's `wait_for_process` uses a
+        // signalfd to consume SIGCHLD on the main thread; if SIGCHLD is
+        // unblocked on the watcher, the kernel can route the container's
+        // death-time SIGCHLD there (default disposition: ignore) and
+        // libcrun's signalfd never fires `runSync` then hangs in
+        // epoll_wait forever. Mirrors `runtime/Pty.zig:start`.
+        var prev_set: std.posix.sigset_t = undefined;
+        {
+            var block_set: std.posix.sigset_t = std.posix.sigemptyset();
+            std.posix.sigaddset(&block_set, .CHLD);
+            std.posix.sigprocmask(std.posix.SIG.BLOCK, &block_set, &prev_set);
+        }
+        watcher_thread_opt = std.Thread.spawn(
+            .{},
+            PidWatcher.run,
+            .{&watcher},
+        ) catch |err| spawn_blk: {
+            std.log.debug("rind: pid watcher spawn failed: {s}", .{@errorName(err)});
+            break :spawn_blk null;
+        };
+        std.posix.sigprocmask(std.posix.SIG.SETMASK, &prev_set, null);
+        watcher_joined = false;
     }
-    const watcher_thread_opt: ?std.Thread = std.Thread.spawn(
-        .{},
-        PidWatcher.run,
-        .{&watcher},
-    ) catch |err| spawn_blk: {
-        std.log.debug("rind: pid watcher spawn failed: {s}", .{@errorName(err)});
-        break :spawn_blk null;
-    };
-    std.posix.sigprocmask(std.posix.SIG.SETMASK, &prev_set, null);
-    var watcher_joined = false;
     defer if (!watcher_joined) {
         watcher.done.store(true, .release);
         if (watcher_thread_opt) |t| t.join();
@@ -376,9 +385,11 @@ pub fn runImage(
         .pid_file_path = pid_file_path,
     });
 
-    watcher.done.store(true, .release);
-    if (watcher_thread_opt) |t| t.join();
-    watcher_joined = true;
+    if (!watcher_joined) {
+        watcher.done.store(true, .release);
+        if (watcher_thread_opt) |t| t.join();
+        watcher_joined = true;
+    }
 
     const exit_code: u8, const signal: u8 = switch (status) {
         .exit => |c| .{ c, 0 },
