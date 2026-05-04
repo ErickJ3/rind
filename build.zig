@@ -24,6 +24,15 @@ pub fn build(b: *std.Build) void {
         "Link host libc dynamically (workaround for musl + systemd-resolved DNS issues).",
     ) orelse false;
 
+    // libcrun memfd-clones `/proc/self/exe` at every container start
+    // an unstripped 71MB Debug binary costs ~33ms wall on `rind run`.
+    // Strip in non-Debug by default; debug keeps symbols for gdb.
+    const strip = b.option(
+        bool,
+        "strip",
+        "Strip debug info from the rind binary (default: true in non-Debug builds).",
+    ) orelse (optimize != .Debug);
+
     const build_options = b.addOptions();
     build_options.addOption(bool, "e2e_enabled", enable_e2e);
     const build_options_mod = build_options.createModule();
@@ -51,6 +60,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .link_libc = dev_libc,
+        .strip = strip,
         .imports = &.{
             .{ .name = "rind", .module = mod },
             .{ .name = "clap", .module = clap_dep.module("clap") },
