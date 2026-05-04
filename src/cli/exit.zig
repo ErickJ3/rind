@@ -71,6 +71,9 @@ pub fn mapErrorToExitCode(err: anyerror) Code {
         error.EmptyArgs,
         error.UnsupportedUserFormat,
         error.InvalidEnv,
+        error.InvalidVolumeSpec,
+        error.VolumeSourceNotAbsolute,
+        error.VolumeSourceUnreadable,
         => .usage,
         error.DigestMismatch,
         error.MediaTypeMismatch,
@@ -119,19 +122,19 @@ test "mapErrorToExitCode classifies common cases" {
 }
 
 test "mapErrorToExitCode classifies run-side errors" {
-    // User-input failures land on .usage so a missing image or bad
-    // override exits with the same code as a malformed flag.
     try testing.expectEqual(Code.usage, mapErrorToExitCode(error.ImageNotPresent));
     try testing.expectEqual(Code.usage, mapErrorToExitCode(error.InvalidEnv));
     try testing.expectEqual(Code.usage, mapErrorToExitCode(error.EmptyArgs));
     try testing.expectEqual(Code.usage, mapErrorToExitCode(error.UnsupportedUserFormat));
-    // Manifest media-type mismatches at run time are integrity failures
-    // mirroring pull's verification class.
+    try testing.expectEqual(Code.usage, mapErrorToExitCode(error.InvalidVolumeSpec));
+    try testing.expectEqual(Code.usage, mapErrorToExitCode(error.VolumeSourceUnreadable));
+    try testing.expectEqual(Code.usage, mapErrorToExitCode(error.VolumeSourceNotAbsolute));
     try testing.expectEqual(Code.verification, mapErrorToExitCode(error.UnsupportedManifestMediaType));
-    // Runtime / kernel failures fall through to .generic.
     try testing.expectEqual(Code.generic, mapErrorToExitCode(error.LibcrunFailure));
     try testing.expectEqual(Code.generic, mapErrorToExitCode(error.BundleNotFound));
     try testing.expectEqual(Code.generic, mapErrorToExitCode(error.PermissionDenied));
     try testing.expectEqual(Code.generic, mapErrorToExitCode(error.InvalidConfig));
     try testing.expectEqual(Code.generic, mapErrorToExitCode(error.AlreadyRunning));
+    try testing.expectEqual(Code.generic, mapErrorToExitCode(error.PtySetupFailed));
+    try testing.expectEqual(Code.generic, mapErrorToExitCode(error.ConsoleSocketFailed));
 }

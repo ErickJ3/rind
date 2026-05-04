@@ -26,6 +26,7 @@ pub fn build(b: *std.Build) void {
 
     const build_options = b.addOptions();
     build_options.addOption(bool, "e2e_enabled", enable_e2e);
+    const build_options_mod = build_options.createModule();
 
     const clap_dep = b.dependency("clap", .{
         .target = target,
@@ -40,6 +41,10 @@ pub fn build(b: *std.Build) void {
         // built off this module compile.
         .link_libc = true,
     });
+    // Inline E2E tests gate themselves on `build_options.e2e_enabled`,
+    // so the same module needs to import it. Without this, any
+    // `@import("build_options")` from a `src/` file fails at compile.
+    mod.addImport("build_options", build_options_mod);
 
     const exe_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -49,7 +54,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "rind", .module = mod },
             .{ .name = "clap", .module = clap_dep.module("clap") },
-            .{ .name = "build_options", .module = build_options.createModule() },
+            .{ .name = "build_options", .module = build_options_mod },
         },
     });
 

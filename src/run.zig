@@ -314,10 +314,17 @@ pub fn runImage(
 
     emit(opts, .{ .started = .{ .pid = 0 } });
 
+    const console_socket_path: ?[]const u8 = if (opts.overrides.tty)
+        try std.fmt.allocPrint(aa, "{s}/console.sock", .{bundle_abs})
+    else
+        null;
+
     const status = try deps.run_fn(io, gpa, .{
         .id = container.id[0..],
         .state_root = state_root_abs,
         .bundle = bundle_abs,
+        .tty = opts.overrides.tty,
+        .console_socket_path = console_socket_path,
     });
 
     const exit_code: u8, const signal: u8 = switch (status) {

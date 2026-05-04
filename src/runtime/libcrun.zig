@@ -42,6 +42,13 @@ pub const RuntimeError = error{
     LibcrunFailure,
     /// Allocator failure while building C strings or duping diagnostics.
     OutOfMemory,
+    /// Pty teardown / setup outside the console-socket dance: `tcgetattr`
+    /// on a non-terminal stdin, `tcsetattr` failure, recvmsg parse,
+    /// thread-spawn failure, etc.
+    PtySetupFailed,
+    /// AF_UNIX listener for `console_socket` could not be created
+    /// (`bind`, `listen`, or `accept` failed before libcrun connected).
+    ConsoleSocketFailed,
 };
 
 /// Decoded outcome of a synchronous container run. libcrun reports its result

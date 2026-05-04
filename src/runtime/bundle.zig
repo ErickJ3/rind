@@ -17,8 +17,6 @@
 //! half-written config never lands on disk.
 //!
 //! Out of scope here:
-//!   - bind-mount overrides,
-//!   - pty / `process.terminal=true`,
 //!   - AppArmor / SELinux labels,
 //!   - `--read-only` rootfs flag.
 
@@ -28,6 +26,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
 const image_config = @import("../image/config.zig");
+const mount_spec = @import("mount_spec.zig");
 const state_mod = @import("state.zig");
 const overlay_mod = @import("overlay.zig");
 const subid_mod = @import("subid.zig");
@@ -58,6 +57,13 @@ pub const RunOverrides = struct {
     workdir: ?[]const u8 = null,
     /// Replaces `image_config.config.User` when non-null.
     user: ?[]const u8 = null,
+    /// Bind mounts from `-v host:container[:ro]`. Appended to
+    /// `default_mounts` after the kernel/proc/dev set so user mounts
+    /// can never shadow `/dev/pts` or `/proc`.
+    mounts: []const mount_spec.UserMount = &.{},
+    /// `-t/--tty`. Drives `process.terminal` and tells the orchestrator
+    /// to wire `console_socket`.
+    tty: bool = false,
 };
 
 /// Closed semantic error set composed at the public entry. Filesystem
@@ -192,10 +198,32 @@ pub fn composeWithIds(
 
     const merged_path: []const u8 = std.mem.span(@as([*:0]const u8, @ptrCast(overlay.merged_path.ptr)));
 
+    const mounts = try buildMounts(aa, overrides.mounts);
+
+    // OCI `process.consoleSize`: libcrun honours this via
+    // `libcrun_terminal_setup_size` BEFORE `execve`, so the slave pty's
+    // winsize is non-zero by the time the container shell calls
+    // `TIOCGWINSZ`. Without it, busybox `ash` falls back to writing
+    // `\033[6n` on every prompt redraw, leaking `^[[<row>;<col>R` into
+    // the shell. Best-effort: if rind's stdin is not a tty (piped
+    // tests, headless runs) leave consoleSize null.
+    const console_size: ?ConsoleSize = if (overrides.tty) blk: {
+        var ws: std.posix.winsize = undefined;
+        const rc = std.os.linux.ioctl(
+            std.posix.STDIN_FILENO,
+            std.os.linux.T.IOCGWINSZ,
+            @intFromPtr(&ws),
+        );
+        if (std.os.linux.errno(rc) != .SUCCESS) break :blk null;
+        if (ws.row == 0 or ws.col == 0) break :blk null;
+        break :blk .{ .height = ws.row, .width = ws.col };
+    } else null;
+
     const doc: Document = .{
         .ociVersion = oci_version,
         .process = .{
-            .terminal = false,
+            .terminal = overrides.tty,
+            .consoleSize = console_size,
             .user = .{ .uid = user.uid, .gid = user.gid },
             .args = args,
             .env = env,
@@ -206,7 +234,7 @@ pub fn composeWithIds(
         },
         .root = .{ .path = merged_path, .readonly = false },
         .hostname = hostname_buf[0..],
-        .mounts = &default_mounts,
+        .mounts = mounts,
         .linux = .{
             .uidMappings = id_maps.uid,
             .gidMappings = id_maps.gid,
@@ -242,6 +270,33 @@ fn writeConfigJson(io: Io, bundle_dir: Io.Dir, doc: Document) (Io.Dir.CreateFile
     fw.interface.flush() catch return fw.err.?;
 
     try atomic.link(io);
+}
+
+fn buildMounts(
+    aa: Allocator,
+    user: []const mount_spec.UserMount,
+) Allocator.Error![]Mount {
+    const out = try aa.alloc(Mount, default_mounts.len + user.len);
+    @memcpy(out[0..default_mounts.len], &default_mounts);
+    for (user, 0..) |um, i| {
+        const opts = try aa.alloc([]const u8, if (um.read_only) 4 else 3);
+        opts[0] = "rbind";
+        if (um.read_only) {
+            opts[1] = "ro";
+            opts[2] = "nosuid";
+            opts[3] = "nodev";
+        } else {
+            opts[1] = "nosuid";
+            opts[2] = "nodev";
+        }
+        out[default_mounts.len + i] = .{
+            .destination = um.destination,
+            .type = "none",
+            .source = um.source,
+            .options = opts,
+        };
+    }
+    return out;
 }
 
 fn resolveArgs(
@@ -281,7 +336,21 @@ fn mergeEnv(
         try validateEnvEntry(e);
         try replaceOrAppendEnv(aa, &list, e);
     }
+    // Docker parity: with `-t`, inject `TERM=xterm` when no other layer
+    // supplied one. Without it, busybox `ash` falls back to writing
+    // `\033[6n` (DSR) at first prompt to discover terminal width — the
+    // response leaks back into the shell as `^[[<row>;<col>R`.
+    if (overrides.tty and !hasEnvKey(list.items, "TERM")) {
+        try list.append(aa, "TERM=xterm");
+    }
     return list.items;
+}
+
+fn hasEnvKey(items: []const []const u8, key: []const u8) bool {
+    for (items) |entry| {
+        if (std.mem.eql(u8, keyOf(entry), key)) return true;
+    }
+    return false;
 }
 
 fn validateEnvEntry(entry: []const u8) BundleError!void {
@@ -554,6 +623,7 @@ const Document = struct {
 
 const Process = struct {
     terminal: bool,
+    consoleSize: ?ConsoleSize = null,
     user: User,
     args: []const []const u8,
     env: []const []const u8,
@@ -561,6 +631,11 @@ const Process = struct {
     capabilities: Capabilities,
     rlimits: []const Rlimit,
     noNewPrivileges: bool,
+};
+
+const ConsoleSize = struct {
+    height: u32,
+    width: u32,
 };
 
 const User = struct {
@@ -1140,6 +1215,215 @@ test "resolveIdMappings: rootless + sub ranges emits 2-entry with hostID=1" {
     try testing.expectEqual(@as(usize, 2), maps.gid.len);
     try testing.expectEqual(@as(u32, 1), maps.gid[1].hostID);
     try testing.expectEqual(@as(u32, 32768), maps.gid[1].size);
+}
+
+test "compose: -v rw mount appended after defaults" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const img_cfg: image_config.ImageConfig = .{
+        .architecture = "amd64",
+        .os = "linux",
+        .rootfs = .{ .type = "layers", .diff_ids = &[_][]const u8{} },
+    };
+    const cmd_overrides = [_][]const u8{"/bin/true"};
+    const user_mounts = [_]mount_spec.UserMount{
+        .{ .source = "/tmp/host-data", .destination = "/data", .read_only = false },
+    };
+    const overrides: RunOverrides = .{
+        .cmd = &cmd_overrides,
+        .mounts = &user_mounts,
+    };
+
+    var got = try composeIntoTmp(aa, overrides, img_cfg);
+    defer got.tmp.cleanup();
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, aa, got.bytes, .{});
+    defer parsed.deinit();
+    const mounts = parsed.value.object.get("mounts").?.array;
+    try testing.expectEqual(@as(usize, default_mounts.len + 1), mounts.items.len);
+
+    const last = mounts.items[mounts.items.len - 1].object;
+    try testing.expectEqualStrings("/data", last.get("destination").?.string);
+    try testing.expectEqualStrings("none", last.get("type").?.string);
+    try testing.expectEqualStrings("/tmp/host-data", last.get("source").?.string);
+    const opts = last.get("options").?.array;
+    try testing.expectEqual(@as(usize, 3), opts.items.len);
+    try testing.expectEqualStrings("rbind", opts.items[0].string);
+    try testing.expectEqualStrings("nosuid", opts.items[1].string);
+    try testing.expectEqualStrings("nodev", opts.items[2].string);
+}
+
+test "compose: -v :ro mount adds 'ro' to options" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const img_cfg: image_config.ImageConfig = .{
+        .architecture = "amd64",
+        .os = "linux",
+        .rootfs = .{ .type = "layers", .diff_ids = &[_][]const u8{} },
+    };
+    const cmd_overrides = [_][]const u8{"/bin/true"};
+    const user_mounts = [_]mount_spec.UserMount{
+        .{ .source = "/etc/passwd", .destination = "/etc/passwd", .read_only = true },
+    };
+    const overrides: RunOverrides = .{
+        .cmd = &cmd_overrides,
+        .mounts = &user_mounts,
+    };
+
+    var got = try composeIntoTmp(aa, overrides, img_cfg);
+    defer got.tmp.cleanup();
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, aa, got.bytes, .{});
+    defer parsed.deinit();
+    const mounts = parsed.value.object.get("mounts").?.array;
+    const last = mounts.items[mounts.items.len - 1].object;
+    const opts = last.get("options").?.array;
+    try testing.expectEqual(@as(usize, 4), opts.items.len);
+    try testing.expectEqualStrings("rbind", opts.items[0].string);
+    try testing.expectEqualStrings("ro", opts.items[1].string);
+    try testing.expectEqualStrings("nosuid", opts.items[2].string);
+    try testing.expectEqualStrings("nodev", opts.items[3].string);
+}
+
+test "compose: tty=true sets process.terminal" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const img_cfg: image_config.ImageConfig = .{
+        .architecture = "amd64",
+        .os = "linux",
+        .rootfs = .{ .type = "layers", .diff_ids = &[_][]const u8{} },
+    };
+    const cmd_overrides = [_][]const u8{"/bin/sh"};
+    const overrides: RunOverrides = .{
+        .cmd = &cmd_overrides,
+        .tty = true,
+    };
+
+    var got = try composeIntoTmp(aa, overrides, img_cfg);
+    defer got.tmp.cleanup();
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, aa, got.bytes, .{});
+    defer parsed.deinit();
+    const terminal = parsed.value.object.get("process").?.object.get("terminal").?.bool;
+    try testing.expectEqual(true, terminal);
+}
+
+fn envContains(env: std.json.Array, expected: []const u8) bool {
+    for (env.items) |item| {
+        if (std.mem.eql(u8, item.string, expected)) return true;
+    }
+    return false;
+}
+
+test "compose: tty=true injects TERM=xterm when absent" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const img_cfg: image_config.ImageConfig = .{
+        .architecture = "amd64",
+        .os = "linux",
+        .rootfs = .{ .type = "layers", .diff_ids = &[_][]const u8{} },
+    };
+    const cmd_overrides = [_][]const u8{"/bin/sh"};
+    const overrides: RunOverrides = .{
+        .cmd = &cmd_overrides,
+        .tty = true,
+    };
+
+    var got = try composeIntoTmp(aa, overrides, img_cfg);
+    defer got.tmp.cleanup();
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, aa, got.bytes, .{});
+    defer parsed.deinit();
+    const env = parsed.value.object.get("process").?.object.get("env").?.array;
+    try testing.expect(envContains(env, "TERM=xterm"));
+}
+
+test "compose: tty=true preserves user-provided TERM" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const img_cfg: image_config.ImageConfig = .{
+        .architecture = "amd64",
+        .os = "linux",
+        .rootfs = .{ .type = "layers", .diff_ids = &[_][]const u8{} },
+    };
+    const cmd_overrides = [_][]const u8{"/bin/sh"};
+    const env_overrides = [_][]const u8{"TERM=screen-256color"};
+    const overrides: RunOverrides = .{
+        .cmd = &cmd_overrides,
+        .env = &env_overrides,
+        .tty = true,
+    };
+
+    var got = try composeIntoTmp(aa, overrides, img_cfg);
+    defer got.tmp.cleanup();
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, aa, got.bytes, .{});
+    defer parsed.deinit();
+    const env = parsed.value.object.get("process").?.object.get("env").?.array;
+    try testing.expect(envContains(env, "TERM=screen-256color"));
+    try testing.expect(!envContains(env, "TERM=xterm"));
+}
+
+test "compose: tty=false leaves TERM untouched" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const img_cfg: image_config.ImageConfig = .{
+        .architecture = "amd64",
+        .os = "linux",
+        .rootfs = .{ .type = "layers", .diff_ids = &[_][]const u8{} },
+    };
+    const cmd_overrides = [_][]const u8{"/bin/sh"};
+    const overrides: RunOverrides = .{
+        .cmd = &cmd_overrides,
+    };
+
+    var got = try composeIntoTmp(aa, overrides, img_cfg);
+    defer got.tmp.cleanup();
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, aa, got.bytes, .{});
+    defer parsed.deinit();
+    const env = parsed.value.object.get("process").?.object.get("env").?.array;
+    try testing.expect(!envContains(env, "TERM=xterm"));
+}
+
+test "compose: tty=true preserves image config TERM" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var env_image = [_][]const u8{ "PATH=/usr/bin", "TERM=linux" };
+    const cmd = [_][]const u8{"/bin/sh"};
+    const img_cfg: image_config.ImageConfig = .{
+        .architecture = "amd64",
+        .os = "linux",
+        .rootfs = .{ .type = "layers", .diff_ids = &[_][]const u8{} },
+        .config = .{
+            .Env = &env_image,
+            .Cmd = @constCast(&cmd),
+        },
+    };
+    const overrides: RunOverrides = .{ .tty = true };
+
+    var got = try composeIntoTmp(aa, overrides, img_cfg);
+    defer got.tmp.cleanup();
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, aa, got.bytes, .{});
+    defer parsed.deinit();
+    const env = parsed.value.object.get("process").?.object.get("env").?.array;
+    try testing.expect(envContains(env, "TERM=linux"));
+    try testing.expect(!envContains(env, "TERM=xterm"));
 }
 
 test "compose rootless+subid emits 2-entry mappings in config.json" {

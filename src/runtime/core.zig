@@ -2,13 +2,14 @@
 //!
 //! Wraps `libcrun.runSync` and forwards SIGINT/SIGTERM/SIGQUIT/SIGHUP
 //! to the container while it runs, restoring the prior handlers on
-//! return. Stdio is inherited verbatim from rind's process — no
-//! proxying, no shim.
+//! return. When `req.tty` is set, a `Pty` instance opens an AF_UNIX
+//! console socket libcrun connects to, receives the master pty fd via
+//! `SCM_RIGHTS`, and proxies rind's stdin↔master in a worker thread.
+//! Otherwise stdio is inherited verbatim — no proxying.
 //!
 //! Scope:
 //!   - One synchronous foreground call; `-d` / detached supervision
 //!     is not yet implemented.
-//!   - No pty / `--console-socket`.
 //!   - No state-file lifecycle writes.
 //!
 //! Signal-handler discipline:
@@ -38,6 +39,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const libcrun = @import("libcrun.zig");
+const Pty = @import("Pty.zig");
 
 const c = @cImport({
     @cInclude("errno.h");
@@ -70,6 +72,13 @@ pub const RunRequest = struct {
     /// Disable libcrun's cgroup setup. Default `true` so rootless dev
     /// runs work without configuring a delegated user.slice.
     force_no_cgroup: bool = true,
+    /// `-t/--tty`. When true, `console_socket_path` must also be set;
+    /// `runForeground` opens an AF_UNIX listener at that path, hands
+    /// it to libcrun, and proxies stdio through the master pty.
+    tty: bool = false,
+    /// AF_UNIX path for the pty console socket. Required when `tty`
+    /// is true; ignored otherwise.
+    console_socket_path: ?[]const u8 = null,
 };
 
 /// Runs the bundle at `req.bundle` to completion, forwarding
@@ -101,15 +110,35 @@ pub fn runForeground(
     };
     defer ctx.deinit();
 
+    var pty_storage: ?Pty = null;
+    defer if (pty_storage) |*p| p.deinit();
+    if (req.tty) {
+        const path = req.console_socket_path orelse return libcrun.RuntimeError.PtySetupFailed;
+        pty_storage = Pty.open(gpa, path) catch return libcrun.RuntimeError.ConsoleSocketFailed;
+        const pty_ref = &pty_storage.?;
+        pty_ref.enterRawMode() catch return libcrun.RuntimeError.PtySetupFailed;
+        // `restore` is idempotent and `deinit` calls it too; the
+        // explicit call here keeps the terminal cooked for any
+        // post-run output before the deferred `deinit` fires.
+        defer pty_ref.restore();
+        pty_ref.start() catch return libcrun.RuntimeError.PtySetupFailed;
+        ctx.console_socket = path;
+    }
+
     try Forwarder.install(gpa, &ctx);
     defer Forwarder.uninstall(gpa);
 
-    return libcrun.runSync(&ctx, container, .{}) catch |err| {
+    const status = libcrun.runSync(&ctx, container, .{}) catch |err| {
         if (ctx.last_error) |le| {
             std.log.err("libcrun: {s} (status={d})", .{ le.message, le.errno });
         }
         return err;
     };
+    if (pty_storage) |*p| {
+        p.join();
+        if (p.recvFailed()) return libcrun.RuntimeError.PtySetupFailed;
+    }
+    return status;
 }
 
 /// Lookup table mapping each forwarded signal to the libcrun-accepted
@@ -228,11 +257,17 @@ const Forwarder = struct {
     /// SIGINT/SIGTERM/SIGQUIT/SIGHUP entry point. Async-signal-safe:
     ///   - No allocation (z-strings pre-built at install time).
     ///   - No locking (slot is atomic).
+    ///   - Restores stdin termios via `Pty.restoreAsyncSignalSafe` so a
+    ///     hung libcrun call never strands the user's terminal in raw
+    ///     mode. The call is idempotent and a no-op when no pty is
+    ///     active.
     ///   - One libcrun call (`libcrun_container_kill`); errors silenced
     ///     because handlers can't propagate.
     fn handler(sig: std.posix.SIG) callconv(.c) void {
         _ = in_handler.fetchAdd(1, .acq_rel);
         defer _ = in_handler.fetchSub(1, .acq_rel);
+
+        Pty.restoreAsyncSignalSafe();
 
         const raw = slot.load(.acquire);
         if (raw == 0) return;

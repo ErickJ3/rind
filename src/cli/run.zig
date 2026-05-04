@@ -20,6 +20,7 @@ const clap = @import("clap");
 
 const run_mod = @import("../run.zig");
 const bundle_mod = @import("../runtime/bundle.zig");
+const mount_spec = @import("../runtime/mount_spec.zig");
 const layout = @import("../store/layout.zig");
 
 const exit = @import("exit.zig");
@@ -68,6 +69,11 @@ pub const RunArgs = struct {
     /// `--platform <plat>`. Host-only in MVP; rejected unless equal
     /// to `pull_cli.expected_platform`.
     platform: ?[]const u8 = null,
+    /// `-v/--volume host:container[:ro]` (repeatable). Raw specs;
+    /// `mount_spec.parseAll` turns them into `UserMount`s in `run()`.
+    volumes: []const []const u8 = &.{},
+    /// `-t/--tty`. Allocates a pty and switches stdin to raw mode.
+    tty: bool = false,
 };
 
 /// Run-handler dependency injection. The CLI test seam wraps the
@@ -114,6 +120,9 @@ const params = clap.parseParamsComptime(
     \\-u, --user <str>            UID, UID:GID, or username.
     \\    --entrypoint <str>      Override the image entrypoint.
     \\    --platform <str>        Target platform (host-only in MVP).
+    \\-v, --volume <str>...       Bind-mount host:container[:ro]. Repeatable.
+    \\-i, --interactive           Keep stdin open (no-op today; stdin already inherits).
+    \\-t, --tty                   Allocate a pseudo-terminal.
     \\<str>                       Image reference (e.g. alpine:3.19).
     \\<str>...                    Optional command + args to run.
     \\
@@ -221,6 +230,19 @@ pub fn parseArgs(
         try gpa.dupe(u8, p)
     else
         null;
+    errdefer if (platform_owned) |p| gpa.free(p);
+
+    const vol_src = res.args.volume;
+    var volumes_owned = try gpa.alloc([]const u8, vol_src.len);
+    var volumes_filled: usize = 0;
+    errdefer {
+        for (volumes_owned[0..volumes_filled]) |s| gpa.free(s);
+        gpa.free(volumes_owned);
+    }
+    for (vol_src) |s| {
+        volumes_owned[volumes_filled] = try gpa.dupe(u8, s);
+        volumes_filled += 1;
+    }
 
     return .{
         .image = image_owned,
@@ -234,6 +256,8 @@ pub fn parseArgs(
         .user = user_owned,
         .entrypoint = entrypoint_owned,
         .platform = platform_owned,
+        .volumes = volumes_owned,
+        .tty = res.args.tty != 0,
     };
 }
 
@@ -251,6 +275,8 @@ pub fn freeArgs(gpa: Allocator, args: RunArgs) void {
     if (args.user) |u| gpa.free(u);
     if (args.entrypoint) |e| gpa.free(e);
     if (args.platform) |p| gpa.free(p);
+    for (args.volumes) |v| gpa.free(v);
+    gpa.free(args.volumes);
 }
 
 /// Cap on an `--env-file` read. 1 MiB is generous; Docker's docs
@@ -338,12 +364,20 @@ pub fn run(
 
     const cmd_override: ?[]const []const u8 = if (args.cmd.len == 0) null else args.cmd;
 
+    const user_mounts = mount_spec.parseAll(io, gpa, args.volumes) catch |err| {
+        try out.on_error(out.ctx, @errorName(err));
+        return err;
+    };
+    defer mount_spec.freeAll(gpa, user_mounts);
+
     const overrides: bundle_mod.RunOverrides = .{
         .entrypoint = entrypoint_override,
         .cmd = cmd_override,
         .env = merged_env,
         .workdir = args.workdir,
         .user = args.user,
+        .mounts = user_mounts,
+        .tty = args.tty,
     };
 
     var trampoline_ctx: TrampolineCtx = .{ .renderer = out };
