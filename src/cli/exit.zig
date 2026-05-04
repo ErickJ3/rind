@@ -4,13 +4,11 @@
 //! other layer returns a typed error and lets `mapErrorToExitCode`
 //! assign it to the documented code:
 //!
-//! | Code | Meaning            |
-//! |------|--------------------|
-//! | 0    | Success            |
-//! | 1    | Generic / storage / config / unhandled |
-//! | 2    | Usage (bad flags, bad ref, unsupported platform) |
-//! | 3    | Network (registry transport, DNS, TLS) |
-//! | 4    | Verification (digest / media-type mismatch) |
+//! - 0 — success
+//! - 1 — generic / storage / config / unhandled
+//! - 2 — usage (bad flags, bad ref, unsupported platform)
+//! - 3 — network (registry transport, DNS, TLS)
+//! - 4 — verification (digest / media-type mismatch)
 //!
 //! The mapping is intentionally forgiving: any error not classified
 //! here falls through to exit 1 rather than crashing the binary.

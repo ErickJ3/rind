@@ -15,10 +15,9 @@
 //!      (busybox-derived images alone ship hundreds of `bin/<applet>
 //!      -> /bin/busybox` links) require it. The kernel does not resolve
 //!      the target at `symlinkat` time; the runtime risk that a later
-//!      extractor op traverses through such a link onto the host is
-//!      tracked separately and will be addressed when the runner
-//!      milestone introduces NOFOLLOW-style path resolution on
-//!      per-layer overlays.
+//!      extractor op traverses through such a link onto the host is a
+//!      known gap — the runner does not yet enforce NOFOLLOW-style
+//!      path resolution on per-layer overlays.
 //!
 //!   2. **Whiteouts** — `.wh.<name>` removes a sibling and `.wh..wh..opq`
 //!      clears its parent directory's contents (preserving the directory
