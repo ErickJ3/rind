@@ -4,3 +4,4 @@ docs/
 zig-out/
 .claude
 zig-pkg/
+CLAUDE.md
