@@ -2,9 +2,10 @@
 //!
 //! Walks `<root>/containers/*/state.json`, refreshes liveness from
 //! `/proc` for `.running` rows, and renders either a fixed-width table
-//! (CONTAINER ID, IMAGE, COMMAND, CREATED, STATUS, NAMES) or a stable
-//! JSON array. `-a/--all` includes `.exited` rows; the default mirrors
-//! Docker and hides them.
+//! (CONTAINER ID, IMAGE, COMMAND, CREATED, STATUS, NAMES), a stable
+//! JSON array, or under `-q` one short id per line. The default
+//! mirrors Docker: only `.running` rows are shown; `-a/--all` adds
+//! `.created` and `.exited`.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -20,15 +21,21 @@ pub const OutputKind = enum { human, json };
 
 /// Validated argv for `rind ps`.
 pub const PsArgs = struct {
-    /// `--output {human,json}`. Defaults to human.
+    /// `--output {human,json}`. Defaults to human. Ignored when `quiet`
+    /// is set `-q` always emits one short id per line.
     output: OutputKind = .human,
-    /// `-a/--all`. When false, `.exited` rows are filtered out.
+    /// `-a/--all`. When false, only `.running` rows are shown
+    /// (`.created` and `.exited` are filtered out, mirroring Docker).
     all: bool = false,
+    /// `-q/--quiet`. Emit one short container id per line, nothing
+    /// else. Wins over `--output`; intended for `rind ps -q | xargs`.
+    quiet: bool = false,
 };
 
 const params = clap.parseParamsComptime(
     \\-h, --help              Display this help and exit.
-    \\-a, --all               Show all containers (default hides exited).
+    \\-a, --all               Show all containers (default shows running only).
+    \\-q, --quiet             Only display container IDs.
     \\    --output <kind>     Output format: human (default) or json.
     \\
 );
@@ -38,7 +45,7 @@ const value_parsers = .{
 };
 
 /// One-line usage banner. Stable enough that scripts can grep it.
-pub const usage_line: []const u8 = "Usage: rind ps [-a|--all] [--output human|json]";
+pub const usage_line: []const u8 = "Usage: rind ps [-a|--all] [-q|--quiet] [--output human|json]";
 
 /// Parse argv (after `ps` has been peeled off) into a validated
 /// `PsArgs`. `iter` is consumed; `gpa` backs clap's working arena.
@@ -67,6 +74,7 @@ pub fn parseArgs(
     return .{
         .output = res.args.output orelse .human,
         .all = res.args.all != 0,
+        .quiet = res.args.quiet != 0,
     };
 }
 
@@ -172,7 +180,7 @@ pub fn run(
             if (live != .alive) status = .exited;
         }
 
-        if (!args.all and status == .exited) continue;
+        if (!args.all and status != .running) continue;
 
         try rows.append(gpa, .{
             .id = parsed.id,
@@ -198,11 +206,20 @@ fn renderOutput(
     rows: []const PsRow,
     now_unix_secs: i64,
 ) !void {
-    switch (args.output) {
+    if (args.quiet) {
+        try renderQuiet(stdout, rows);
+    } else switch (args.output) {
         .human => try renderHuman(stdout, rows, now_unix_secs),
         .json => try renderJson(stdout, rows),
     }
     try stdout.flush();
+}
+
+fn renderQuiet(w: *Io.Writer, rows: []const PsRow) Io.Writer.Error!void {
+    for (rows) |row| {
+        try w.writeAll(row.id);
+        try w.writeByte('\n');
+    }
 }
 
 const col_id_w: usize = 14;
@@ -470,13 +487,14 @@ fn parseFromSlice(gpa: Allocator, argv: []const []const u8, err_writer: *Io.Writ
     return parseArgs(gpa, &iter, err_writer);
 }
 
-test "parseArgs default is human, all=false" {
+test "parseArgs default is human, all=false, quiet=false" {
     const gpa = testing.allocator;
     var err_buf: Io.Writer.Allocating = .init(gpa);
     defer err_buf.deinit();
     const a = try parseFromSlice(gpa, &.{}, &err_buf.writer);
     try testing.expectEqual(OutputKind.human, a.output);
     try testing.expect(!a.all);
+    try testing.expect(!a.quiet);
 }
 
 test "parseArgs accepts -a and --output json" {
@@ -486,6 +504,23 @@ test "parseArgs accepts -a and --output json" {
     const a = try parseFromSlice(gpa, &.{ "-a", "--output", "json" }, &err_buf.writer);
     try testing.expect(a.all);
     try testing.expectEqual(OutputKind.json, a.output);
+}
+
+test "parseArgs accepts -q and combined -aq" {
+    const gpa = testing.allocator;
+    var err_buf: Io.Writer.Allocating = .init(gpa);
+    defer err_buf.deinit();
+
+    const q_only = try parseFromSlice(gpa, &.{"-q"}, &err_buf.writer);
+    try testing.expect(q_only.quiet);
+    try testing.expect(!q_only.all);
+
+    const aq = try parseFromSlice(gpa, &.{ "-a", "-q" }, &err_buf.writer);
+    try testing.expect(aq.quiet);
+    try testing.expect(aq.all);
+
+    const long = try parseFromSlice(gpa, &.{"--quiet"}, &err_buf.writer);
+    try testing.expect(long.quiet);
 }
 
 test "parseArgs rejects unknown flag" {
@@ -591,7 +626,7 @@ test "run on missing containers/ emits header only / empty array" {
     }
 }
 
-test "run lists allocated container, hides exited by default, -a includes" {
+test "run hides .created and .exited by default; -a includes both" {
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -603,7 +638,7 @@ test "run lists allocated container, hides exited by default, -a includes" {
     });
     defer root.close(io);
 
-    var c1 = try state_mod.allocate(io, gpa, root, "alpine:3.19", "sha256:aa", "live", "/bin/sh");
+    var c1 = try state_mod.allocate(io, gpa, root, "alpine:3.19", "sha256:aa", "fresh", "/bin/sh");
     defer c1.deinit(gpa);
     var c2 = try state_mod.allocate(io, gpa, root, "busybox:1", "sha256:bb", "gone", "/bin/true");
     defer c2.deinit(gpa);
@@ -616,8 +651,7 @@ test "run lists allocated container, hides exited by default, -a includes" {
         var err_buf: Io.Writer.Allocating = .init(gpa);
         defer err_buf.deinit();
         try run(io, gpa, root, .{ .output = .json, .all = false }, fixture_now_unix, &out_buf.writer, &err_buf.writer);
-        try testing.expect(std.mem.indexOf(u8, out_buf.written(), "live") != null);
-        try testing.expect(std.mem.indexOf(u8, out_buf.written(), "gone") == null);
+        try testing.expectEqualStrings("[]\n", out_buf.written());
     }
 
     {
@@ -626,10 +660,50 @@ test "run lists allocated container, hides exited by default, -a includes" {
         var err_buf: Io.Writer.Allocating = .init(gpa);
         defer err_buf.deinit();
         try run(io, gpa, root, .{ .output = .json, .all = true }, fixture_now_unix, &out_buf.writer, &err_buf.writer);
-        try testing.expect(std.mem.indexOf(u8, out_buf.written(), "live") != null);
+        try testing.expect(std.mem.indexOf(u8, out_buf.written(), "fresh") != null);
         try testing.expect(std.mem.indexOf(u8, out_buf.written(), "gone") != null);
+        try testing.expect(std.mem.indexOf(u8, out_buf.written(), "\"status\": \"created\"") != null);
         try testing.expect(std.mem.indexOf(u8, out_buf.written(), "\"status\": \"exited\"") != null);
     }
+}
+
+test "run quiet emits id-per-line, no header, ignores --output" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var root = try tmp.dir.createDirPathOpen(io, "rind", .{
+        .open_options = .{ .iterate = true },
+    });
+    defer root.close(io);
+
+    var c1 = try state_mod.allocate(io, gpa, root, "alpine:3.19", "sha256:aa", "first", "/bin/sh");
+    defer c1.deinit(gpa);
+    var c2 = try state_mod.allocate(io, gpa, root, "busybox:1", "sha256:bb", "second", "/bin/true");
+    defer c2.deinit(gpa);
+
+    var out_buf: Io.Writer.Allocating = .init(gpa);
+    defer out_buf.deinit();
+    var err_buf: Io.Writer.Allocating = .init(gpa);
+    defer err_buf.deinit();
+
+    try run(io, gpa, root, .{ .quiet = true, .all = true, .output = .json }, fixture_now_unix, &out_buf.writer, &err_buf.writer);
+
+    const got = out_buf.written();
+    try testing.expect(std.mem.indexOf(u8, got, "CONTAINER ID") == null);
+    try testing.expect(std.mem.indexOf(u8, got, "{") == null);
+    try testing.expect(std.mem.indexOf(u8, got, c1.id[0..]) != null);
+    try testing.expect(std.mem.indexOf(u8, got, c2.id[0..]) != null);
+
+    var lines: usize = 0;
+    var it = std.mem.splitScalar(u8, got, '\n');
+    while (it.next()) |line| if (line.len != 0) {
+        try testing.expectEqual(state_mod.id_short_length, line.len);
+        lines += 1;
+    };
+    try testing.expectEqual(@as(usize, 2), lines);
 }
 
 test "run reconciles stale .running rows against /proc liveness" {
