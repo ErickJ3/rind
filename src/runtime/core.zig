@@ -111,16 +111,15 @@ pub fn runForeground(
     defer ctx.deinit();
 
     var pty_storage: ?Pty = null;
-    defer if (pty_storage) |*p| p.deinit();
+    defer if (pty_storage) |*p| {
+        p.restore();
+        p.deinit();
+    };
     if (req.tty) {
         const path = req.console_socket_path orelse return libcrun.RuntimeError.PtySetupFailed;
         pty_storage = Pty.open(gpa, path) catch return libcrun.RuntimeError.ConsoleSocketFailed;
         const pty_ref = &pty_storage.?;
         pty_ref.enterRawMode() catch return libcrun.RuntimeError.PtySetupFailed;
-        // `restore` is idempotent and `deinit` calls it too; the
-        // explicit call here keeps the terminal cooked for any
-        // post-run output before the deferred `deinit` fires.
-        defer pty_ref.restore();
         pty_ref.start() catch return libcrun.RuntimeError.PtySetupFailed;
         ctx.console_socket = path;
     }

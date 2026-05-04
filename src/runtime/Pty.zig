@@ -91,9 +91,6 @@ pub fn open(gpa: Allocator, console_socket_path: []const u8) Error!Pty {
     const path_z = gpa.dupeZ(u8, console_socket_path) catch return Error.PtySetupFailed;
     errdefer gpa.free(path_z);
 
-    // Stale socket from a crashed prior run trips bind with EADDRINUSE.
-    // Best-effort unlink — if the path is still missing the bind below
-    // surfaces the real error.
     _ = linux.unlink(path_z.ptr);
 
     const sock_rc = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
@@ -145,27 +142,7 @@ pub fn enterRawMode(self: *Pty) Error!void {
     self.saved_termios = saved;
 
     var raw = saved;
-    // `cfmakeraw` per Linux man page: clear input/output post-processing
-    // and line-discipline cooking; force 8-bit chars; one byte minimum
-    // read with no inter-character timeout.
-    raw.iflag.IGNBRK = false;
-    raw.iflag.BRKINT = false;
-    raw.iflag.PARMRK = false;
-    raw.iflag.ISTRIP = false;
-    raw.iflag.INLCR = false;
-    raw.iflag.IGNCR = false;
-    raw.iflag.ICRNL = false;
-    raw.iflag.IXON = false;
-    raw.oflag.OPOST = false;
-    raw.lflag.ECHO = false;
-    raw.lflag.ECHONL = false;
-    raw.lflag.ICANON = false;
-    raw.lflag.ISIG = false;
-    raw.lflag.IEXTEN = false;
-    raw.cflag.PARENB = false;
-    raw.cflag.CSIZE = .CS8;
-    raw.cc[@intFromEnum(linux.V.MIN)] = 1;
-    raw.cc[@intFromEnum(linux.V.TIME)] = 0;
+    applyCfmakeraw(&raw);
 
     posix.tcsetattr(fd, .NOW, raw) catch return Error.PtySetupFailed;
 
@@ -187,8 +164,24 @@ pub fn enterRawMode(self: *Pty) Error!void {
 
 /// Spawn the worker thread. Caller invokes `libcrun.runSync` after
 /// `start` returns; the worker handles accept + recvmsg + proxy.
+///
+/// SIGCHLD is masked on the main thread for the duration of the
+/// spawn so the worker inherits it blocked. libcrun's
+/// `wait_for_process` later sets up a signalfd that consumes
+/// SIGCHLD on the main thread; with an unblocked SIGCHLD on the
+/// worker, the kernel could route the container's death-time
+/// SIGCHLD to the worker (default disposition: ignore) and
+/// libcrun's signalfd would never fire — `runSync` then hangs
+/// forever.
 pub fn start(self: *Pty) Error!void {
     if (self.worker != null) return Error.PtySetupFailed;
+
+    var block_set: posix.sigset_t = posix.sigemptyset();
+    posix.sigaddset(&block_set, .CHLD);
+    var prev_set: posix.sigset_t = undefined;
+    posix.sigprocmask(posix.SIG.BLOCK, &block_set, &prev_set);
+    defer posix.sigprocmask(posix.SIG.SETMASK, &prev_set, null);
+
     self.worker = std.Thread.spawn(.{}, workerEntry, .{self}) catch
         return Error.PtySetupFailed;
 }
@@ -359,6 +352,8 @@ fn proxyLoop(self: *Pty, master: i32) void {
         .{ .fd = self.wake_pipe[0], .events = linux.POLL.IN, .revents = 0 },
     };
     var buf: [4096]u8 = undefined;
+    var filtered: [4096]u8 = undefined;
+    var dsr: DsrFilter = .{};
     while (true) {
         fds[0].revents = 0;
         fds[1].revents = 0;
@@ -370,7 +365,7 @@ fn proxyLoop(self: *Pty, master: i32) void {
 
         if (fds[0].revents & (linux.POLL.IN | linux.POLL.HUP) != 0) {
             const n = readSome(master, &buf) orelse return;
-            if (n == 0) return; // master EOF — container exited
+            if (n == 0) return; // master EOF
             writeAll(posix.STDOUT_FILENO, buf[0..n]);
         }
         if (stdin_open and fds[1].revents & (linux.POLL.IN | linux.POLL.HUP) != 0) {
@@ -378,7 +373,8 @@ fn proxyLoop(self: *Pty, master: i32) void {
             if (n == 0) {
                 stdin_open = false;
             } else {
-                writeAll(master, buf[0..n]);
+                const out = dsr.process(buf[0..n], &filtered);
+                if (out.len > 0) writeAll(master, out);
             }
         }
         if (fds[2].revents != 0) {
@@ -426,6 +422,91 @@ fn forwardWinsize(stdin_fd: i32, master_fd: i32) void {
     )) != .SUCCESS) return;
     _ = linux.ioctl(master_fd, linux.T.IOCSWINSZ, @intFromPtr(&ws));
 }
+
+/// `cfmakeraw` per Linux man page: clear input/output post-processing
+/// and line-discipline cooking; force 8-bit chars; one byte minimum
+/// read with no inter-character timeout. Mutates in place.
+fn applyCfmakeraw(t: *posix.termios) void {
+    t.iflag.IGNBRK = false;
+    t.iflag.BRKINT = false;
+    t.iflag.PARMRK = false;
+    t.iflag.ISTRIP = false;
+    t.iflag.INLCR = false;
+    t.iflag.IGNCR = false;
+    t.iflag.ICRNL = false;
+    t.iflag.IXON = false;
+    t.oflag.OPOST = false;
+    t.lflag.ECHO = false;
+    t.lflag.ECHONL = false;
+    t.lflag.ICANON = false;
+    t.lflag.ISIG = false;
+    t.lflag.IEXTEN = false;
+    t.cflag.PARENB = false;
+    t.cflag.CSIZE = .CS8;
+    t.cc[@intFromEnum(linux.V.MIN)] = 1;
+    t.cc[@intFromEnum(linux.V.TIME)] = 0;
+}
+
+const DsrFilter = struct {
+    state: State = .normal,
+    pending: [16]u8 = undefined,
+    pending_len: u8 = 0,
+
+    const State = enum { normal, after_esc, after_csi };
+
+    fn process(self: *DsrFilter, in: []const u8, out: []u8) []const u8 {
+        var w: usize = 0;
+        for (in) |b| {
+            switch (self.state) {
+                .normal => {
+                    if (b == 0x1b) {
+                        self.state = .after_esc;
+                        self.pending[0] = b;
+                        self.pending_len = 1;
+                    } else {
+                        out[w] = b;
+                        w += 1;
+                    }
+                },
+                .after_esc => {
+                    if (b == '[') {
+                        self.pending[self.pending_len] = b;
+                        self.pending_len += 1;
+                        self.state = .after_csi;
+                    } else {
+                        w += flushPending(self, out[w..]);
+                        out[w] = b;
+                        w += 1;
+                        self.state = .normal;
+                    }
+                },
+                .after_csi => {
+                    const accept = (b >= '0' and b <= '9') or b == ';';
+                    if (accept and self.pending_len < self.pending.len) {
+                        self.pending[self.pending_len] = b;
+                        self.pending_len += 1;
+                    } else if (b == 'R') {
+                        self.state = .normal;
+                        self.pending_len = 0;
+                    } else {
+                        w += flushPending(self, out[w..]);
+                        out[w] = b;
+                        w += 1;
+                        self.state = .normal;
+                    }
+                },
+            }
+        }
+        return out[0..w];
+    }
+
+    fn flushPending(self: *DsrFilter, out: []u8) usize {
+        const n = self.pending_len;
+        @memcpy(out[0..n], self.pending[0..n]);
+        self.pending_len = 0;
+        return n;
+    }
+};
 
 const RawState = struct {
     fd: std.atomic.Value(i32) = .init(-1),
@@ -582,7 +663,7 @@ test "recvMasterFd: extracts fd sent over a socketpair" {
     try testing.expect(recv >= 0);
     try testing.expect(recv != dummy[0]); // recv is a duped fd in our process
 
-    // The duped fd should refer to the same pipe — write to dummy[1] and
+    // The duped fd should refer to the same pipe, write to dummy[1] and
     // read it through `recv` to confirm.
     const probe: [3]u8 = .{ 'h', 'i', 0 };
     try testing.expectEqual(@as(usize, 3), linux.write(dummy[1], &probe, 3));
@@ -632,4 +713,82 @@ test "enterRawMode: returns NotATerminal when stdin is a pipe" {
 
     pty.saved_stdin_fd = pipe_fds[0];
     try testing.expectError(Error.NotATerminal, pty.enterRawMode());
+}
+
+test "applyCfmakeraw: clears canonical/echo/post-processing flags" {
+    var t: posix.termios = std.mem.zeroes(posix.termios);
+    t.iflag.ICRNL = true;
+    t.iflag.IXON = true;
+    t.oflag.OPOST = true;
+    t.lflag.ICANON = true;
+    t.lflag.ECHO = true;
+    t.lflag.ECHONL = true;
+    t.lflag.ISIG = true;
+
+    applyCfmakeraw(&t);
+
+    try testing.expectEqual(false, t.iflag.ICRNL);
+    try testing.expectEqual(false, t.iflag.IXON);
+    try testing.expectEqual(false, t.oflag.OPOST);
+    try testing.expectEqual(false, t.lflag.ICANON);
+    try testing.expectEqual(false, t.lflag.ECHO);
+    try testing.expectEqual(false, t.lflag.ECHONL);
+    try testing.expectEqual(false, t.lflag.ISIG);
+    try testing.expectEqual(posix.CSIZE.CS8, t.cflag.CSIZE);
+    try testing.expectEqual(@as(u8, 1), t.cc[@intFromEnum(linux.V.MIN)]);
+    try testing.expectEqual(@as(u8, 0), t.cc[@intFromEnum(linux.V.TIME)]);
+}
+
+test "DsrFilter: drops simple CPR sequence" {
+    var f: DsrFilter = .{};
+    var out: [64]u8 = undefined;
+    const r = f.process("\x1b[5;4R", &out);
+    try testing.expectEqualSlices(u8, "", r);
+}
+
+test "DsrFilter: drops multi-digit CPR sequence" {
+    var f: DsrFilter = .{};
+    var out: [64]u8 = undefined;
+    const r = f.process("\x1b[123;456R", &out);
+    try testing.expectEqualSlices(u8, "", r);
+}
+
+test "DsrFilter: passes plain ASCII unchanged" {
+    var f: DsrFilter = .{};
+    var out: [64]u8 = undefined;
+    const r = f.process("hello world\n", &out);
+    try testing.expectEqualSlices(u8, "hello world\n", r);
+}
+
+test "DsrFilter: passes non-CPR CSI sequences unchanged" {
+    var f: DsrFilter = .{};
+    var out: [64]u8 = undefined;
+    // `\x1b[A` (cursor up), `\x1b[?6n` (DEC private DSR), `\x1b[5n` (status).
+    const input = "\x1b[A\x1b[?6n\x1b[5n";
+    const r = f.process(input, &out);
+    try testing.expectEqualSlices(u8, input, r);
+}
+
+test "DsrFilter: passes lone ESC unchanged when not followed by `[`" {
+    var f: DsrFilter = .{};
+    var out: [64]u8 = undefined;
+    const r = f.process("\x1bz", &out);
+    try testing.expectEqualSlices(u8, "\x1bz", r);
+}
+
+test "DsrFilter: state persists across calls (split sequence)" {
+    var f: DsrFilter = .{};
+    var out1: [64]u8 = undefined;
+    var out2: [64]u8 = undefined;
+    const r1 = f.process("hi\x1b[5", &out1);
+    try testing.expectEqualSlices(u8, "hi", r1);
+    const r2 = f.process(";4R bye", &out2);
+    try testing.expectEqualSlices(u8, " bye", r2);
+}
+
+test "DsrFilter: CPR followed by user input emits only the input" {
+    var f: DsrFilter = .{};
+    var out: [64]u8 = undefined;
+    const r = f.process("\x1b[5;4Rls\n", &out);
+    try testing.expectEqualSlices(u8, "ls\n", r);
 }
