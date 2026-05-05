@@ -38,3 +38,12 @@ clean:
 
 check:
     zig build --summary all
+
+bench:
+    bash bench/run-all.sh
+
+bench-quick:
+    bash bench/run-all.sh --skip pull-cold,rm
+
+bench-snapshot:
+    cp bench/results/latest.md "bench/results/history/$(date +%F)_$(git rev-parse --short HEAD).md"
