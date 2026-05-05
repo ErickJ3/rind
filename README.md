@@ -1,8 +1,6 @@
 # rind
 
-A container runtime that runs OCI images without a daemon. One static binary; state lives in `~/.rind/` and there's no background process.
-
-It's for Linux machines where you want `docker pull` and `docker run` semantics but don't want Docker Desktop.
+A daemonless container runtime for fast, reproducible OCI workflows on Linux.
 
 ![demo](demo.gif)
 
