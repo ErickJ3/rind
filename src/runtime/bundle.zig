@@ -64,6 +64,17 @@ pub const RunOverrides = struct {
     /// `-t/--tty`. Drives `process.terminal` and tells the orchestrator
     /// to wire `console_socket`.
     tty: bool = false,
+    /// `--memory <bytes>`. Sets `linux.resources.memory.limit`. Null
+    /// leaves the field absent and lets cgroup setup remain skipped.
+    memory_bytes: ?i64 = null,
+    /// `--cpus <fraction>` translated to a CFS quota in microseconds.
+    /// Pairs with `cpu_period_us`; when null both fields drop out of
+    /// the OCI doc.
+    cpu_quota_us: ?i64 = null,
+    /// CFS scheduling period in microseconds. Defaults to 100_000
+    /// (100ms) at the orchestrator when `cpu_quota_us` is set; null
+    /// here lets `compose` decide.
+    cpu_period_us: ?u64 = null,
 };
 
 /// Closed semantic error set composed at the public entry. Filesystem
@@ -242,7 +253,13 @@ pub fn composeWithIds(
             .maskedPaths = default_masked_paths,
             .readonlyPaths = default_readonly_paths,
             .cgroupsPath = cgroups_path,
-            .resources = .{},
+            .resources = .{
+                .memory = if (overrides.memory_bytes) |b| .{ .limit = b } else null,
+                .cpu = if (overrides.cpu_quota_us) |q| .{
+                    .quota = q,
+                    .period = overrides.cpu_period_us orelse 100_000,
+                } else null,
+            },
             .seccomp = seccomp,
         },
     };
@@ -696,7 +713,20 @@ const Namespace = struct {
     type: []const u8,
 };
 
-const Resources = struct {};
+const Resources = struct {
+    memory: ?Memory = null,
+    cpu: ?Cpu = null,
+};
+
+const Memory = struct {
+    limit: ?i64 = null,
+    swap: ?i64 = null,
+};
+
+const Cpu = struct {
+    quota: ?i64 = null,
+    period: ?u64 = null,
+};
 
 /// Mirrors the OCI `linux.seccomp` schema. Field order is fixed so the
 /// re-stringified output is deterministic across builds.
@@ -1120,6 +1150,83 @@ test "compose: InvalidEnv on missing equals sign" {
     const c = fakeContainer();
 
     try testing.expectError(BundleError.InvalidEnv, composeWithIds(testing.io, aa, io_bundle_dir, c, img_cfg, overrides, ovl, fixed_id_source));
+}
+
+test "compose with memory_bytes writes resources.memory.limit" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const img_cfg: image_config.ImageConfig = .{
+        .architecture = "amd64",
+        .os = "linux",
+        .rootfs = .{ .type = "layers", .diff_ids = &[_][]const u8{} },
+    };
+    const cmd_overrides = [_][]const u8{"/bin/true"};
+    const overrides: RunOverrides = .{
+        .cmd = &cmd_overrides,
+        .memory_bytes = 50 * 1024 * 1024,
+        .cpu_quota_us = 150_000,
+    };
+
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var io_bundle_dir = try tmp.dir.createDirPathOpen(testing.io, "bundle", .{
+        .open_options = .{ .iterate = true },
+    });
+    defer io_bundle_dir.close(testing.io);
+
+    var ovl = try fakeOverlay(aa);
+    defer ovl.deinit();
+    const c = fakeContainer();
+
+    try composeWithIds(testing.io, aa, io_bundle_dir, c, img_cfg, overrides, ovl, fixed_id_source);
+
+    const json_bytes = try io_bundle_dir.readFileAlloc(testing.io, "config.json", aa, .limited(1 << 20));
+    var parsed = try std.json.parseFromSlice(std.json.Value, aa, json_bytes, .{});
+    defer parsed.deinit();
+
+    const resources = parsed.value.object.get("linux").?.object.get("resources").?.object;
+    const memory = resources.get("memory").?.object;
+    try testing.expectEqual(@as(i64, 50 * 1024 * 1024), memory.get("limit").?.integer);
+    const cpu = resources.get("cpu").?.object;
+    try testing.expectEqual(@as(i64, 150_000), cpu.get("quota").?.integer);
+    try testing.expectEqual(@as(i64, 100_000), cpu.get("period").?.integer);
+}
+
+test "compose without resource overrides omits memory and cpu" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const img_cfg: image_config.ImageConfig = .{
+        .architecture = "amd64",
+        .os = "linux",
+        .rootfs = .{ .type = "layers", .diff_ids = &[_][]const u8{} },
+    };
+    const cmd_overrides = [_][]const u8{"/bin/true"};
+    const overrides: RunOverrides = .{ .cmd = &cmd_overrides };
+
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var io_bundle_dir = try tmp.dir.createDirPathOpen(testing.io, "bundle", .{
+        .open_options = .{ .iterate = true },
+    });
+    defer io_bundle_dir.close(testing.io);
+
+    var ovl = try fakeOverlay(aa);
+    defer ovl.deinit();
+    const c = fakeContainer();
+
+    try composeWithIds(testing.io, aa, io_bundle_dir, c, img_cfg, overrides, ovl, fixed_id_source);
+
+    const json_bytes = try io_bundle_dir.readFileAlloc(testing.io, "config.json", aa, .limited(1 << 20));
+    var parsed = try std.json.parseFromSlice(std.json.Value, aa, json_bytes, .{});
+    defer parsed.deinit();
+
+    const resources = parsed.value.object.get("linux").?.object.get("resources").?.object;
+    try testing.expectEqual(@as(?std.json.Value, null), resources.get("memory"));
+    try testing.expectEqual(@as(?std.json.Value, null), resources.get("cpu"));
 }
 
 test "compose: UnsupportedUserFormat on textual user" {
