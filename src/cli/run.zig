@@ -74,6 +74,16 @@ pub const RunArgs = struct {
     volumes: []const []const u8 = &.{},
     /// `-t/--tty`. Allocates a pty and switches stdin to raw mode.
     tty: bool = false,
+    /// `-i/--interactive`. No-op today; stdin already inherits.
+    interactive: bool = false,
+    /// `--memory <bytes>`. Null = no limit.
+    memory_bytes: ?i64 = null,
+    /// `--cpus <decimal>` translated to a CFS quota in microseconds
+    /// (assuming a 100_000 µs period). Null = no CPU limit.
+    cpu_quota_us: ?i64 = null,
+    /// CFS period paired with `cpu_quota_us`. Always 100_000 when set
+    /// for now; field exists to keep the bundle override symmetrical.
+    cpu_period_us: ?u64 = null,
 };
 
 /// Run-handler dependency injection. The CLI test seam wraps the
@@ -123,8 +133,9 @@ const params = clap.parseParamsComptime(
     \\-v, --volume <str>...       Bind-mount host:container[:ro]. Repeatable.
     \\-i, --interactive           Keep stdin open (no-op today; stdin already inherits).
     \\-t, --tty                   Allocate a pseudo-terminal.
+    \\    --memory <str>          Memory limit (suffix k/m/g, e.g. 50m).
+    \\    --cpus <str>            CPU limit as decimal (e.g. 1.5 = 150%).
     \\<str>                       Image reference (e.g. alpine:3.19).
-    \\<str>...                    Optional command + args to run.
     \\
 );
 
@@ -134,7 +145,7 @@ const value_parsers = .{
 };
 
 /// One-line usage banner. Stable enough that scripts can grep it.
-pub const usage_line: []const u8 = "Usage: rind run [--output human|json] [--name <n>] [--rm] [-e|--env KEY=VAL]... [--env-file <path>] [-w|--workdir <dir>] [-u|--user <spec>] [--entrypoint <prog>] [--platform <plat>] <image> [--] [cmd...]";
+pub const usage_line: []const u8 = "Usage: rind run [--output human|json] [--name <n>] [--rm] [-e|--env KEY=VAL]... [--env-file <path>] [-w|--workdir <dir>] [-u|--user <spec>] [--entrypoint <prog>] [--platform <plat>] [-i] [-t] [--memory <size>] [--cpus <n>] <image> [--] [cmd...]";
 
 /// Parse argv (after the `run` subcommand has been peeled off) into a
 /// validated `RunArgs`. `iter` is consumed; `gpa` backs clap's
@@ -150,6 +161,12 @@ pub fn parseArgs(
     var res = clap.parseEx(clap.Help, &params, value_parsers, iter, .{
         .diagnostic = &diag,
         .allocator = gpa,
+        // Stop matching flags after the image positional so trailing
+        // tokens (the container's argv) flow through verbatim — this
+        // is what lets `rind run alpine sh -c "echo hi"` work without
+        // requiring `--` and stops `-c`/`-e` etc. from being claimed
+        // by rind's own flag table.
+        .terminating_positional = 0,
     }) catch {
         err_writer.print("{s}\n", .{usage_line}) catch {};
         return error.Usage;
@@ -166,23 +183,24 @@ pub fn parseArgs(
         return error.Usage;
     };
 
-    // Owned-by-arena strings would dangle once `res.deinit()` runs;
-    // dupe out everything we want to keep on `gpa` so the caller can
-    // call `freeArgs` symmetrically.
     const image_owned = try gpa.dupe(u8, image);
     errdefer gpa.free(image_owned);
 
-    const cmd_src = res.positionals[1];
-    var cmd_owned = try gpa.alloc([]const u8, cmd_src.len);
-    var cmd_filled: usize = 0;
+    var cmd_list: std.ArrayList([]const u8) = .empty;
     errdefer {
-        for (cmd_owned[0..cmd_filled]) |s| gpa.free(s);
-        gpa.free(cmd_owned);
+        for (cmd_list.items) |s| gpa.free(s);
+        cmd_list.deinit(gpa);
     }
-    for (cmd_src) |s| {
-        cmd_owned[cmd_filled] = try gpa.dupe(u8, s);
-        cmd_filled += 1;
+    var saw_separator = false;
+    while (iter.next()) |tok| {
+        if (!saw_separator and std.mem.eql(u8, tok, "--")) {
+            saw_separator = true;
+            continue;
+        }
+        saw_separator = true;
+        try cmd_list.append(gpa, try gpa.dupe(u8, tok));
     }
+    const cmd_owned = try cmd_list.toOwnedSlice(gpa);
 
     const env_src = res.args.env;
     var env_owned = try gpa.alloc([]const u8, env_src.len);
@@ -244,6 +262,24 @@ pub fn parseArgs(
         volumes_filled += 1;
     }
 
+    var memory_bytes: ?i64 = null;
+    if (res.args.memory) |m| {
+        memory_bytes = parseMemoryBytes(m) catch {
+            err_writer.print("{s}\n", .{usage_line}) catch {};
+            return error.Usage;
+        };
+    }
+    var cpu_quota_us: ?i64 = null;
+    var cpu_period_us: ?u64 = null;
+    if (res.args.cpus) |c| {
+        const parsed = parseCpus(c) catch {
+            err_writer.print("{s}\n", .{usage_line}) catch {};
+            return error.Usage;
+        };
+        cpu_quota_us = parsed.quota_us;
+        cpu_period_us = parsed.period_us;
+    }
+
     return .{
         .image = image_owned,
         .cmd = cmd_owned,
@@ -258,6 +294,10 @@ pub fn parseArgs(
         .platform = platform_owned,
         .volumes = volumes_owned,
         .tty = res.args.tty != 0,
+        .interactive = res.args.interactive != 0,
+        .memory_bytes = memory_bytes,
+        .cpu_quota_us = cpu_quota_us,
+        .cpu_period_us = cpu_period_us,
     };
 }
 
@@ -277,6 +317,35 @@ pub fn freeArgs(gpa: Allocator, args: RunArgs) void {
     if (args.platform) |p| gpa.free(p);
     for (args.volumes) |v| gpa.free(v);
     gpa.free(args.volumes);
+}
+
+/// Default CFS scheduling period used to convert `--cpus` decimals
+/// into a quota+period pair. 100ms matches Docker's runc default.
+const cpu_period_default_us: u64 = 100_000;
+
+fn parseMemoryBytes(s: []const u8) !i64 {
+    if (s.len == 0) return error.Usage;
+    const last = s[s.len - 1];
+    const multiplier: i64 = switch (last) {
+        'k', 'K' => 1024,
+        'm', 'M' => 1024 * 1024,
+        'g', 'G' => 1024 * 1024 * 1024,
+        else => 1,
+    };
+    const digits = if (multiplier == 1) s else s[0 .. s.len - 1];
+    if (digits.len == 0) return error.Usage;
+    const n = std.fmt.parseInt(i64, digits, 10) catch return error.Usage;
+    if (n <= 0) return error.Usage;
+    return n * multiplier;
+}
+
+fn parseCpus(s: []const u8) !struct { quota_us: i64, period_us: u64 } {
+    const f = std.fmt.parseFloat(f64, s) catch return error.Usage;
+    if (!(f > 0)) return error.Usage;
+    const period: u64 = cpu_period_default_us;
+    const quota_f = f * @as(f64, @floatFromInt(period));
+    if (!(quota_f > 0) or !std.math.isFinite(quota_f)) return error.Usage;
+    return .{ .quota_us = @intFromFloat(quota_f), .period_us = period };
 }
 
 /// Cap on an `--env-file` read. 1 MiB is generous; Docker's docs
@@ -378,6 +447,9 @@ pub fn run(
         .user = args.user,
         .mounts = user_mounts,
         .tty = args.tty,
+        .memory_bytes = args.memory_bytes,
+        .cpu_quota_us = args.cpu_quota_us,
+        .cpu_period_us = args.cpu_period_us,
     };
 
     var trampoline_ctx: TrampolineCtx = .{ .renderer = out };
@@ -473,6 +545,132 @@ test "parseArgs accepts image + -- + dash-prefixed cmd args" {
     try testing.expectEqualStrings("echo", a.cmd[0]);
     try testing.expectEqualStrings("-n", a.cmd[1]);
     try testing.expectEqualStrings("hi", a.cmd[2]);
+}
+
+test "parseArgs accepts dash-prefixed cmd token without --" {
+    const gpa = testing.allocator;
+    var err_buf: Io.Writer.Allocating = .init(gpa);
+    defer err_buf.deinit();
+
+    const a = try parseFromSlice(
+        gpa,
+        &.{ "--rm", "alpine", "sh", "-c", "echo hi" },
+        &err_buf.writer,
+    );
+    defer freeArgs(gpa, a);
+
+    try testing.expect(a.rm);
+    try testing.expectEqualStrings("alpine", a.image);
+    try testing.expectEqual(@as(usize, 3), a.cmd.len);
+    try testing.expectEqualStrings("sh", a.cmd[0]);
+    try testing.expectEqualStrings("-c", a.cmd[1]);
+    try testing.expectEqualStrings("echo hi", a.cmd[2]);
+}
+
+test "parseArgs accepts node -e literal as cmd" {
+    const gpa = testing.allocator;
+    var err_buf: Io.Writer.Allocating = .init(gpa);
+    defer err_buf.deinit();
+
+    const a = try parseFromSlice(
+        gpa,
+        &.{ "alpine", "node", "-e", "console.log(1)" },
+        &err_buf.writer,
+    );
+    defer freeArgs(gpa, a);
+
+    try testing.expectEqual(@as(usize, 0), a.env.len);
+    try testing.expectEqual(@as(usize, 3), a.cmd.len);
+    try testing.expectEqualStrings("node", a.cmd[0]);
+    try testing.expectEqualStrings("-e", a.cmd[1]);
+    try testing.expectEqualStrings("console.log(1)", a.cmd[2]);
+}
+
+test "parseArgs sets interactive on -i" {
+    const gpa = testing.allocator;
+    var err_buf: Io.Writer.Allocating = .init(gpa);
+    defer err_buf.deinit();
+    const a = try parseFromSlice(gpa, &.{ "-i", "alpine" }, &err_buf.writer);
+    defer freeArgs(gpa, a);
+    try testing.expect(a.interactive);
+    try testing.expect(!a.tty);
+}
+
+test "parseArgs accepts -it cluster" {
+    const gpa = testing.allocator;
+    var err_buf: Io.Writer.Allocating = .init(gpa);
+    defer err_buf.deinit();
+    const a = try parseFromSlice(gpa, &.{ "-it", "alpine" }, &err_buf.writer);
+    defer freeArgs(gpa, a);
+    try testing.expect(a.interactive);
+    try testing.expect(a.tty);
+}
+
+test "parseMemoryBytes accepts k/m/g suffixes" {
+    try testing.expectEqual(@as(i64, 50 * 1024 * 1024), try parseMemoryBytes("50m"));
+    try testing.expectEqual(@as(i64, 1024 * 1024 * 1024), try parseMemoryBytes("1g"));
+    try testing.expectEqual(@as(i64, 4096), try parseMemoryBytes("4k"));
+    try testing.expectEqual(@as(i64, 4096), try parseMemoryBytes("4K"));
+    try testing.expectEqual(@as(i64, 100), try parseMemoryBytes("100"));
+}
+
+test "parseMemoryBytes rejects malformed input" {
+    try testing.expectError(error.Usage, parseMemoryBytes(""));
+    try testing.expectError(error.Usage, parseMemoryBytes("m"));
+    try testing.expectError(error.Usage, parseMemoryBytes("0"));
+    try testing.expectError(error.Usage, parseMemoryBytes("-5m"));
+    try testing.expectError(error.Usage, parseMemoryBytes("abc"));
+}
+
+test "parseCpus translates decimals to quota+period" {
+    const a = try parseCpus("1.5");
+    try testing.expectEqual(@as(i64, 150_000), a.quota_us);
+    try testing.expectEqual(@as(u64, 100_000), a.period_us);
+
+    const b = try parseCpus("0.5");
+    try testing.expectEqual(@as(i64, 50_000), b.quota_us);
+
+    const c = try parseCpus("2");
+    try testing.expectEqual(@as(i64, 200_000), c.quota_us);
+}
+
+test "parseCpus rejects non-positive values" {
+    try testing.expectError(error.Usage, parseCpus("0"));
+    try testing.expectError(error.Usage, parseCpus("-1"));
+    try testing.expectError(error.Usage, parseCpus("foo"));
+}
+
+test "parseArgs threads --memory and --cpus" {
+    const gpa = testing.allocator;
+    var err_buf: Io.Writer.Allocating = .init(gpa);
+    defer err_buf.deinit();
+
+    const a = try parseFromSlice(
+        gpa,
+        &.{ "--memory", "50m", "--cpus", "1.5", "alpine" },
+        &err_buf.writer,
+    );
+    defer freeArgs(gpa, a);
+
+    try testing.expectEqual(@as(?i64, 50 * 1024 * 1024), a.memory_bytes);
+    try testing.expectEqual(@as(?i64, 150_000), a.cpu_quota_us);
+    try testing.expectEqual(@as(?u64, 100_000), a.cpu_period_us);
+}
+
+test "parseArgs forwards rm-shaped tokens after image" {
+    const gpa = testing.allocator;
+    var err_buf: Io.Writer.Allocating = .init(gpa);
+    defer err_buf.deinit();
+    const a = try parseFromSlice(
+        gpa,
+        &.{ "alpine", "echo", "--rm" },
+        &err_buf.writer,
+    );
+    defer freeArgs(gpa, a);
+    try testing.expect(!a.rm);
+    try testing.expectEqual(@as(usize, 2), a.cmd.len);
+    try testing.expectEqualStrings("echo", a.cmd[0]);
+    try testing.expectEqualStrings("--rm", a.cmd[1]);
 }
 
 test "parseArgs accepts repeatable -e" {

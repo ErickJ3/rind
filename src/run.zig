@@ -190,6 +190,12 @@ pub const RunError =
         /// `index.json` resolved a descriptor whose `mediaType` is
         /// not a single-platform manifest (image-index, unknown).
         UnsupportedManifestMediaType,
+        /// Caller asked for a resource limit (`--memory`/`--cpus`)
+        /// but the host has no cgroup v2 delegation to the calling
+        /// user. Configure with `loginctl enable-linger $USER` and
+        /// ensure `memory` + `cpu` are listed in
+        /// `/sys/fs/cgroup/user.slice/user-<uid>.slice/cgroup.subtree_control`.
+        CgroupDelegationMissing,
     };
 
 /// Cap on a manifest blob read into memory. Same magnitude as
@@ -197,6 +203,37 @@ pub const RunError =
 const manifest_max_bytes: usize = 8 * 1024 * 1024;
 /// Cap on a config blob.
 const config_max_bytes: usize = 4 * 1024 * 1024;
+
+/// True when the calling user's cgroup v2 user-slice has both
+/// `memory` and `cpu` listed in `cgroup.subtree_control`. Returning
+/// `false` is the trigger for `CgroupDelegationMissing`. The check
+/// is read-only and doesn't allocate.
+fn detectCgroupV2Delegation() bool {
+    const euid = std.os.linux.geteuid();
+    var path_buf: [128]u8 = undefined;
+    const path = std.fmt.bufPrintZ(
+        &path_buf,
+        "/sys/fs/cgroup/user.slice/user-{d}.slice/user@{d}.service/cgroup.subtree_control",
+        .{ euid, euid },
+    ) catch return false;
+
+    const fd_rc = std.os.linux.openat(
+        std.os.linux.AT.FDCWD,
+        path.ptr,
+        .{ .ACCMODE = .RDONLY },
+        0,
+    );
+    if (std.os.linux.errno(fd_rc) != .SUCCESS) return false;
+    const fd: i32 = @bitCast(@as(u32, @truncate(fd_rc)));
+    defer _ = std.os.linux.close(fd);
+
+    var buf: [512]u8 = undefined;
+    const n = std.os.linux.read(fd, &buf, buf.len);
+    if (std.os.linux.errno(n) != .SUCCESS) return false;
+    const content = buf[0..n];
+    return std.mem.indexOf(u8, content, "memory") != null and
+        std.mem.indexOf(u8, content, "cpu") != null;
+}
 
 /// Run `ref_text` end-to-end: resolve the image in the store, allocate
 /// container state, mount its overlay, compose the OCI runtime bundle,
@@ -376,6 +413,12 @@ pub fn runImage(
         if (watcher_thread_opt) |t| t.join();
     };
 
+    const want_cgroup =
+        opts.overrides.memory_bytes != null or opts.overrides.cpu_quota_us != null;
+    if (want_cgroup and !detectCgroupV2Delegation()) {
+        return RunError.CgroupDelegationMissing;
+    }
+
     const status = try deps.run_fn(io, gpa, .{
         .id = container.id[0..],
         .state_root = state_root_abs,
@@ -383,6 +426,8 @@ pub fn runImage(
         .tty = opts.overrides.tty,
         .console_socket_path = console_socket_path,
         .pid_file_path = pid_file_path,
+        .force_no_cgroup = !want_cgroup,
+        .systemd_cgroup = want_cgroup,
     });
 
     if (!watcher_joined) {

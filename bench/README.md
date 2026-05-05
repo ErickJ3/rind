@@ -41,6 +41,7 @@ The harness builds with `zig build -Doptimize=ReleaseFast -Dstrip` and **refuses
 | `pull-warm.sh` | `pull alpine:3.19` (warm) | poop 3s | <100ms target (`docs/rind.md:271`) |
 | `pull-cold.sh` | `pull alpine:3.19` (cold) | outer 3 iters | rind only, wipes `RIND_ROOT` between iters, captures `--timing` |
 | `rm.sh` | `rm <container>` | outer 50 iters | pre-creates per-iter container |
+| `run-perf.sh` | `run --rm alpine /bin/true` | `perf stat -r 30` | rind-only baseline; tracks context-switches, instructions, cycles, page-faults, task-clock. Override iterations with `RIND_PERF_RUNS`. Requires `perf` on PATH. |
 
 ## Results
 
@@ -61,3 +62,7 @@ Each scenario has a named follow-up. Don't go fishing.
 - `docker` runs against a daemon (image already mmap'd in daemon memory). Treat docker numbers as informational, not the apples-to-apples comparison. **podman is the comparator that matters.**
 - Cold pull benches network — re-running with different ISPs / times of day will give very different numbers. Trend it, don't chase a single absolute.
 - Bench machines should be on AC, not battery. Disable `intel_pstate`/`amd-pstate` boost throttling for stable numbers if you care about <5% noise.
+
+## Run-startup baseline (perf stat)
+
+`run-perf.sh` captures kernel-level counters for the flagship `run --rm` path so future regressions can be compared against a known baseline. The dominant teardown cost (`umount2`) was already addressed by switching to `MNT_DETACH` (`src/runtime/overlay.zig:241` / `unmountPath`); further mount-count reduction is deferred to a later perf milestone. Re-snapshot after any change touching `src/runtime/overlay.zig`, `src/runtime/bundle.zig`, or `src/run.zig` and compare against the previous entry under `bench/results/history/`.

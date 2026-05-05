@@ -31,7 +31,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Default scenario order — pull-cold last, it nukes the store.
-SCENARIOS=(pull-warm images inspect run ps rm pull-cold)
+SCENARIOS=(pull-warm images inspect run run-perf ps rm pull-cold)
 
 want() {
     local s="$1"

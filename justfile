@@ -18,6 +18,9 @@ test-fuzz:
 e2e:
     RIND_E2E=1 zig build test -Drind-e2e=true
 
+isolation-check:
+    RIND_E2E=1 bash tests/isolation/run-all.sh
+
 release:
     zig build -Doptimize=ReleaseFast
 

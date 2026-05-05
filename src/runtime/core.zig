@@ -70,8 +70,14 @@ pub const RunRequest = struct {
     /// `<root>/bundles/<id>/`.
     bundle: []const u8,
     /// Disable libcrun's cgroup setup. Default `true` so rootless dev
-    /// runs work without configuring a delegated user.slice.
+    /// runs work without configuring a delegated user.slice. The
+    /// orchestrator flips this to `false` when the user requests a
+    /// resource limit (`--memory`, `--cpus`).
     force_no_cgroup: bool = true,
+    /// Routes cgroup setup through the systemd manager. Pairs with
+    /// `force_no_cgroup = false`. The orchestrator only flips this on
+    /// after `cgroups.detectV2Delegation` succeeds.
+    systemd_cgroup: bool = false,
     /// `-t/--tty`. When true, `console_socket_path` must also be set;
     /// `runForeground` opens an AF_UNIX listener at that path, hands
     /// it to libcrun, and proxies stdio through the master pty.
@@ -112,6 +118,7 @@ pub fn runForeground(
         .state_root = req.state_root,
         .bundle = req.bundle,
         .force_no_cgroup = req.force_no_cgroup,
+        .systemd_cgroup = req.systemd_cgroup,
         .pid_file = req.pid_file_path,
     };
     defer ctx.deinit();
@@ -188,6 +195,7 @@ const Forwarder = struct {
         state_root_z: [:0]u8,
         bundle_z: [:0]u8,
         force_no_cgroup: bool,
+        systemd_cgroup: bool,
         preserve_fds: c_int,
         detach: bool,
 
@@ -212,6 +220,7 @@ const Forwarder = struct {
         errdefer gpa.free(state.bundle_z);
 
         state.force_no_cgroup = ctx.force_no_cgroup;
+        state.systemd_cgroup = ctx.systemd_cgroup;
         state.preserve_fds = ctx.preserve_fds;
         state.detach = ctx.detach;
 
@@ -287,6 +296,7 @@ const Forwarder = struct {
         lc_ctx.detach = state.detach;
         lc_ctx.preserve_fds = state.preserve_fds;
         lc_ctx.force_no_cgroup = state.force_no_cgroup;
+        lc_ctx.systemd_cgroup = state.systemd_cgroup;
         lc_ctx.fifo_exec_wait_fd = -1;
 
         var err: c.libcrun_error_t = null;

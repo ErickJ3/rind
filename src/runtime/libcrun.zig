@@ -113,6 +113,11 @@ pub const Context = struct {
     pid_file: ?[]const u8 = null,
     /// Disables cgroup setup. Useful for rootless test bundles.
     force_no_cgroup: bool = false,
+    /// Routes cgroup setup through the systemd manager (DBus
+    /// `StartTransientUnit`). Required when `cgroupsPath` in
+    /// `config.json` is in `slice:prefix:name` form. The default
+    /// (cgroupfs manager) expects a literal filesystem path.
+    systemd_cgroup: bool = false,
     /// Most-recent libcrun failure diagnostic. Cleared on success of any
     /// wrapper call. `message` owned by `allocator`.
     last_error: ?LastError = null,
@@ -191,6 +196,7 @@ pub fn runSync(
     lc_ctx.detach = ctx.detach;
     lc_ctx.preserve_fds = ctx.preserve_fds;
     lc_ctx.force_no_cgroup = ctx.force_no_cgroup;
+    lc_ctx.systemd_cgroup = ctx.systemd_cgroup;
     lc_ctx.fifo_exec_wait_fd = -1;
 
     var err: c.libcrun_error_t = null;

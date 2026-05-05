@@ -310,17 +310,27 @@ fn mountRootless(
     io: Io,
     merged_path: [:0]const u8,
     opts: [:0]const u8,
-) OverlayError!struct { sub_uid: SubidRange, sub_gid: SubidRange } {
+) OverlayError!struct { sub_uid: ?SubidRange, sub_gid: ?SubidRange } {
     // Resolve the calling user's name and subuid/subgid ranges before
-    // forking. Failure modes here are pure user-config errors.
+    // forking. `SubidNotConfigured` triggers the single-id fallback
+    // path: container uid 0 maps to the host euid only, no sub-range.
     const euid = linux.geteuid();
     const egid = linux.getegid();
 
     const username = try lookupUsernameAlloc(io, gpa, "/etc/passwd", euid);
     defer gpa.free(username);
 
-    const sub_uid = try lookupSubidAlloc(io, gpa, "/etc/subuid", username, euid);
-    const sub_gid = try lookupSubidAlloc(io, gpa, "/etc/subgid", username, egid);
+    const sub_uid_raw: ?SubidRange = lookupSubidAlloc(io, gpa, "/etc/subuid", username, euid) catch |err| switch (err) {
+        subid_mod.SubidError.SubidNotConfigured => null,
+        else => return err,
+    };
+    const sub_gid_raw: ?SubidRange = lookupSubidAlloc(io, gpa, "/etc/subgid", username, egid) catch |err| switch (err) {
+        subid_mod.SubidError.SubidNotConfigured => null,
+        else => return err,
+    };
+    const both_present = sub_uid_raw != null and sub_gid_raw != null;
+    const sub_uid: ?SubidRange = if (both_present) sub_uid_raw else null;
+    const sub_gid: ?SubidRange = if (both_present) sub_gid_raw else null;
 
     var sv: [2]i32 = undefined;
     const sp_rc = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &sv);
@@ -370,8 +380,8 @@ fn parentDance(
     euid: linux.uid_t,
     egid: linux.gid_t,
     username: []const u8,
-    sub_uid: SubidRange,
-    sub_gid: SubidRange,
+    sub_uid: ?SubidRange,
+    sub_gid: ?SubidRange,
 ) OverlayError!void {
     // Wait for child to confirm it has unshared.
     const ready = try recvFrame(sock);
@@ -381,11 +391,39 @@ fn parentDance(
         else => return OverlayError.ChildSyncFailed,
     }
 
-    // Hand the child's namespaces over to newuidmap / newgidmap. The
-    // helpers consult /etc/sub{u,g}id themselves; we just have to point
-    // them at the right pid and the per-uid range we already parsed.
-    try runIdMapHelper(gpa, io, "newuidmap", child_pid, 0, euid, 1, sub_uid, username);
-    try runIdMapHelper(gpa, io, "newgidmap", child_pid, 0, egid, 1, sub_gid, username);
+    // Map ids into the child's user namespace. Preferred path is
+    // newuidmap/newgidmap which can populate the full /etc/sub{u,g}id
+    // range. When the helpers are missing or the subid file is empty,
+    // fall back to a single-id mapping written directly to
+    // /proc/<pid>/{uid,gid}_map (host euid → container 0). The
+    // fallback is functional but loses the multi-id range.
+    const want_helper = sub_uid != null and sub_gid != null;
+    var used_fallback = !want_helper;
+    if (want_helper) {
+        runIdMapHelper(gpa, io, "newuidmap", child_pid, 0, euid, 1, sub_uid.?, username) catch |err| switch (err) {
+            OverlayError.NewuidmapMissing, OverlayError.NewuidmapFailed => {
+                used_fallback = true;
+            },
+            else => return err,
+        };
+        if (!used_fallback) {
+            runIdMapHelper(gpa, io, "newgidmap", child_pid, 0, egid, 1, sub_gid.?, username) catch |err| switch (err) {
+                OverlayError.NewuidmapMissing, OverlayError.NewuidmapFailed => {
+                    used_fallback = true;
+                },
+                else => return err,
+            };
+        }
+    }
+    if (used_fallback) {
+        std.log.warn(
+            "rind: newuidmap unavailable or /etc/subuid not configured; falling back to single-id mapping (host {d} -> 0). Configure /etc/subuid for full range support.",
+            .{euid},
+        );
+        try writeSetgroupsDeny(child_pid);
+        try writeSingleIdMap(child_pid, .uid, euid);
+        try writeSingleIdMap(child_pid, .gid, egid);
+    }
 
     // Tell the child the maps are in place.
     try sendFrame(sock, .{ .tag = Frame.tag_go, .payload = 0 });
@@ -520,6 +558,62 @@ fn sendFrameNoFail(fd: i32, frame: Frame) void {
 
 fn recvFrameNoFail(fd: i32) Frame {
     return recvFrame(fd) catch .{ .tag = 0, .payload = 0 };
+}
+
+const IdKind = enum { uid, gid };
+
+fn writeSingleIdMap(child_pid: linux.pid_t, kind: IdKind, host_id: u32) OverlayError!void {
+    var path_buf: [64]u8 = undefined;
+    const fname = switch (kind) {
+        .uid => "uid_map",
+        .gid => "gid_map",
+    };
+    const path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/{s}", .{ child_pid, fname }) catch
+        return OverlayError.NewuidmapFailed;
+
+    var line_buf: [64]u8 = undefined;
+    const line = std.fmt.bufPrint(&line_buf, "0 {d} 1\n", .{host_id}) catch
+        return OverlayError.NewuidmapFailed;
+
+    const O = linux.O{ .ACCMODE = .WRONLY };
+    const fd_rc = linux.openat(linux.AT.FDCWD, path.ptr, O, 0);
+    if (linux.errno(fd_rc) != .SUCCESS) return OverlayError.NewuidmapFailed;
+    const fd: i32 = @bitCast(@as(u32, @truncate(fd_rc)));
+    defer _ = linux.close(fd);
+
+    var written: usize = 0;
+    while (written < line.len) {
+        const rc = linux.write(fd, line[written..].ptr, line.len - written);
+        switch (linux.errno(rc)) {
+            .SUCCESS => written += rc,
+            .INTR => continue,
+            else => return OverlayError.NewuidmapFailed,
+        }
+    }
+}
+
+// Unprivileged gid_map writes require setgroups to be denied first
+// (see user_namespaces(7)).
+fn writeSetgroupsDeny(child_pid: linux.pid_t) OverlayError!void {
+    var path_buf: [64]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/setgroups", .{child_pid}) catch
+        return OverlayError.NewuidmapFailed;
+    const O = linux.O{ .ACCMODE = .WRONLY };
+    const fd_rc = linux.openat(linux.AT.FDCWD, path.ptr, O, 0);
+    if (linux.errno(fd_rc) != .SUCCESS) return OverlayError.NewuidmapFailed;
+    const fd: i32 = @bitCast(@as(u32, @truncate(fd_rc)));
+    defer _ = linux.close(fd);
+
+    const body = "deny";
+    var written: usize = 0;
+    while (written < body.len) {
+        const rc = linux.write(fd, body[written..].ptr, body.len - written);
+        switch (linux.errno(rc)) {
+            .SUCCESS => written += rc,
+            .INTR => continue,
+            else => return OverlayError.NewuidmapFailed,
+        }
+    }
 }
 
 fn runIdMapHelper(
