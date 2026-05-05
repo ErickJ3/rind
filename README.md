@@ -4,6 +4,8 @@ A container runtime that runs OCI images without a daemon. One static binary; st
 
 It's for Linux machines where you want `docker pull` and `docker run` semantics but don't want Docker Desktop.
 
+![demo](demo.gif)
+
 ## Status
 
 Shipped: `pull`, `images`, `inspect`, `run`, `ps`, `rm`. Works against Docker Hub, GHCR, and other OCI v2 registries. Linux x86_64 only. `build` and `push` are coming. Expect breakage on `main` until 1.0.
