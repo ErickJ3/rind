@@ -1,6 +1,6 @@
 # rind
 
-A lightning-fast, daemonless container engine for OCI workflows on Linux.
+A lightning-fast, daemonless container engine for OCI workflows.
 
 ![demo](demo.gif)
 
