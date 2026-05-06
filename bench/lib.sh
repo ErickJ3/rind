@@ -232,6 +232,32 @@ stats_ms() {
     ' "$file"
 }
 
+# Compute p50 / p95 / p99 from a file of float seconds.
+# Echoes "p50 p95 p99" in milliseconds. Linear interpolation between
+# adjacent ranks; stable for n >= 1.
+percentiles_ms() {
+    local file="$1"
+    sort -n "$file" | awk '
+        { a[NR] = $1 * 1000 }
+        END {
+            n = NR
+            if (n == 0) { print "n/a n/a n/a"; exit }
+            for (i = 0; i < 3; i++) {
+                p = (i == 0) ? 50 : ((i == 1) ? 95 : 99)
+                if (n == 1) { v = a[1] }
+                else {
+                    rank = (p / 100.0) * (n - 1) + 1
+                    lo = int(rank); hi = lo + 1
+                    if (hi > n) hi = n
+                    frac = rank - lo
+                    v = a[lo] + (a[hi] - a[lo]) * frac
+                }
+                printf "%.1f%s", v, (i < 2 ? " " : "\n")
+            }
+        }
+    '
+}
+
 # Render an outer-loop result table from labelled raw files.
 # Args: heading, desc, then label=path pairs.
 emit_outer_block() {
@@ -258,6 +284,41 @@ emit_outer_block() {
                 printf "| %s | %s | %s | %s | %s | %s |\n" "$tag" "$mean" "$min" "$max" "$stddev" "$n"
             else
                 printf "| %s | n/a | n/a | n/a | n/a | 0 |\n" "$tag"
+            fi
+        done
+        echo ""
+    } >> "$out"
+}
+
+# Same as emit_outer_block but adds p50/p95/p99 columns. Use for
+# warm-loop scenarios where tail latency matters more than mean.
+emit_outer_block_pct() {
+    local heading="$1" desc="$2"; shift 2
+    local out="$BENCH_DIR/results/latest.md"
+    {
+        echo ""
+        echo "## $heading"
+        echo ""
+        echo "$desc"
+        echo ""
+        echo "| runtime | mean (ms) | p50 (ms) | p95 (ms) | p99 (ms) | min (ms) | max (ms) | stddev (ms) | n |"
+        echo "|---------|-----------|----------|----------|----------|----------|----------|-------------|---|"
+        while [[ $# -gt 0 ]]; do
+            local pair="$1"; shift
+            local tag="${pair%%=*}"
+            local file="${pair#*=}"
+            if [[ -s "$file" ]]; then
+                local stats pct
+                stats=$(stats_ms "$file")
+                pct=$(percentiles_ms "$file")
+                local n
+                n=$(wc -l < "$file")
+                read -r mean min max stddev <<< "$stats"
+                read -r p50 p95 p99 <<< "$pct"
+                printf "| %s | %s | %s | %s | %s | %s | %s | %s | %s |\n" \
+                    "$tag" "$mean" "$p50" "$p95" "$p99" "$min" "$max" "$stddev" "$n"
+            else
+                printf "| %s | n/a | n/a | n/a | n/a | n/a | n/a | n/a | 0 |\n" "$tag"
             fi
         done
         echo ""

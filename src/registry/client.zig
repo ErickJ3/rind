@@ -113,10 +113,15 @@ pub const Response = struct {
     content_type: ?[]u8 = null,
     /// `Content-Length` header value or null.
     content_length: ?u64 = null,
+    /// `ETag` header value (allocator-owned dup) or null. Surfaced so
+    /// the manifest cache can stamp it onto a cache record for the
+    /// next conditional revalidation.
+    etag: ?[]u8 = null,
 
-    /// Free `content_type` if present.
+    /// Free allocator-owned strings.
     pub fn deinit(self: *Response, gpa: Allocator) void {
         if (self.content_type) |s| gpa.free(s);
+        if (self.etag) |s| gpa.free(s);
         self.* = undefined;
     }
 };
@@ -341,16 +346,19 @@ pub const Client = struct {
         if (@intFromEnum(send.status) >= 500) return error.ServerError;
         if (@intFromEnum(send.status) >= 400) return error.UnexpectedStatus;
 
-        // Move ownership of content_type out of the SendResult so the
-        // deferred `deinit` does not double-free what now belongs to
-        // the returned `Response`.
+        // Move ownership of allocator-owned strings out of the SendResult
+        // so the deferred `deinit` does not double-free what now belongs
+        // to the returned `Response`.
         const ct = send.content_type;
         send.content_type = null;
+        const et = send.etag;
+        send.etag = null;
 
         return .{
             .status = send.status,
             .content_type = ct,
             .content_length = send.content_length,
+            .etag = et,
         };
     }
 
@@ -433,6 +441,7 @@ pub const Client = struct {
         content_type: ?[]u8 = null,
         content_length: ?u64 = null,
         www_authenticate: ?[]u8 = null,
+        etag: ?[]u8 = null,
         /// True iff the body was discarded (no `body_writer` passed
         /// to `sendOnce`). The caller of `fetch` re-sends in this
         /// case to populate the user's writer.
@@ -441,6 +450,7 @@ pub const Client = struct {
         fn deinit(self: *SendResult, gpa: Allocator) void {
             if (self.content_type) |s| gpa.free(s);
             if (self.www_authenticate) |s| gpa.free(s);
+            if (self.etag) |s| gpa.free(s);
             self.* = undefined;
         }
     };
@@ -498,9 +508,10 @@ pub const Client = struct {
             req.sendBodiless() catch return error.WriteFailed;
             var response = try req.receiveHead(&redirect_buf);
 
-            // Redirect: parse Location, swap URIs, strip auth on host
-            // change, retry. Hop-cap is 3 to mirror std.http's default.
-            if (response.head.status.class() == .redirect and redirects_left > 0) {
+            // 304 Not Modified is in the 3xx class but is not a redirect —
+            // it carries no `Location` header and the conditional-GET
+            // caller wants the status surfaced, not a hop chase.
+            if (response.head.status.class() == .redirect and response.head.status != .not_modified and redirects_left > 0) {
                 const loc_borrow = response.head.location orelse return error.UnexpectedStatus;
                 const loc_dup = try self.gpa.dupe(u8, loc_borrow);
                 errdefer self.gpa.free(loc_dup);
@@ -549,9 +560,10 @@ pub const Client = struct {
             {
                 var it = response.head.iterateHeaders();
                 while (it.next()) |hdr| {
-                    if (std.ascii.eqlIgnoreCase(hdr.name, "www-authenticate")) {
+                    if (result.www_authenticate == null and std.ascii.eqlIgnoreCase(hdr.name, "www-authenticate")) {
                         result.www_authenticate = try self.gpa.dupe(u8, hdr.value);
-                        break;
+                    } else if (result.etag == null and std.ascii.eqlIgnoreCase(hdr.name, "etag")) {
+                        result.etag = try self.gpa.dupe(u8, hdr.value);
                     }
                 }
             }
@@ -624,6 +636,41 @@ pub const Client = struct {
         expected_digest: ?Digest,
         opts: GetManifestOptions,
     ) GetManifestError!ManifestResult {
+        return switch (try self.getManifestByUrlConditional(base_url, reference, scope, expected_digest, null, opts)) {
+            .fetched => |m| m,
+            .not_modified => unreachable,
+        };
+    }
+
+    /// Outcome of `getManifestByUrlConditional`. `not_modified` happens
+    /// only when the caller passed `if_none_match` and the registry
+    /// honored the conditional with a 304. `fetched` is the same
+    /// `ManifestResult` `getManifestByUrl` returns.
+    pub const ConditionalManifest = union(enum) {
+        not_modified,
+        fetched: ManifestResult,
+
+        pub fn deinit(self: *ConditionalManifest) void {
+            switch (self.*) {
+                .not_modified => {},
+                .fetched => |*m| m.deinit(),
+            }
+        }
+    };
+
+    /// Same as `getManifestByUrl` but supports conditional GETs via an
+    /// optional `If-None-Match` ETag. Returns `.not_modified` (no
+    /// allocation) when the registry replies 304 — caller is expected
+    /// to keep using the manifest blob it cached against `if_none_match`.
+    pub fn getManifestByUrlConditional(
+        self: *Client,
+        base_url: []const u8,
+        reference: []const u8,
+        scope: []const u8,
+        expected_digest: ?Digest,
+        if_none_match: ?[]const u8,
+        opts: GetManifestOptions,
+    ) GetManifestError!ConditionalManifest {
         var arena: std.heap.ArenaAllocator = .init(self.gpa);
         var arena_owned: bool = true;
         errdefer if (arena_owned) arena.deinit();
@@ -632,13 +679,24 @@ pub const Client = struct {
         const url = try std.fmt.allocPrint(self.gpa, "{s}/{s}", .{ base_url, reference });
         defer self.gpa.free(url);
 
+        var extras_buf: [1]http.Header = undefined;
+        const extras: []const http.Header = if (if_none_match) |inm| blk: {
+            extras_buf[0] = .{ .name = "if-none-match", .value = inm };
+            break :blk extras_buf[0..1];
+        } else &.{};
+
         var body_buf: Io.Writer.Allocating = .init(arena_alloc);
         var resp = try self.fetch(.{
             .url = url,
             .accept = manifest_mod.accept_header_value,
+            .extra_headers = extras,
             .scope = scope,
         }, &body_buf.writer);
         defer resp.deinit(self.gpa);
+
+        if (resp.status == .not_modified) {
+            return .not_modified;
+        }
 
         const ct = resp.content_type orelse return error.UnsupportedMediaType;
         const mt = manifest_mod.MediaType.fromString(ct) orelse return error.UnsupportedMediaType;
@@ -652,14 +710,16 @@ pub const Client = struct {
 
         if (mt.isSingle()) {
             const m = try manifest_mod.parseManifest(arena_alloc, raw_bytes, mt);
+            const etag_dup: ?[]const u8 = if (resp.etag) |e| try arena_alloc.dupe(u8, e) else null;
             arena_owned = false;
-            return .{
+            return .{ .fetched = .{
                 .manifest = m,
                 .digest = computed,
                 .media_type = mt,
                 .raw_bytes = raw_bytes,
+                .etag = etag_dup,
                 .arena = arena,
-            };
+            } };
         }
 
         // Index path: parse, select platform, recurse on the picked
@@ -675,7 +735,12 @@ pub const Client = struct {
 
         arena.deinit();
         arena_owned = false;
-        return self.getManifestByUrl(base_url, picked_ref_dup, scope, picked_dig, opts);
+        // Index recursion never sends If-None-Match — the digest in the
+        // index already pins identity, and a registry that honored 304
+        // for the index would not honor it for the picked manifest
+        // anyway (different URL, different ETag).
+        const inner = try self.getManifestByUrlConditional(base_url, picked_ref_dup, scope, picked_dig, null, opts);
+        return inner;
     }
 
     /// Tunables for `getBlob` / `getBlobByUrl`. The defaults match the

@@ -145,8 +145,13 @@ pub const ManifestResult = struct {
     /// Verbatim response body the caller can hand directly to
     /// `Store.putBlob` without re-fetching or re-hashing.
     raw_bytes: []const u8,
-    /// Backing arena for `manifest`, `raw_bytes`, and any nested
-    /// strings.
+    /// Last-seen `ETag` from the registry, arena-owned. Null if the
+    /// registry omitted the header. The pull orchestrator stamps this
+    /// onto the manifest cache so the next refresh can send
+    /// `If-None-Match`.
+    etag: ?[]const u8 = null,
+    /// Backing arena for `manifest`, `raw_bytes`, `etag`, and any
+    /// nested strings.
     arena: std.heap.ArenaAllocator,
 
     /// Free every allocation owned by this result.

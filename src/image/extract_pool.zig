@@ -106,13 +106,19 @@ pub const Pool = struct {
         self.* = undefined;
     }
 
-    /// Default concurrency: `min(host_cpus, 8)`. Falls back to 4 if
-    /// cpu count is unavailable. Same heuristic as `blob_pool` so a
-    /// shared `--concurrency` knob means the same thing for both
-    /// phases.
-    pub fn defaultConcurrency() usize {
+    /// Default parallel-extract cap: `min(cpus, 8)`. Extract is
+    /// CPU-bound (zlib-ng decompress + tar walk), so the cap matches
+    /// the host core count up to 8 — past that point a registry's
+    /// blob delivery becomes the bottleneck instead.
+    pub fn defaultExtractJobs() usize {
         const cpus = std.Thread.getCpuCount() catch return 4;
         return @min(cpus, 8);
+    }
+
+    /// Legacy alias for `defaultExtractJobs`. Kept for callers that
+    /// haven't migrated yet.
+    pub fn defaultConcurrency() usize {
+        return defaultExtractJobs();
     }
 
     pub fn peakInflight(self: *const Pool) usize {

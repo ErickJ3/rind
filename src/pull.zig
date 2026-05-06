@@ -37,6 +37,7 @@ const image_ref = @import("image/ref.zig");
 const digest_mod = @import("image/digest.zig");
 const extract = @import("image/extract.zig");
 const layout = @import("store/layout.zig");
+const manifest_cache = @import("store/manifest_cache.zig");
 const client_mod = @import("registry/client.zig");
 const manifest_mod = @import("registry/manifest.zig");
 const blob_pool = @import("registry/blob_pool.zig");
@@ -99,9 +100,14 @@ pub const PullOptions = struct {
     /// index. `null` → `manifest_mod.default_platform`
     /// (`linux/<host_arch>`).
     platform: ?manifest_mod.Platform = null,
-    /// Maximum concurrent blob downloads. `0` → defaults to
-    /// `blob_pool.Pool.defaultConcurrency()`.
+    /// Soft alias: when non-zero, sets both `download_jobs` and
+    /// `extract_jobs` unless either is set explicitly. Retained for
+    /// back-compat with the original single `--concurrency` knob.
     concurrency: usize = 0,
+    /// Max parallel blob downloads. `0` → `defaultDownloadJobs()`.
+    download_jobs: usize = 0,
+    /// Max parallel layer extracts. `0` → `defaultExtractJobs()`.
+    extract_jobs: usize = 0,
     /// Transport scheme used to build manifest and blob URLs. The OCI
     /// distribution spec mandates HTTPS, so production callers should
     /// leave this at the default. Tests against a plain-HTTP loopback
@@ -121,6 +127,11 @@ pub const PullOptions = struct {
     /// manifest (auth + GET), blobs (pool runAll), extract (drain).
     /// blobs and extract overlap — sums won't match total.
     timing: bool = false,
+    /// TTL applied to tag-style refs in the manifest cache. Digest
+    /// pins ignore this and never expire. Defaults to 5 min (Docker's
+    /// staleness check value); the CLI can override via
+    /// `RIND_MANIFEST_TTL`.
+    manifest_ttl_seconds: i64 = manifest_cache.default_tag_ttl_seconds,
 };
 
 /// Outcome of a successful `pullImage`.
@@ -153,6 +164,7 @@ pub const PullError =
     layout.Store.PutBlobError ||
     layout.Store.TagError ||
     layout.Store.OpenBlobError ||
+    layout.Store.ReadBlobError ||
     layout.StoreError ||
     digest_mod.DigestError ||
     Io.Dir.AccessError ||
@@ -343,6 +355,44 @@ fn extractAdapter(
     return extract.ensureLayer(io, gpa, store, digest, media_type);
 }
 
+/// Cap on the size of a cached manifest body. Eight megabytes matches
+/// `layout.index_max_bytes` — far larger than any realistic OCI
+/// manifest, but tight enough that a corrupt cache entry pointing at
+/// a giant blob aborts the warm path early.
+const cached_manifest_max_bytes: usize = 8 * 1024 * 1024;
+
+fn loadManifestFromCache(
+    io: Io,
+    gpa: Allocator,
+    store: *layout.Store,
+    cached: manifest_cache.Entry,
+) !client_mod.ManifestResult {
+    const dig = try Digest.parse(cached.manifest_digest);
+    const raw_owned = try store.readBlobAlloc(io, gpa, dig, cached_manifest_max_bytes);
+    defer gpa.free(raw_owned);
+
+    const mt = manifest_mod.MediaType.fromString(cached.media_type) orelse
+        return error.UnsupportedMediaType;
+    if (!mt.isSingle()) return error.UnsupportedMediaType;
+
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    errdefer arena.deinit();
+    const aa = arena.allocator();
+
+    const raw_in_arena = try aa.dupe(u8, raw_owned);
+    const m = try manifest_mod.parseManifest(aa, raw_in_arena, mt);
+    const etag_dup: ?[]const u8 = if (cached.etag) |e| try aa.dupe(u8, e) else null;
+
+    return .{
+        .manifest = m,
+        .digest = dig,
+        .media_type = mt,
+        .raw_bytes = raw_in_arena,
+        .etag = etag_dup,
+        .arena = arena,
+    };
+}
+
 /// Pull `ref_text` into `store` using `client` for transport. Returns
 /// a `PullResult` whose `arena` carries the layer-digest slice; call
 /// `result.deinit()` when done. On any error the store is left in a
@@ -364,10 +414,9 @@ pub fn pullImage(
     var ref = try image_ref.parse(gpa, ref_text);
     defer ref.deinit(gpa);
 
-    // Step 2: manifest fetch via the URL-explicit entry so we honor
-    // `options.scheme` (production HTTPS, tests plain HTTP). The
-    // dispatcher in `getManifestByUrl` still handles image-index
-    // recursion and digest verification.
+    // Step 2: manifest fetch. The cache short-circuits the network
+    // entirely on a fresh hit, and degrades to a conditional GET on a
+    // stale hit (304 if the registry honors `If-None-Match`).
     const manifest_base = try buildManifestBaseUrl(gpa, options.scheme, ref.registry, ref.repository);
     defer gpa.free(manifest_base);
     const reference: []const u8 = if (ref.digest) |d| d else if (ref.tag) |t| t else "latest";
@@ -375,29 +424,68 @@ pub fn pullImage(
     defer gpa.free(manifest_scope);
     const expected_manifest_digest: ?Digest = if (ref.digest) |d| try Digest.parse(d) else null;
 
-    // Indeterminate spinner while we auth + GET the manifest. Closed
-    // immediately after the call returns so subsequent phases get a
-    // clean parent.
-    const manifest_node: ?std.Progress.Node = if (options.progress_node) |root|
-        root.start("fetching manifest", 0)
-    else
-        null;
-    errdefer if (manifest_node) |n| n.end();
+    var cached_lookup = manifest_cache.lookup(io, gpa, store, ref.registry, ref.repository, reference) catch null;
+    defer if (cached_lookup) |*c| c.deinit();
 
-    var mres = client.getManifestByUrl(
-        manifest_base,
-        reference,
-        manifest_scope,
-        expected_manifest_digest,
-        .{ .platform = options.platform },
-    ) catch |e| {
-        if (manifest_node) |n| n.end();
-        return e;
-    };
-    if (manifest_node) |n| n.end();
-    const t_manifest: ?Io.Timestamp = if (options.timing) Io.Clock.awake.now(io) else null;
-    var mres_owned = true;
+    const now_unix: i64 = Io.Clock.real.now(io).toSeconds();
+    const cache_fresh = if (cached_lookup) |c| manifest_cache.isFresh(c.value, now_unix) else false;
+    const cache_blob_present: bool = if (cached_lookup) |c| blk: {
+        const cd = Digest.parse(c.value.manifest_digest) catch break :blk false;
+        if (expected_manifest_digest) |exp| if (!cd.eql(exp)) break :blk false;
+        break :blk store.hasBlob(io, cd);
+    } else false;
+    const cache_usable_fresh = cache_fresh and cache_blob_present;
+
+    var mres: client_mod.ManifestResult = undefined;
+    var mres_owned = false;
     defer if (mres_owned) mres.deinit();
+
+    var fetched_from_network = false;
+
+    if (cache_usable_fresh) {
+        mres = try loadManifestFromCache(io, gpa, store, cached_lookup.?.value);
+        mres_owned = true;
+    } else {
+        // `If-None-Match` only helps when we still have the cached
+        // manifest blob to fall back on. A 304 against a missing blob
+        // would leave us with no manifest at all.
+        const if_none_match: ?[]const u8 = if (cache_blob_present)
+            (if (cached_lookup) |c| c.value.etag else null)
+        else
+            null;
+
+        const manifest_node: ?std.Progress.Node = if (options.progress_node) |root|
+            root.start("fetching manifest", 0)
+        else
+            null;
+        errdefer if (manifest_node) |n| n.end();
+
+        const outcome = client.getManifestByUrlConditional(
+            manifest_base,
+            reference,
+            manifest_scope,
+            expected_manifest_digest,
+            if_none_match,
+            .{ .platform = options.platform },
+        ) catch |e| {
+            if (manifest_node) |n| n.end();
+            return e;
+        };
+        if (manifest_node) |n| n.end();
+
+        switch (outcome) {
+            .not_modified => {
+                mres = try loadManifestFromCache(io, gpa, store, cached_lookup.?.value);
+                mres_owned = true;
+            },
+            .fetched => |m| {
+                mres = m;
+                mres_owned = true;
+                fetched_from_network = true;
+            },
+        }
+    }
+    const t_manifest: ?Io.Timestamp = if (options.timing) Io.Clock.awake.now(io) else null;
 
     emit(options, .{ .manifest = .{
         .digest = mres.digest,
@@ -405,10 +493,31 @@ pub fn pullImage(
         .size = mres.raw_bytes.len,
     } });
 
-    // Step 3: persist manifest blob.
+    // Step 3: persist manifest blob. Idempotent — a no-op when the
+    // manifest came from the cache.
     {
         var manifest_reader: Io.Reader = .fixed(mres.raw_bytes);
         try store.putBlob(io, mres.digest, &manifest_reader);
+    }
+
+    // Step 3b: refresh the cache. On 304, just bump `expires_at_unix`;
+    // on 200, write a new entry with the latest digest+etag. Errors
+    // are swallowed — a non-writable cache must not abort the pull.
+    {
+        var dig_buf: [digest_mod.string_length]u8 = undefined;
+        const cache_entry: manifest_cache.Entry = .{
+            .manifest_digest = mres.digest.toString(&dig_buf),
+            .media_type = mres.media_type.toString(),
+            .etag = if (fetched_from_network)
+                mres.etag
+            else if (cached_lookup) |c| c.value.etag else null,
+            .expires_at_unix = manifest_cache.computeExpiry(reference, now_unix, options.manifest_ttl_seconds),
+            .size = mres.raw_bytes.len,
+            .registry = ref.registry,
+            .repository = ref.repository,
+            .reference = reference,
+        };
+        manifest_cache.store(io, store, cache_entry) catch {};
     }
 
     const config_digest = try Digest.parse(mres.manifest.config.digest);
@@ -488,10 +597,18 @@ pub fn pullImage(
     // layer N with download of layer N+k.
     try extract.ensureExtractedRoot(io, store);
 
-    const eff_concurrency = if (options.concurrency == 0)
-        blob_pool.Pool.defaultConcurrency()
+    const eff_download_jobs: usize = if (options.download_jobs != 0)
+        options.download_jobs
+    else if (options.concurrency != 0)
+        options.concurrency
     else
-        options.concurrency;
+        blob_pool.Pool.defaultDownloadJobs();
+    const eff_extract_jobs: usize = if (options.extract_jobs != 0)
+        options.extract_jobs
+    else if (options.concurrency != 0)
+        options.concurrency
+    else
+        extract_pool.Pool.defaultExtractJobs();
 
     var extract_jobs = try gpa.alloc(extract_pool.ExtractJob, layers.len);
     defer gpa.free(extract_jobs);
@@ -531,7 +648,7 @@ pub fn pullImage(
         };
     }
 
-    var ex_pool = extract_pool.Pool.init(gpa, io, store, eff_concurrency, extractAdapter);
+    var ex_pool = extract_pool.Pool.init(gpa, io, store, eff_extract_jobs, extractAdapter);
     defer ex_pool.deinit();
     try ex_pool.start();
     // Persistent workers are now running; ensure they always join,
@@ -625,7 +742,7 @@ pub fn pullImage(
     // Step 5: drive the blob pool. Workers fire `blob_done`,
     // finalize each Pending, and submit each layer's extract job to
     // `ex_pool` as it completes (see `onBlobComplete`).
-    var pool = blob_pool.Pool.init(gpa, io, client, eff_concurrency);
+    var pool = blob_pool.Pool.init(gpa, io, client, eff_download_jobs);
     defer pool.deinit();
     try pool.runAll(jobs);
     const t_blobs: ?Io.Timestamp = if (options.timing) Io.Clock.awake.now(io) else null;

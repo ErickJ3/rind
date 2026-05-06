@@ -232,3 +232,36 @@ Benchmark 3 (27 runs): docker ps -a
 ```
 
 </details>
+
+## pull alpine:3.19 (warm cache, 10x loop, p50/p95/p99)
+
+Image pre-pulled, cache primed, then 10 timed iterations of `rind pull`. Tracks the manifest-cache fast path; target p50 < 100 ms.
+
+| runtime | mean (ms) | p50 (ms) | p95 (ms) | p99 (ms) | min (ms) | max (ms) | stddev (ms) | n |
+|---------|-----------|----------|----------|----------|----------|----------|-------------|---|
+| rind | n/a | n/a | n/a | n/a | n/a | n/a | n/a | 0 |
+| podman | n/a | n/a | n/a | n/a | n/a | n/a | n/a | 0 |
+| docker | n/a | n/a | n/a | n/a | n/a | n/a | n/a | 0 |
+
+
+## pull alpine:3.19 (warm cache, 10x loop, p50/p95/p99)
+
+Image pre-pulled, cache primed, then 10 timed iterations of `rind pull`. Tracks the manifest-cache fast path; target p50 < 100 ms.
+
+| runtime | mean (ms) | p50 (ms) | p95 (ms) | p99 (ms) | min (ms) | max (ms) | stddev (ms) | n |
+|---------|-----------|----------|----------|----------|----------|----------|-------------|---|
+| rind | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 10 |
+| podman | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 10 |
+| docker | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 10 |
+
+
+## pull alpine:3.19 (warm cache, 10x loop, p50/p95/p99)
+
+Image pre-pulled, cache primed, then 10 timed iterations of `rind pull`. Tracks the manifest-cache fast path; target p50 < 100 ms.
+
+| runtime | mean (ms) | p50 (ms) | p95 (ms) | p99 (ms) | min (ms) | max (ms) | stddev (ms) | n |
+|---------|-----------|----------|----------|----------|----------|----------|-------------|---|
+| rind | 3.5 | 3.5 | 3.8 | 3.8 | 3.2 | 3.8 | 0.2 | 10 |
+| podman | 1721.6 | 1709.9 | 1831.0 | 1887.8 | 1643.5 | 1902.0 | 69.8 | 10 |
+| docker | 1425.8 | 1426.1 | 1438.8 | 1439.0 | 1410.5 | 1439.1 | 9.5 | 10 |
+

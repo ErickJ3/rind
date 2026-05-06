@@ -98,14 +98,22 @@ pub const Pool = struct {
         self.* = undefined;
     }
 
-    /// Default concurrency used by callers that don't specify one:
-    /// `min(host_cpus, 8)`. Falls back to 4 if cpu count is
-    /// unavailable. Cap raised to 8 (T-progress): blob fetches are
-    /// I/O-bound, so extra workers fill TCP+TLS handshake stalls
-    /// without burning CPU.
+    /// Legacy default — callers should prefer `defaultDownloadJobs`.
+    /// Kept as the same `min(cpus, 8)` cap so warm-cache tests with
+    /// fixed expectations stay green.
     pub fn defaultConcurrency() usize {
         const cpus = std.Thread.getCpuCount() catch return 4;
         return @min(cpus, 8);
+    }
+
+    /// Default parallel-download cap. Blob fetches are I/O-bound
+    /// (TCP+TLS handshake, socket reads), not CPU-bound, so we pick
+    /// `min(cpus*4, 32)` — many more workers than the extract pool
+    /// uses, capped where diminishing returns set in for typical
+    /// registries.
+    pub fn defaultDownloadJobs() usize {
+        const cpus = std.Thread.getCpuCount() catch return 8;
+        return @min(cpus * 4, 32);
     }
 
     /// Snapshot of the highest concurrent-inflight count seen during

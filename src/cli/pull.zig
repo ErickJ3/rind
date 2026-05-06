@@ -35,9 +35,18 @@ pub const PullArgs = struct {
     quiet: bool = false,
     /// `--platform <str>`. Optional; rejected unless equal to host.
     platform: ?[]const u8 = null,
-    /// `--concurrency <usize>`. Max parallel blob downloads + layer
-    /// extracts. `0` means use orchestrator default.
+    /// `--concurrency <usize>`. Soft alias: applies to both
+    /// `download_jobs` and `extract_jobs` unless either is set
+    /// explicitly. `0` means use orchestrator default.
     concurrency: usize = 0,
+    /// `--download-jobs <usize>`. Max parallel blob downloads.
+    /// `0` means use orchestrator default
+    /// (`blob_pool.Pool.defaultDownloadJobs()`).
+    download_jobs: usize = 0,
+    /// `--extract-jobs <usize>`. Max parallel layer extracts.
+    /// `0` means use orchestrator default
+    /// (`extract_pool.Pool.defaultExtractJobs()`).
+    extract_jobs: usize = 0,
     /// `--no-progress`. Disable the live progress UI on TTYs and
     /// fall back to the per-event terse log on stdout.
     no_progress: bool = false,
@@ -75,7 +84,9 @@ const params = clap.parseParamsComptime(
     \\    --output <kind>         Output format: human (default) or json.
     \\-q, --quiet                 Suppress per-event output (terse summary still prints).
     \\    --platform <str>        Target platform (only the host is supported in MVP).
-    \\    --concurrency <usize>   Max parallel blob downloads + layer extracts (0 = default).
+    \\    --concurrency <usize>   Soft alias: caps both download and extract pools (0 = default).
+    \\    --download-jobs <usize> Max parallel blob downloads (0 = default).
+    \\    --extract-jobs <usize>  Max parallel layer extracts (0 = default).
     \\    --no-progress           Disable the live progress UI; print terse log instead.
     \\    --timing                Print per-phase ms summary on stderr at end.
     \\    --ipv4                  Force IPv4-only connections (skip IPv6 happy-eyeballs).
@@ -90,7 +101,7 @@ const value_parsers = .{
 };
 
 /// One-line usage banner. Stable enough that scripts can grep it.
-pub const usage_line: []const u8 = "Usage: rind pull [--output human|json] [-q|--quiet] [--platform <plat>] [--concurrency <n>] [--no-progress] [--timing] [--ipv4] <image>";
+pub const usage_line: []const u8 = "Usage: rind pull [--output human|json] [-q|--quiet] [--platform <plat>] [--concurrency <n>] [--download-jobs <n>] [--extract-jobs <n>] [--no-progress] [--timing] [--ipv4] <image>";
 
 /// Parse argv (after the `pull` subcommand has already been peeled
 /// off) into a validated `PullArgs`. `iter` is consumed; `gpa` backs
@@ -138,6 +149,8 @@ pub fn parseArgs(
         .quiet = res.args.quiet != 0,
         .platform = platform_owned,
         .concurrency = res.args.concurrency orelse 0,
+        .download_jobs = res.args.@"download-jobs" orelse 0,
+        .extract_jobs = res.args.@"extract-jobs" orelse 0,
         .no_progress = res.args.@"no-progress" != 0,
         .timing = res.args.timing != 0,
         .ipv4 = res.args.ipv4 != 0,
@@ -188,6 +201,8 @@ pub fn run(
         .progress_fn = trampoline,
         .progress_node = progress_root.*,
         .concurrency = args.concurrency,
+        .download_jobs = args.download_jobs,
+        .extract_jobs = args.extract_jobs,
         .timing = args.timing,
     };
 
