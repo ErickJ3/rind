@@ -24,6 +24,7 @@ pub const Registry = struct {
     pub const client = @import("registry/client.zig");
     pub const manifest = @import("registry/manifest.zig");
     pub const blob_pool = @import("registry/blob_pool.zig");
+    pub const prefetch = @import("registry/prefetch.zig");
 };
 
 /// Pull orchestrator: glue that wires ref → manifest → blob pool →
