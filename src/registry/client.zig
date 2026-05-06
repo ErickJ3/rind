@@ -368,6 +368,26 @@ pub const Client = struct {
         challenge: auth.Challenge,
         scope_str: []const u8,
     ) FetchError![]u8 {
+        const service_str = challenge.service orelse "";
+        const now_unix = Io.Clock.real.now(self.io).toSeconds();
+
+        // Single-flight: when a peer caller (typically `prefetch.zig`)
+        // is already mid-fetch for the same `(realm, service, scope)`,
+        // wait on the cache's condvar rather than duplicate the
+        // network round-trip.
+        switch (try self.tokens.acquireOrWait(
+            self.io,
+            self.gpa,
+            challenge.realm,
+            service_str,
+            scope_str,
+            now_unix,
+        )) {
+            .have_token => |tok| return tok,
+            .acquire => {},
+        }
+        errdefer self.tokens.clearInflight(self.io, self.gpa, challenge.realm, service_str, scope_str);
+
         const url = try buildTokenUrl(self.gpa, challenge.realm, challenge.service, scope_str);
         defer self.gpa.free(url);
         const token_uri = try std.Uri.parse(url);
@@ -419,11 +439,12 @@ pub const Client = struct {
             self.io,
             self.gpa,
             challenge.realm,
-            challenge.service orelse "",
+            service_str,
             scope_str,
             tok_view,
             expires_at,
         );
+        self.tokens.clearInflight(self.io, self.gpa, challenge.realm, service_str, scope_str);
 
         return self.gpa.dupe(u8, tok_view);
     }
@@ -581,6 +602,32 @@ pub const Client = struct {
 
             return result;
         }
+    }
+
+    /// Speculative warm-up: GET the manifest URL and discard the body,
+    /// purely for the side-effects on `std.http.Client`'s connection
+    /// pool and `TokenCache`. Used by `prefetch.zig` to overlap the
+    /// auth dance with the orchestrator's pre-fetch disk I/O.
+    ///
+    /// Returns successfully iff the GET completed (200 or 304); a
+    /// 4xx/5xx surfaces as a `FetchError` the prefetch worker
+    /// silently swallows. The main-path manifest GET will retry
+    /// either way.
+    pub fn warmup(
+        self: *Client,
+        manifest_base: []const u8,
+        reference: []const u8,
+        scope: []const u8,
+        accept: []const u8,
+    ) FetchError!void {
+        const url = try std.fmt.allocPrint(self.gpa, "{s}/{s}", .{ manifest_base, reference });
+        defer self.gpa.free(url);
+        var resp = try self.fetch(.{
+            .url = url,
+            .accept = accept,
+            .scope = scope,
+        }, null);
+        resp.deinit(self.gpa);
     }
 
     /// Options for `getManifest` / `getManifestByUrl`.
@@ -1060,15 +1107,40 @@ fn writeUrlEncoded(w: *Io.Writer, text: []const u8) Io.Writer.Error!void {
 
 /// Thread-safe `(realm, service, scope)` → token map. The blob pool
 /// hits this from N concurrent layer-download threads sharing a
-/// single `Client`; the mutex serialises all accesses.
+/// single `Client`; the mutex serialises all accesses. The
+/// `inflight` set + `cond` add single-flight semantics so a
+/// prefetch worker (`registry/prefetch.zig`) and the orchestrator
+/// thread cannot both fire the same token GET when their schedules
+/// race.
 const TokenCache = struct {
     mutex: Io.Mutex = .init,
     entries: std.StringHashMapUnmanaged(Entry) = .empty,
+    /// Set of `(realm, service, scope)` keys that have an in-progress
+    /// `acquireToken` somewhere. Second caller for the same key
+    /// `cond`-waits instead of duplicating the network round-trip.
+    inflight: std.StringHashMapUnmanaged(void) = .empty,
+    /// Broadcast by `clearInflight` after either a successful
+    /// `tokens.put` or a failed acquire.
+    cond: Io.Condition = .init,
 
     const Entry = struct {
         token: []u8,
         /// Absolute unix-second deadline, or null for "never expires".
         expires_at: ?i64 = null,
+    };
+
+    /// Outcome of `acquireOrWait`. The two variants encode the two
+    /// roles of an `acquireToken` caller: it either gets a cached
+    /// token back (no network needed) or it claims the in-flight
+    /// slot and must follow up with `clearInflight`.
+    pub const AcquireOutcome = union(enum) {
+        /// Cache hit (possibly populated by another thread we waited
+        /// on). Owned dup; caller frees with `gpa`.
+        have_token: []u8,
+        /// Caller owns the in-flight slot for this key. Must call
+        /// `clearInflight` exactly once before returning, whether the
+        /// network call succeeded or not.
+        acquire: void,
     };
 
     fn deinit(self: *TokenCache, io: Io, gpa: Allocator) void {
@@ -1082,6 +1154,9 @@ const TokenCache = struct {
             gpa.free(e.value_ptr.token);
         }
         self.entries.deinit(gpa);
+        var it2 = self.inflight.iterator();
+        while (it2.next()) |e| gpa.free(e.key_ptr.*);
+        self.inflight.deinit(gpa);
         self.* = undefined;
     }
 
@@ -1157,6 +1232,82 @@ const TokenCache = struct {
             gpa.free(kv.key);
             gpa.free(kv.value.token);
         }
+    }
+
+    /// Single-flight claim. Returns `.have_token` on a fresh cache hit
+    /// (possibly after waking from a peer's broadcast), `.acquire`
+    /// when the caller has won the slot and must do the network
+    /// round-trip before calling `clearInflight`.
+    fn acquireOrWait(
+        self: *TokenCache,
+        io: Io,
+        gpa: Allocator,
+        realm: []const u8,
+        service: []const u8,
+        scope: []const u8,
+        now_unix: i64,
+    ) Allocator.Error!AcquireOutcome {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+
+        while (true) {
+            // Cache hit overrides everything — even if there's an
+            // in-flight acquire for this key, a fresh entry is the
+            // best answer we can give.
+            var key_buf: [768]u8 = undefined;
+            var heap_lookup_key: ?[]u8 = null;
+            defer if (heap_lookup_key) |h| gpa.free(h);
+            const lookup_key: []const u8 = makeStackKey(&key_buf, realm, service, scope) orelse blk: {
+                const heap = try makeKey(gpa, realm, service, scope);
+                heap_lookup_key = heap;
+                break :blk heap;
+            };
+
+            if (self.entries.get(lookup_key)) |entry| {
+                const fresh = if (entry.expires_at) |e| now_unix < e else true;
+                if (fresh) {
+                    return .{ .have_token = try gpa.dupe(u8, entry.token) };
+                }
+            }
+
+            if (self.inflight.contains(lookup_key)) {
+                self.cond.waitUncancelable(io, &self.mutex);
+                continue;
+            }
+
+            // Claim. Owned key handed to the inflight map.
+            const owned_key = try makeKey(gpa, realm, service, scope);
+            errdefer gpa.free(owned_key);
+            try self.inflight.put(gpa, owned_key, {});
+            return .acquire;
+        }
+    }
+
+    /// Counterpart to a successful `.acquire` outcome. Removes the
+    /// in-flight marker and broadcasts so any waiters re-check the
+    /// cache. Safe to call on a key that was never claimed (no-op).
+    fn clearInflight(
+        self: *TokenCache,
+        io: Io,
+        gpa: Allocator,
+        realm: []const u8,
+        service: []const u8,
+        scope: []const u8,
+    ) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+
+        var key_buf: [768]u8 = undefined;
+        if (makeStackKey(&key_buf, realm, service, scope)) |k| {
+            if (self.inflight.fetchRemove(k)) |kv| gpa.free(kv.key);
+        } else if (makeKey(gpa, realm, service, scope)) |heap| {
+            defer gpa.free(heap);
+            if (self.inflight.fetchRemove(heap)) |kv| gpa.free(kv.key);
+        } else |_| {
+            // OOM building the key — broadcast anyway so waiters can
+            // recover by claiming the slot themselves.
+        }
+        self.cond.broadcast(io);
     }
 
     fn keyLen(realm: []const u8, service: []const u8, scope: []const u8) usize {
@@ -1282,6 +1433,76 @@ test "TokenCache invalidate removes entry" {
     try cache.put(io, gpa, "realm", "svc", "scope", "tok", null);
     cache.invalidate(io, gpa, "realm", "svc", "scope");
     try testing.expectEqual(@as(?[]u8, null), try cache.get(io, gpa, "realm", "svc", "scope", 0));
+}
+
+test "TokenCache.acquireOrWait — first caller claims .acquire" {
+    const gpa = testing.allocator;
+    var cache: TokenCache = .{};
+    const io = testing.io;
+    defer cache.deinit(io, gpa);
+
+    const out = try cache.acquireOrWait(io, gpa, "realm", "svc", "scope", 0);
+    try testing.expect(out == .acquire);
+    cache.clearInflight(io, gpa, "realm", "svc", "scope");
+}
+
+test "TokenCache.acquireOrWait — cache hit returns have_token" {
+    const gpa = testing.allocator;
+    var cache: TokenCache = .{};
+    const io = testing.io;
+    defer cache.deinit(io, gpa);
+
+    try cache.put(io, gpa, "realm", "svc", "scope", "tok-1", null);
+    const out = try cache.acquireOrWait(io, gpa, "realm", "svc", "scope", 0);
+    switch (out) {
+        .have_token => |tok| {
+            defer gpa.free(tok);
+            try testing.expectEqualStrings("tok-1", tok);
+        },
+        .acquire => {
+            cache.clearInflight(io, gpa, "realm", "svc", "scope");
+            try testing.expect(false);
+        },
+    }
+}
+
+test "TokenCache.acquireOrWait — clearInflight without put lets next caller claim" {
+    const gpa = testing.allocator;
+    var cache: TokenCache = .{};
+    const io = testing.io;
+    defer cache.deinit(io, gpa);
+
+    const first = try cache.acquireOrWait(io, gpa, "realm", "svc", "scope", 0);
+    try testing.expect(first == .acquire);
+    cache.clearInflight(io, gpa, "realm", "svc", "scope");
+
+    const second = try cache.acquireOrWait(io, gpa, "realm", "svc", "scope", 0);
+    try testing.expect(second == .acquire);
+    cache.clearInflight(io, gpa, "realm", "svc", "scope");
+}
+
+test "TokenCache.acquireOrWait — put after acquire makes second caller see have_token" {
+    const gpa = testing.allocator;
+    var cache: TokenCache = .{};
+    const io = testing.io;
+    defer cache.deinit(io, gpa);
+
+    const first = try cache.acquireOrWait(io, gpa, "realm", "svc", "scope", 0);
+    try testing.expect(first == .acquire);
+    try cache.put(io, gpa, "realm", "svc", "scope", "tok-shared", null);
+    cache.clearInflight(io, gpa, "realm", "svc", "scope");
+
+    const second = try cache.acquireOrWait(io, gpa, "realm", "svc", "scope", 0);
+    switch (second) {
+        .have_token => |tok| {
+            defer gpa.free(tok);
+            try testing.expectEqualStrings("tok-shared", tok);
+        },
+        .acquire => {
+            cache.clearInflight(io, gpa, "realm", "svc", "scope");
+            try testing.expect(false);
+        },
+    }
 }
 
 const ScriptStep = struct {

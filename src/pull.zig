@@ -41,6 +41,7 @@ const manifest_cache = @import("store/manifest_cache.zig");
 const client_mod = @import("registry/client.zig");
 const manifest_mod = @import("registry/manifest.zig");
 const blob_pool = @import("registry/blob_pool.zig");
+const prefetch = @import("registry/prefetch.zig");
 const extract_pool = @import("image/extract_pool.zig");
 
 /// Sha256 content digest. Re-exported so callers don't double-import.
@@ -436,6 +437,9 @@ pub fn pullImage(
     } else false;
     const cache_usable_fresh = cache_fresh and cache_blob_present;
 
+    var pref: prefetch.Handle = .{};
+    defer pref.join();
+
     var mres: client_mod.ManifestResult = undefined;
     var mres_owned = false;
     defer if (mres_owned) mres.deinit();
@@ -446,6 +450,18 @@ pub fn pullImage(
         mres = try loadManifestFromCache(io, gpa, store, cached_lookup.?.value);
         mres_owned = true;
     } else {
+        // Speculative warm-up. Best-effort — failures are swallowed
+        // by the worker; the main-path manifest GET below retries
+        // independently. Owned slices `manifest_base`, `reference`,
+        // and `manifest_scope` outlive the join below.
+        pref.start(.{
+            .client = client,
+            .manifest_base = manifest_base,
+            .reference = reference,
+            .scope = manifest_scope,
+            .accept = manifest_mod.accept_header_value,
+        }) catch {};
+
         // `If-None-Match` only helps when we still have the cached
         // manifest blob to fall back on. A 304 against a missing blob
         // would leave us with no manifest at all.
@@ -459,6 +475,12 @@ pub fn pullImage(
         else
             null;
         errdefer if (manifest_node) |n| n.end();
+
+        // Join here so the connection pool + token cache are warm
+        // before the conditional GET fires. The deferred `join` is
+        // idempotent — this explicit call collapses the race in the
+        // common cache-miss path.
+        pref.join();
 
         const outcome = client.getManifestByUrlConditional(
             manifest_base,
