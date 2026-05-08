@@ -1,0 +1,36 @@
+# syntax=docker/dockerfile:1.4
+# Sample Containerfile exercising every lexer code path:
+# parser-directives, multi-stage FROM, line continuation across a
+# blank-and-comment block, JSON-array CMD, here-docs (raw and
+# tab-strip), quoted LABEL value, and the deprecated MAINTAINER.
+
+ARG BASE=alpine:3.19
+
+FROM ${BASE} AS builder
+MAINTAINER alice@example.com
+
+ENV LANG="en_US.UTF-8" \
+    PATH=/usr/local/bin:/usr/bin
+
+WORKDIR /work
+COPY . /work
+
+RUN apt-get update \
+    && apt-get install -y \
+    # comment inside a continuation block
+    curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN <<EOF
+echo "first heredoc line"
+echo "second heredoc line"
+EOF
+
+RUN <<-INDENTED
+	indented body line one
+	indented body line two
+	INDENTED
+
+LABEL org.example.note="first line\nsecond line"
+EXPOSE 8080
+CMD ["sh", "-c", "echo hi"]
