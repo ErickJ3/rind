@@ -123,6 +123,43 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&b.addRunArtifact(client_tests).step);
 
+    // Regression harness: walks /tests/cases/<scenario>/ and diffs
+    // against expected_* goldens. The harness is a separate binary
+    // so the rind exe stays tight; build.zig wires the freshly
+    // installed `rind` path in as argv[1] of the runner.
+    const update_goldens = b.option(
+        bool,
+        "update-goldens",
+        "Rewrite stale regression goldens on diff and exit 0.",
+    ) orelse false;
+
+    const harness_mod = b.createModule(.{
+        .root_source_file = b.path("tests/cases/_runner.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const harness_exe = b.addExecutable(.{
+        .name = "regression-runner",
+        .root_module = harness_mod,
+    });
+
+    const run_harness = b.addRunArtifact(harness_exe);
+    run_harness.addArtifactArg(exe);
+    run_harness.addArg("--cases-dir");
+    run_harness.addDirectoryArg(b.path("tests/cases"));
+    if (update_goldens) run_harness.addArg("--update-goldens");
+    run_harness.step.dependOn(b.getInstallStep());
+
+    const regression_step = b.step("regression", "Run regression scenarios");
+    regression_step.dependOn(&run_harness.step);
+
+    const check_step = b.step("check", "Aggregate test + regression");
+    check_step.dependOn(test_step);
+    check_step.dependOn(regression_step);
+
+    const harness_unit = b.addTest(.{ .root_module = harness_mod });
+    test_step.dependOn(&b.addRunArtifact(harness_unit).step);
+
     // T17 — static-link libcrun.a + libseccomp.a + libcap.a +
     // argp_standalone.a into the rind exe (helpers below). Link order
     // matters: libcrun → libseccomp → libcap → argp_standalone (libcrun

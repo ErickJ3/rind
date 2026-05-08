@@ -1,0 +1,6 @@
+{
+  "name": "_smoke",
+  "argv": ["help"],
+  "expected_exit": 0,
+  "expected_stdout": "expected_stdout.txt"
+}

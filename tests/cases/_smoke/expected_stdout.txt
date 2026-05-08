@@ -1,0 +1,9 @@
+Usage: rind <command> [args...]
+Commands:
+  pull     Pull an image into the local store
+  run      Run a command in a new container
+  ps       List containers
+  rm       Remove one or more containers
+  images   List images in the local store
+  inspect  Dump the image config JSON for a local image
+  help     Show this message
