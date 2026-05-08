@@ -2,6 +2,11 @@
 const std = @import("std");
 const Io = std.Io;
 
+/// Builder modules: Containerfile lexer, parser, build orchestrator.
+pub const Builder = struct {
+    pub const lex = @import("builder/lex.zig");
+};
+
 /// Image-layer modules: reference parsing, digest helpers, layer
 /// extraction, image-config decoding.
 pub const Image = struct {
@@ -63,6 +68,7 @@ test "basic add functionality" {
 }
 
 test {
+    _ = Builder.lex;
     _ = Image.ref;
     _ = Image.digest;
     _ = Image.extract;
