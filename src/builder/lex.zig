@@ -9,7 +9,7 @@
 //!
 //! Token text fields are slices into the caller's `src` buffer, so
 //! `tokenize` allocates only the `Token` array. Quote chars and escape
-//! sequences are preserved verbatim in the token text; the T31 parser
+//! sequences are preserved verbatim in the token text; the parser
 //! does interpretation. The lexer's job is to chunk bytes and surface
 //! span info for accurate downstream diagnostics.
 //!
@@ -26,7 +26,7 @@ const Allocator = std.mem.Allocator;
 
 /// 1-based source position for a token. `offset`/`len` point into the
 /// caller's `src`; `line`/`col` are derived for human-friendly error
-/// formatting in T31 and downstream tools.
+/// formatting in the parser and downstream tools.
 pub const Span = struct {
     offset: u32,
     len: u32,
@@ -35,8 +35,8 @@ pub const Span = struct {
 };
 
 /// Canonical directive tag. The original source casing is preserved on
-/// the directive token's `text` field; this enum is what the T31
-/// parser dispatches on.
+/// the directive token's `text` field; this enum is what the parser
+/// dispatches on.
 pub const Directive = enum {
     from,
     run,
@@ -55,8 +55,8 @@ pub const Directive = enum {
     shell,
     volume,
     /// Deprecated by Docker; lexes successfully but the lexer also
-    /// emits a `.deprecated_warn` token alongside it so the T31
-    /// parser can surface a warning without re-lexing.
+    /// emits a `.deprecated_warn` token alongside it so the parser
+    /// can surface a warning without re-lexing.
     maintainer,
     onbuild,
 };
@@ -96,8 +96,8 @@ pub const Token = struct {
 };
 
 /// Side-channel header recorded from parser-directive comments before
-/// the first instruction. Carried alongside the token slice so T31
-/// gets it without re-scanning bytes.
+/// the first instruction. Carried alongside the token slice so the
+/// parser gets it without re-scanning bytes.
 pub const Header = struct {
     /// Value of `# syntax=...` if present; slice into source.
     syntax: ?[]const u8 = null,
@@ -594,8 +594,8 @@ const Lexer = struct {
                 // Mid-token escape: pass through together with the next
                 // byte. `\<newline>` is handled at the top-level loop
                 // before we entered here, so any `\<newline>` that
-                // shows up here is a stray; emit it raw and let T31
-                // decide.
+                // shows up here is a stray; emit it raw and let the
+                // parser decide.
                 self.advance();
                 if (!self.atEof()) self.advance();
                 continue;
