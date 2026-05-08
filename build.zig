@@ -1,7 +1,19 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    // Pin a glibc version on the default target so Zig links against
+    // its bundled CRT (`crt1.o` etc.) instead of the system's
+    // `/usr/lib/gcc/.../crt1.o`. GCC ≥15 emits a `.sframe` stack-unwind
+    // section there, and Zig 0.16's LLD doesn't yet handle the
+    // R_X86_64_PC64 relocations inside it — link fails with
+    // "unhandled relocation type R_X86_64_PC64 ... in crt1.o:.sframe".
+    // Override with `-Dtarget=...` if cross-building.
+    const target = b.standardTargetOptions(.{
+        .default_target = .{
+            .abi = .gnu,
+            .glibc_version = .{ .major = 2, .minor = 38, .patch = 0 },
+        },
+    });
     const optimize = b.standardOptimizeOption(.{});
 
     const enable_e2e = b.option(
