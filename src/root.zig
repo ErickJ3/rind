@@ -5,6 +5,7 @@ const Io = std.Io;
 /// Builder modules: Containerfile lexer, parser, build orchestrator.
 pub const Builder = struct {
     pub const lex = @import("builder/lex.zig");
+    pub const parse = @import("builder/parse.zig");
 };
 
 /// Image-layer modules: reference parsing, digest helpers, layer
@@ -69,6 +70,7 @@ test "basic add functionality" {
 
 test {
     _ = Builder.lex;
+    _ = Builder.parse;
     _ = Image.ref;
     _ = Image.digest;
     _ = Image.extract;

@@ -172,16 +172,39 @@ pub fn build(b: *std.Build) void {
     const lex_regression_step = b.step("lex-regression", "Diff lex_smoke output against goldens");
     lex_regression_step.dependOn(&run_lex.step);
 
+    const parse_harness_mod = b.createModule(.{
+        .root_source_file = b.path("tests/cases/_parse_harness.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "rind", .module = mod }},
+    });
+    const parse_harness_exe = b.addExecutable(.{
+        .name = "parse-harness",
+        .root_module = parse_harness_mod,
+    });
+
+    const run_parse = b.addRunArtifact(parse_harness_exe);
+    run_parse.addArg("--cases-dir");
+    run_parse.addDirectoryArg(b.path("tests/parse_cases/parse_smoke"));
+    if (update_goldens) run_parse.addArg("--update");
+
+    const parse_regression_step = b.step("parse-regression", "Diff parse_smoke output against goldens");
+    parse_regression_step.dependOn(&run_parse.step);
+
     const check_step = b.step("check", "Aggregate test + regression");
     check_step.dependOn(test_step);
     check_step.dependOn(regression_step);
     check_step.dependOn(lex_regression_step);
+    check_step.dependOn(parse_regression_step);
 
     const harness_unit = b.addTest(.{ .root_module = harness_mod });
     test_step.dependOn(&b.addRunArtifact(harness_unit).step);
 
     const lex_harness_unit = b.addTest(.{ .root_module = lex_harness_mod });
     test_step.dependOn(&b.addRunArtifact(lex_harness_unit).step);
+
+    const parse_harness_unit = b.addTest(.{ .root_module = parse_harness_mod });
+    test_step.dependOn(&b.addRunArtifact(parse_harness_unit).step);
 
     // T17 — static-link libcrun.a + libseccomp.a + libcap.a +
     // argp_standalone.a into the rind exe (helpers below). Link order
