@@ -1,0 +1,10 @@
+# Build artefacts excluded from the context.
+build/
+*.tmp
+.zig-cache/
+
+# Re-include a single output that the cache key wants to see.
+!build/keep.bin
+
+# Anchored exclusion at the root only.
+/scratch.txt

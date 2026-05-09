@@ -1,0 +1,3 @@
+FROM scratch
+COPY src /app/src
+COPY Containerfile /app/Containerfile
