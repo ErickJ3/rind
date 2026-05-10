@@ -210,12 +210,32 @@ pub fn build(b: *std.Build) void {
     const context_regression_step = b.step("context-regression", "Diff context_smoke output against goldens");
     context_regression_step.dependOn(&run_context.step);
 
+    const cache_key_harness_mod = b.createModule(.{
+        .root_source_file = b.path("tests/cases/_cache_key_harness.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "rind", .module = mod }},
+    });
+    const cache_key_harness_exe = b.addExecutable(.{
+        .name = "cache-key-harness",
+        .root_module = cache_key_harness_mod,
+    });
+
+    const run_cache_key = b.addRunArtifact(cache_key_harness_exe);
+    run_cache_key.addArg("--cases-dir");
+    run_cache_key.addDirectoryArg(b.path("tests/cache_key_cases/cache_key_smoke"));
+    if (update_goldens) run_cache_key.addArg("--update");
+
+    const cache_key_regression_step = b.step("cache-key-regression", "Diff cache_key_smoke output against goldens");
+    cache_key_regression_step.dependOn(&run_cache_key.step);
+
     const check_step = b.step("check", "Aggregate test + regression");
     check_step.dependOn(test_step);
     check_step.dependOn(regression_step);
     check_step.dependOn(lex_regression_step);
     check_step.dependOn(parse_regression_step);
     check_step.dependOn(context_regression_step);
+    check_step.dependOn(cache_key_regression_step);
 
     const harness_unit = b.addTest(.{ .root_module = harness_mod });
     test_step.dependOn(&b.addRunArtifact(harness_unit).step);
@@ -228,6 +248,9 @@ pub fn build(b: *std.Build) void {
 
     const context_harness_unit = b.addTest(.{ .root_module = context_harness_mod });
     test_step.dependOn(&b.addRunArtifact(context_harness_unit).step);
+
+    const cache_key_harness_unit = b.addTest(.{ .root_module = cache_key_harness_mod });
+    test_step.dependOn(&b.addRunArtifact(cache_key_harness_unit).step);
 
     // T17 — static-link libcrun.a + libseccomp.a + libcap.a +
     // argp_standalone.a into the rind exe (helpers below). Link order

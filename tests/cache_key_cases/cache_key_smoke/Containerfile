@@ -1,0 +1,6 @@
+FROM scratch
+ENV LANG=C.UTF-8
+ARG VERSION=1.0
+COPY file_a.txt /app/a.txt
+RUN echo building
+CMD ["/app/a.txt"]
