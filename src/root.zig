@@ -6,6 +6,8 @@ const Io = std.Io;
 pub const Builder = struct {
     pub const lex = @import("builder/lex.zig");
     pub const parse = @import("builder/parse.zig");
+    pub const context = @import("builder/context.zig");
+    pub const cache_key = @import("builder/cache_key.zig");
 };
 
 /// Image-layer modules: reference parsing, digest helpers, layer
@@ -71,6 +73,8 @@ test "basic add functionality" {
 test {
     _ = Builder.lex;
     _ = Builder.parse;
+    _ = Builder.context;
+    _ = Builder.cache_key;
     _ = Image.ref;
     _ = Image.digest;
     _ = Image.extract;
